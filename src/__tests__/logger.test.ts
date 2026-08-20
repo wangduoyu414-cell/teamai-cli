@@ -10,7 +10,7 @@ vi.mock('chalk', () => ({
   default: { blue: (s: string) => s, green: (s: string) => s, yellow: (s: string) => s, red: (s: string) => s, gray: (s: string) => s, dim: (s: string) => s },
 }));
 
-import { log, setVerbose, setSilent, setStderrOnly, MAX_LOG_BYTES, _setLogFilePath, _resetState } from '../utils/logger.js';
+import { log, setVerbose, setSilent, setStderrOnly, setFileLogging, MAX_LOG_BYTES, _setLogFilePath, _resetState } from '../utils/logger.js';
 
 let tmpDir: string;
 let logFile: string;
@@ -76,6 +76,15 @@ describe('file transport', () => {
     // Make logFile a directory so appendFileSync fails with EISDIR
     fs.mkdirSync(logFile);
     expect(() => log.debug('ok')).not.toThrow();
+  });
+
+  it('can disable file writes for zero-side-effect plan commands', () => {
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    setFileLogging(false);
+    log.debug('plan debug');
+    log.error('plan error');
+    spy.mockRestore();
+    expect(fs.existsSync(logFile)).toBe(false);
   });
 });
 

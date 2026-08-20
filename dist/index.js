@@ -16,6 +16,7 @@ __export(logger_exports, {
   _resetState: () => _resetState,
   _setLogFilePath: () => _setLogFilePath,
   log: () => log,
+  setFileLogging: () => setFileLogging,
   setSilent: () => setSilent,
   setStderrOnly: () => setStderrOnly,
   setVerbose: () => setVerbose,
@@ -49,6 +50,7 @@ function maybeRotate() {
   }
 }
 function writeToFile(level, msg) {
+  if (!fileLoggingEnabled) return;
   if (_writing) return;
   _writing = true;
   try {
@@ -71,12 +73,16 @@ function _resetState() {
   _logFilePath = null;
   _dirEnsured = false;
   _writing = false;
+  fileLoggingEnabled = true;
 }
 function setVerbose(v) {
   verboseEnabled = v;
 }
 function setSilent(s) {
   silentMode = s;
+}
+function setFileLogging(enabled) {
+  fileLoggingEnabled = enabled;
 }
 function setStderrOnly(s) {
   stderrMode = s;
@@ -94,13 +100,14 @@ function spinner(text) {
   }
   return ora({ text, color: "cyan", discardStdin: false });
 }
-var verboseEnabled, silentMode, stderrMode, MAX_LOG_BYTES, _logFilePath, _dirEnsured, _writing, log;
+var verboseEnabled, silentMode, stderrMode, fileLoggingEnabled, MAX_LOG_BYTES, _logFilePath, _dirEnsured, _writing, log;
 var init_logger = __esm({
   "src/utils/logger.ts"() {
     "use strict";
     verboseEnabled = false;
     silentMode = false;
     stderrMode = false;
+    fileLoggingEnabled = true;
     MAX_LOG_BYTES = 5 * 1024 * 1024;
     _logFilePath = null;
     _dirEnsured = false;
@@ -32268,9 +32275,10 @@ import { Command, Option } from "commander";
 var require2 = createRequire2(import.meta.url);
 var { version } = require2("../package.json");
 var program = new Command();
-program.name("teamai").description("TeamAI \u2014 The team harness for AI agents").version(version).option("--dry-run", "Preview mode, no changes made").option("--plan", "Preview lifecycle work with zero side effects (alias for --dry-run)").option("-v, --verbose", "Verbose output").hook("preAction", (thisCommand) => {
-  const opts = thisCommand.opts();
+program.name("teamai").description("TeamAI \u2014 The team harness for AI agents").version(version).option("--dry-run", "Preview mode, no changes made").option("--plan", "Preview lifecycle work with zero side effects (alias for --dry-run)").option("-v, --verbose", "Verbose output").hook("preAction", () => {
+  const opts = program.opts();
   if (opts.verbose) setVerbose(true);
+  if (opts.dryRun || opts.plan) setFileLogging(false);
 });
 program.command("init").description("Initialize teamai (configure TGit, clone repo, register member)").argument("[repo]", 'Team repo (owner/repo or full URL). Pass "." for single-repo mode (the current git repo is the team repo).').option("--repo <repo>", "Team repo (alias of the positional argument)").option("--http <url>", "Git-free HTTP team repo (read-only consumer; only needs an API key)").option("--self", "Single-repo mode: the current git repo is the team repo (equivalent to `teamai init .`). Knowledge lives on main under .teamai/; reports go to the teamai-reports orphan branch.").option("--token <key>", "API key for HTTP team repo / status reporting (stored 0600, never committed). Also reads TEAMAI_API_TOKEN.").option("--scope <scope>", "Install scope: project (default, <cwd>/.teamai + <cwd>/.claude) or user (~/.teamai + ~/.claude)").option("--inherit-user-scope", "In project scope, also sync safe user-scope resources and search its knowledge").option("--no-inherit-user-scope", "Disable user-scope inheritance for this project").option("--role <id>", "Primary role ID (e.g. hai_dev) for non-interactive setup").option("--agent <name>", "AI tools to set up (e.g. claude, codex, cursor, codebuddy, workbuddy). Repeatable or comma-separated. In single-repo mode, selects which tool dirs to create; omit for an interactive picker. Additive on repeated runs.", (val, acc) => acc.concat(val), []).option("--force", "Overwrite existing config without confirmation").action(async (repoArg, cmdOpts) => {
   const globalOpts = program.opts();

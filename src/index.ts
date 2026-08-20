@@ -1,6 +1,6 @@
 import { createRequire } from 'node:module';
 import { Command, Option } from 'commander';
-import { setVerbose, setSilent, log } from './utils/logger.js';
+import { setVerbose, setSilent, setFileLogging, log } from './utils/logger.js';
 import type { GlobalOptions } from './types.js';
 
 const require = createRequire(import.meta.url);
@@ -15,9 +15,10 @@ program
   .option('--dry-run', 'Preview mode, no changes made')
   .option('--plan', 'Preview lifecycle work with zero side effects (alias for --dry-run)')
   .option('-v, --verbose', 'Verbose output')
-  .hook('preAction', (thisCommand) => {
-    const opts = thisCommand.opts();
+  .hook('preAction', () => {
+    const opts = program.opts();
     if (opts.verbose) setVerbose(true);
+    if (opts.dryRun || opts.plan) setFileLogging(false);
   });
 
 program

@@ -6,6 +6,7 @@ import ora, { type Ora } from 'ora';
 let verboseEnabled = false;
 let silentMode = false;
 let stderrMode = false;
+let fileLoggingEnabled = true;
 
 // ─── File transport ─────────────────────────────────────
 //
@@ -72,6 +73,7 @@ function maybeRotate(): void {
  * Silently fails — never throws, never recurses into log.
  */
 function writeToFile(level: string, msg: string): void {
+  if (!fileLoggingEnabled) return;
   if (_writing) return; // prevent recursion
   _writing = true;
   try {
@@ -100,6 +102,7 @@ export function _resetState(): void {
   _logFilePath = null;
   _dirEnsured = false;
   _writing = false;
+  fileLoggingEnabled = true;
 }
 
 // ─── Public API ─────────────────────────────────────────
@@ -110,6 +113,11 @@ export function setVerbose(v: boolean): void {
 
 export function setSilent(s: boolean): void {
   silentMode = s;
+}
+
+/** Disable debug/error file writes for read-only plan commands. */
+export function setFileLogging(enabled: boolean): void {
+  fileLoggingEnabled = enabled;
 }
 
 /**

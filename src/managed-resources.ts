@@ -214,12 +214,15 @@ async function managedTargetRoots(home: string, candidates: string[]): Promise<s
   const scopeRoot = path.dirname(path.resolve(home));
   const roots = [scopeRoot];
   if (candidates.some((candidate) => !path.isAbsolute(candidate) || !isWithin(scopeRoot, candidate))) {
-    roots.push(...(await openclawWorkspaceCandidates()).filter((candidate) => path.isAbsolute(candidate)));
+    roots.push(...(await openclawWorkspaceCandidates())
+      .filter((candidate) => path.isAbsolute(candidate))
+      .map((candidate) => path.join(candidate, 'skills')));
   }
   return roots;
 }
 
 async function validateManifestSemantics(home: string, manifest: ManagedResourceManifest): Promise<void> {
+  const scopeRoot = path.dirname(path.resolve(home));
   const backupRoot = path.join(path.resolve(home), BACKUPS_DIR);
   const targets = Object.values(manifest.resources).flatMap((resource) => resource.targets);
   const targetRoots = await managedTargetRoots(home, targets.map((target) => target.path));
@@ -227,6 +230,10 @@ async function validateManifestSemantics(home: string, manifest: ManagedResource
   for (const [id, resource] of Object.entries(manifest.resources)) {
     if (resource.id !== id) throw new Error(`Managed resource key/id mismatch: ${id}`);
     for (const target of resource.targets) {
+      const external = !path.isAbsolute(target.path) || !isWithin(scopeRoot, target.path);
+      if (external && (resource.type !== 'skills' || target.tool !== 'openclaw')) {
+        throw new Error(`Only OpenClaw skills may use an external managed target: ${target.path}`);
+      }
       await assertAbsoluteWithin(targetRoots, target.path, 'Managed target');
       if (seenTargets.has(target.path)) throw new Error(`Managed target is claimed more than once: ${target.path}`);
       seenTargets.add(target.path);
@@ -662,12 +669,17 @@ export async function reconcileManagedResources(
 
   const desiredIds = new Set<string>();
   const desiredOwners = new Map<string, string>();
+  const scopeRoot = path.dirname(path.resolve(home));
   const desiredTargetPaths = desiredResources.flatMap((resource) => resource.targets.map((target) => target.path));
   const targetRoots = await managedTargetRoots(home, desiredTargetPaths);
   for (const resource of desiredResources) {
     if (desiredIds.has(resource.id)) throw new Error(`Managed resource id is duplicated: ${resource.id}`);
     desiredIds.add(resource.id);
     for (const target of resource.targets) {
+      const external = !path.isAbsolute(target.path) || !isWithin(scopeRoot, target.path);
+      if (external && (resource.type !== 'skills' || target.tool !== 'openclaw')) {
+        throw new Error(`Only OpenClaw skills may use an external managed target: ${target.path}`);
+      }
       await assertAbsoluteWithin(targetRoots, target.path, 'Managed target');
       const owner = desiredOwners.get(target.path);
       if (owner) throw new Error(`Managed target is claimed by both ${owner} and ${resource.id}: ${target.path}`);

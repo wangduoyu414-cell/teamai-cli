@@ -360,7 +360,7 @@ export async function initHttp(
   // Step 5: inject hooks (built-in dispatch incl. the reporter) via the same
   // authoritative path the git init uses, so HTTP consumers behave identically.
   const filterAgents = requestedAgents.length > 0 ? requestedAgents : undefined;
-  await reconcileTeamHooksForConfig(teamConfig, localConfig, { filterAgents });
+  await reconcileTeamHooksForConfig(teamConfig, localConfig, { auto: true, filterAgents });
 
   // Step 6: also initialize local-agent config so the new hook-dispatch --stdin
   // path can deliver rules/claudemd (not just skills).
@@ -763,7 +763,7 @@ export async function initSelfRepo(options: GlobalOptions & {
   // settings file exists on disk and can be committed to main below. This is what
   // makes a teammate's fresh clone carry the session-start hook that triggers the
   // self-heal bootstrap — the core of "clone = initialized".
-  await reconcileTeamHooksForConfig(teamConfig, localConfig, { filterAgents });
+  await reconcileTeamHooksForConfig(teamConfig, localConfig, { auto: true, filterAgents });
 
   // Step 5.5: commit the .teamai/ knowledge skeleton + selected tools' hook
   // settings to the current branch. Single-repo mode keeps knowledge on main, and
@@ -1256,11 +1256,15 @@ export async function init(options: GlobalOptions & {
   const reloadedTeamConfig = await loadTeamConfig(localPath);
   if (reloadedTeamConfig) {
     const filterAgents = requestedAgents.length > 0 ? requestedAgents : undefined;
-    await reconcileTeamHooksForConfig(reloadedTeamConfig, localConfig, { filterAgents });
+    await reconcileTeamHooksForConfig(reloadedTeamConfig, localConfig, { auto: true, filterAgents });
   }
 
   log.success('teamai initialized successfully!');
-  log.info('Skills, rules, env and docs will auto-sync on each session start (via hooks).');
+  if (reloadedTeamConfig?.sharing.hooks?.autoApply === false) {
+    log.info('Automatic hook sync is disabled by team policy. Run `teamai pull` manually when you want to sync.');
+  } else {
+    log.info('Skills, rules, env and docs will auto-sync on each session start (via hooks).');
+  }
   log.info('Run `teamai status` to check current config.');
 
   // Close the readline singleton so the process can exit cleanly.

@@ -5,6 +5,8 @@
 > **teamai-cli** — a shared AI experience framework for teams
 >
 > Helps teams centrally manage and share Skills, Rules, Docs, and Env resources, automatically syncing them to AI coding tools like Claude Code, CodeBuddy, Cursor, Codex, Gemini CLI, and Windsurf.
+>
+> This fork is installed from the immutable commit recorded by the consuming repository's `teamai-core.lock.json`; it is not published to npm.
 
 ---
 
@@ -62,7 +64,8 @@
 ## Installation
 
 ```bash
-npm install -g teamai-cli
+TEAMAI_CORE_COMMIT=<commit-from-teamai-core.lock.json>
+npm install -g "https://github.com/wangduoyu414-cell/teamai-cli/archive/${TEAMAI_CORE_COMMIT}.tar.gz"
 
 # Verify
 teamai --version
@@ -241,7 +244,8 @@ Once the admin shares the team repo URL with members:
 **Project-scoped teams (default):**
 
 ```bash
-npm install -g teamai-cli
+TEAMAI_CORE_COMMIT=<commit-from-teamai-core.lock.json>
+npm install -g "https://github.com/wangduoyu414-cell/teamai-cli/archive/${TEAMAI_CORE_COMMIT}.tar.gz"
 cd /path/to/my-project
 teamai init <group>/TeamAi-<team>
 # Done! AI tools now automatically have access to team resources
@@ -250,7 +254,8 @@ teamai init <group>/TeamAi-<team>
 **User-scoped teams:**
 
 ```bash
-npm install -g teamai-cli
+TEAMAI_CORE_COMMIT=<commit-from-teamai-core.lock.json>
+npm install -g "https://github.com/wangduoyu414-cell/teamai-cli/archive/${TEAMAI_CORE_COMMIT}.tar.gz"
 teamai init <group>/TeamAi-<team> --scope user
 ```
 
@@ -1137,5 +1142,8 @@ teamai remove rules <name>
 
 ---
 
-> **Repo**: https://github.com/Tencent/teamai-cli
+> **Fork**: https://github.com/wangduoyu414-cell/teamai-cli
+>
+> **Upstream**: https://github.com/Tencent/teamai-cli
+>
 > **Feedback**: file an Issue in the repo

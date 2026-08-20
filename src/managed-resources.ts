@@ -421,6 +421,19 @@ export async function reconcileManagedResources(
   if (!options.plan) await recoverManagedResourceTransaction(home);
   const manifest = await loadManagedResourceManifest(home);
   const result: ManagedReconcileResult = { applied: [], removed: [], conflicts: [], planned: [] };
+
+  const desiredIds = new Set<string>();
+  const desiredOwners = new Map<string, string>();
+  for (const resource of desiredResources) {
+    if (desiredIds.has(resource.id)) throw new Error(`Managed resource id is duplicated: ${resource.id}`);
+    desiredIds.add(resource.id);
+    for (const target of resource.targets) {
+      const owner = desiredOwners.get(target.path);
+      if (owner) throw new Error(`Managed target is claimed by both ${owner} and ${resource.id}: ${target.path}`);
+      desiredOwners.set(target.path, resource.id);
+    }
+  }
+
   const desiredById = new Map(desiredResources.map((resource) => [resource.id, resource]));
   const desiredPaths = new Set(desiredResources.flatMap((resource) => [
     ...resource.targets.map((target) => target.path), ...(resource.retainTargetPaths ?? []),
@@ -554,24 +567,31 @@ export async function reconcileManagedResources(
         // exactly like a created target. A changed hash above remains protected.
         let payload: string | null = null;
         let stagedRoot: string | undefined;
+        let backupPath: string | null = null;
+        if (oldTarget.ownership === 'replaced-with-backup') {
+          if (!oldTarget.backupPath || !await fse.pathExists(oldTarget.backupPath)) {
+            throw new Error(`Managed resource backup is missing for ${oldTarget.path}`);
+          }
+          backupPath = oldTarget.backupPath;
+        }
         if (oldTarget.section) {
           let restore: string | undefined;
-          if (oldTarget.ownership === 'replaced-with-backup' && oldTarget.backupPath && await fse.pathExists(oldTarget.backupPath)) {
-            restore = await fse.readFile(oldTarget.backupPath, 'utf8');
-            journal.backupCleanup.push(oldTarget.backupPath);
+          if (backupPath) {
+            restore = await fse.readFile(backupPath, 'utf8');
+            journal.backupCleanup.push(backupPath);
           }
           const stagedRemoval = await stageSectionRemoval(oldTarget, transactionId, appliedCount, restore);
           payload = (await fse.readFile(stagedRemoval.payload, 'utf8')).trim() === '' ? null : stagedRemoval.payload;
           stagedRoot = stagedRemoval.root;
           journal.stagedRoots.push(stagedRoot);
           await writeJournal(home, journal);
-        } else if (oldTarget.ownership === 'replaced-with-backup' && oldTarget.backupPath && await fse.pathExists(oldTarget.backupPath)) {
+        } else if (backupPath) {
           const root = await fse.mkdtemp(path.join(path.dirname(oldTarget.path), `.teamai-stage-${transactionId}-restore-`));
           payload = path.join(root, 'payload');
-          await fse.copy(oldTarget.backupPath, payload);
+          await fse.copy(backupPath, payload);
           stagedRoot = root;
           journal.stagedRoots.push(root);
-          journal.backupCleanup.push(oldTarget.backupPath);
+          journal.backupCleanup.push(backupPath);
           await writeJournal(home, journal);
         }
         await recordOperation(home, journal, oldTarget.path, payload, stagedRoot);

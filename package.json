@@ -1,6 +1,6 @@
 {
-  "name": "teamai-cli",
-  "version": "0.20.0",
+  "name": "@wangduoyu414-cell/teamai-cli",
+  "version": "0.20.0-autocode.1",
   "description": "TeamAI — the team harness for AI agents (skill sync + shared knowledge base, powered by Git)",
   "type": "module",
   "bin": {
@@ -30,11 +30,11 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Tencent/teamai-cli.git"
+    "url": "git+https://github.com/wangduoyu414-cell/teamai-cli.git"
   },
-  "homepage": "https://github.com/Tencent/teamai-cli#readme",
+  "homepage": "https://github.com/wangduoyu414-cell/teamai-cli#readme",
   "bugs": {
-    "url": "https://github.com/Tencent/teamai-cli/issues"
+    "url": "https://github.com/wangduoyu414-cell/teamai-cli/issues"
   },
   "keywords": [
     "ai",

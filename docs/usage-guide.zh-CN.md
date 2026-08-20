@@ -2,9 +2,11 @@
 
 > [English](usage-guide.md) | [简体中文](usage-guide.zh-CN.md)
 
-> **@tencent/teamai-cli** — 团队 AI 经验共享框架
+> **@wangduoyu414-cell/teamai-cli** — 团队 AI 经验共享框架
 >
 > 帮助团队统一管理和共享 Skills、Rules、Docs、Env 等资源，自动同步到 Claude Code、CodeBuddy、Cursor、Codex、Gemini CLI、Windsurf 等 AI 编程工具中。
+>
+> 这个 Fork 不发布到 npm；安装时使用资源仓库 `teamai-core.lock.json` 记录的不可变提交。
 
 ---
 
@@ -60,7 +62,8 @@
 ## 安装
 
 ```bash
-npm install -g @tencent/teamai-cli --registry=http://r.tnpm.oa.com
+TEAMAI_CORE_COMMIT=<teamai-core.lock.json 中的提交>
+npm install -g "https://github.com/wangduoyu414-cell/teamai-cli/archive/${TEAMAI_CORE_COMMIT}.tar.gz"
 
 # 验证
 teamai --version
@@ -239,7 +242,8 @@ teamai init https://github.com/yourorg/java-service-teamai --inherit-user-scope
 **项目级团队（默认）：**
 
 ```bash
-npm install -g @tencent/teamai-cli --registry=http://r.tnpm.oa.com
+TEAMAI_CORE_COMMIT=<teamai-core.lock.json 中的提交>
+npm install -g "https://github.com/wangduoyu414-cell/teamai-cli/archive/${TEAMAI_CORE_COMMIT}.tar.gz"
 cd /path/to/my-project
 teamai init <group>/TeamAi-<team>
 # 完成！AI 工具已自动获得团队资源
@@ -248,7 +252,8 @@ teamai init <group>/TeamAi-<team>
 **用户级团队：**
 
 ```bash
-npm install -g @tencent/teamai-cli --registry=http://r.tnpm.oa.com
+TEAMAI_CORE_COMMIT=<teamai-core.lock.json 中的提交>
+npm install -g "https://github.com/wangduoyu414-cell/teamai-cli/archive/${TEAMAI_CORE_COMMIT}.tar.gz"
 teamai init <group>/TeamAi-<team> --scope user
 ```
 
@@ -1132,5 +1137,8 @@ teamai remove rules <name>
 
 ---
 
-> **仓库**: https://git.woa.com/teamai/teamai-cli
+> **Fork**: https://github.com/wangduoyu414-cell/teamai-cli
+>
+> **Upstream**: https://github.com/Tencent/teamai-cli
+>
 > **问题反馈**: 提交 Issue 到仓库

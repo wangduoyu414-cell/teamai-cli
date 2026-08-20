@@ -1,6 +1,7 @@
 # Dependencies & build output
 node_modules/
-dist/
+dist/*
+!dist/index.js
 coverage/
 *.tgz
 pkgs/

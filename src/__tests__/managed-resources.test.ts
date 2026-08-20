@@ -70,6 +70,19 @@ describe('managed resource lifecycle', () => {
     expect(await fse.pathExists(backupPath)).toBe(false);
   });
 
+  it('blocks uninstall when a required original backup is missing', async () => {
+    const { root, home } = await fixture();
+    const target = path.join(root, 'agent.md');
+    await fse.writeFile(target, 'user original');
+    await reconcileManagedResources(home, [file('agents:a', target, 'team version')], { pruneTypes: ['agents'] });
+    const manifest = await loadManagedResourceManifest(home);
+    await fse.remove(manifest.resources['agents:a'].targets[0].backupPath!);
+
+    await expect(uninstallManagedResources(home)).rejects.toThrow('backup is missing');
+    expect(await fse.readFile(target, 'utf8')).toBe('team version');
+    expect((await loadManagedResourceManifest(home)).resources['agents:a']).toBeDefined();
+  });
+
   it('preserves a locally modified managed target and keeps its ledger record', async () => {
     const { root, home } = await fixture();
     const target = path.join(root, 'agent.md');
@@ -94,6 +107,36 @@ describe('managed resource lifecycle', () => {
 
     expect(await fse.pathExists(oldTarget)).toBe(false);
     expect(await fse.readFile(newTarget, 'utf8')).toBe('v2');
+  });
+
+  it('replaces a managed directory atomically and removes deleted deep files', async () => {
+    const { root, home } = await fixture();
+    const sourceV1 = path.join(root, 'source-v1');
+    const sourceV2 = path.join(root, 'source-v2');
+    const target = path.join(root, 'skill');
+    await fse.outputFile(path.join(sourceV1, 'nested', 'old.md'), 'old');
+    await fse.outputFile(path.join(sourceV2, 'nested', 'new.md'), 'new');
+    const resource = (sourcePath: string): DesiredManagedResource => ({
+      id: 'skills:deep', type: 'skills', targets: [{ path: target, kind: 'directory', sourcePath }],
+    });
+
+    await reconcileManagedResources(home, [resource(sourceV1)], { pruneTypes: ['skills'] });
+    await reconcileManagedResources(home, [resource(sourceV2)], { pruneTypes: ['skills'] });
+    expect(await fse.pathExists(path.join(target, 'nested', 'old.md'))).toBe(false);
+    expect(await fse.readFile(path.join(target, 'nested', 'new.md'), 'utf8')).toBe('new');
+
+    await reconcileManagedResources(home, [], { pruneTypes: ['skills'] });
+    expect(await fse.pathExists(target)).toBe(false);
+  });
+
+  it('rejects ambiguous duplicate ownership before writing', async () => {
+    const { root, home } = await fixture();
+    const target = path.join(root, 'agent.md');
+    await expect(reconcileManagedResources(home, [
+      file('agents:a', target, 'a'),
+      file('agents:b', target, 'b'),
+    ])).rejects.toThrow('claimed by both');
+    expect(await fse.pathExists(home)).toBe(false);
   });
 
   it('keeps a locally modified old target in the manifest during a same-id rename', async () => {
@@ -256,5 +299,15 @@ describe('managed resource lifecycle', () => {
     expect(result.planned).toEqual([target]);
     expect(await fse.pathExists(target)).toBe(false);
     expect(await fse.pathExists(home)).toBe(false);
+  });
+
+  it('rejects a corrupt manifest instead of rebuilding it', async () => {
+    const { root, home } = await fixture();
+    await fse.ensureDir(home);
+    await fse.writeFile(path.join(home, 'managed-resources.json'), '{not-json');
+
+    await expect(reconcileManagedResources(home, [file('agents:a', path.join(root, 'agent.md'), 'a')]))
+      .rejects.toThrow('manifest is invalid');
+    expect(await fse.readFile(path.join(home, 'managed-resources.json'), 'utf8')).toBe('{not-json');
   });
 });

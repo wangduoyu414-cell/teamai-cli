@@ -944,7 +944,7 @@ export async function reconcileManagedInstructions(
         const instructionPath = toolPath.instruction ?? toolPath.claudemd;
         if (isAgentDisabled(localConfig, tool) || !instructionPath || !source) continue;
         const installationPath = toolPath.skills ?? instructionPath;
-        if (!await ResourceHandler.isToolInstalled(installationPath, baseDir)) continue;
+        if (!await ResourceHandler.isToolInstalled(installationPath, baseDir, toolPath.probe)) continue;
         const blocks = [source, toolPath.agents && isRecallEnabled(localConfig, config) ? compileRecallRulesBlock() : null]
           .filter((block): block is string => !!block);
         resources.push({
@@ -1159,16 +1159,15 @@ async function autoMigrateHooksIfNeeded(): Promise<void> {
   // Old format detected — reinject all tools
   log.debug('Auto-migrating hooks to dispatch format...');
   const { autoDetectInit } = await import('./config.js');
-  const { injectHooksToAllTools } = await import('./hooks.js');
+  const { reconcileTeamHooksForConfig } = await import('./hooks.js');
   const { localConfig, teamConfig } = await autoDetectInit();
-  const baseDir = resolveBaseDir(localConfig);
   const disabled = localConfig.disabledAgents;
   let hookFilter = localConfig.enabledAgents;
   if (disabled && disabled.length > 0) {
     const universe = hookFilter ?? Object.keys(teamConfig.toolPaths);
     hookFilter = universe.filter((t) => !disabled.includes(t));
   }
-  await injectHooksToAllTools(teamConfig.toolPaths, baseDir, hookFilter);
+  await reconcileTeamHooksForConfig(teamConfig, localConfig, { auto: true, filterAgents: hookFilter });
   log.debug('Hooks migrated to dispatch format');
 }
 
@@ -1288,7 +1287,9 @@ export async function pull(options: GlobalOptions): Promise<void> {
         log.debug('No user-scope config found, skipping user pull');
       }
     } catch (e) {
-      log.warn(`User-scope pull error: ${(e as Error).message}`);
+      log.error(`User-scope pull failed: ${(e as Error).message}`);
+      process.exitCode = 1;
+      return;
     }
   }
 
@@ -1297,7 +1298,9 @@ export async function pull(options: GlobalOptions): Promise<void> {
     try {
       await pullForScope(projectConfig, options);
     } catch (e) {
-      log.warn(`Project-scope pull error: ${(e as Error).message}`);
+      log.error(`Project-scope pull failed: ${(e as Error).message}`);
+      process.exitCode = 1;
+      return;
     }
   }
 

@@ -49,6 +49,27 @@ describe('instruction lifecycle integration', () => {
     expect(await fse.readFile(path.join(home, '.qwen/QWEN.md'), 'utf8')).toContain('shared workflow');
   });
 
+  it('uses the independent host probe when the instruction path has a different root', async () => {
+    const { home, repo } = await fixture();
+    vi.stubEnv('HOME', home);
+    await fse.writeFile(path.join(repo, 'AGENTS.md'), '# Team instructions\n');
+    await fse.ensureDir(path.join(home, '.codex'));
+    const config = TeamaiConfigSchema.parse({
+      team: 'test', repo: 'https://example.test/team.git',
+      sharing: { instructions: { source: 'AGENTS.md' } },
+      toolPaths: {
+        codex: { probe: '.codex', skills: '.agents/skills', instruction: '.codex/AGENTS.md' },
+      },
+    });
+    const localConfig: LocalConfig = {
+      repo: { localPath: repo, remote: 'https://example.test/team.git' },
+      username: 'test', scope: 'user', additionalRoles: [],
+    };
+
+    await reconcileManagedInstructions(config, localConfig, null, 'test');
+    expect(await fse.readFile(path.join(home, '.codex/AGENTS.md'), 'utf8')).toContain('Team instructions');
+  });
+
   it('updates only the TeamAI block in project AGENTS.md', async () => {
     const { repo, project } = await fixture();
     await fse.writeFile(path.join(repo, 'AGENTS.md'), '# Team v1\n');

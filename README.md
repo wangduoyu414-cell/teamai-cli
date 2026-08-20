@@ -6,9 +6,7 @@
 
 > [English](README.md) | [简体中文](README.zh-CN.md)
 
-[![CI](https://github.com/Tencent/teamai-cli/actions/workflows/ci.yml/badge.svg)](https://github.com/Tencent/teamai-cli/actions/workflows/ci.yml)
-[![npm version](https://img.shields.io/npm/v/teamai-cli.svg)](https://www.npmjs.com/package/teamai-cli)
-[![npm downloads](https://img.shields.io/npm/dm/teamai-cli.svg)](https://www.npmjs.com/package/teamai-cli)
+[![CI](https://github.com/wangduoyu414-cell/teamai-cli/actions/workflows/ci.yml/badge.svg)](https://github.com/wangduoyu414-cell/teamai-cli/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 [![User Chat](https://img.shields.io/badge/User_Chat-Discord-5865F2?logo=discord&logoColor=white)](https://discord.gg/gervEZm58g)
@@ -20,12 +18,15 @@ Git-native management of skills, rules, and docs across Claude Code / Codex / Co
 
 For you or your whole team.
 
+> This fork is the pinned TeamAI Core used by the Autocode resource repository. It keeps upstream v0.20.0 behavior while adding strict host-aware Agent rendering and manifest-backed resource lifecycle safety. It is installed from an immutable commit archive, not from npm.
+
 ## Quick Start
 
 ### Install
 
 ```bash
-npm install -g teamai-cli
+TEAMAI_CORE_COMMIT=<commit-from-teamai-core.lock.json>
+npm install -g "https://github.com/wangduoyu414-cell/teamai-cli/archive/${TEAMAI_CORE_COMMIT}.tar.gz"
 ```
 
 ### Team admin / solo user

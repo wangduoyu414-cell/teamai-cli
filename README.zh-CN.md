@@ -6,9 +6,7 @@
 
 > [English](README.md) | [简体中文](README.zh-CN.md)
 
-[![CI](https://github.com/Tencent/teamai-cli/actions/workflows/ci.yml/badge.svg)](https://github.com/Tencent/teamai-cli/actions/workflows/ci.yml)
-[![npm version](https://img.shields.io/npm/v/teamai-cli.svg)](https://www.npmjs.com/package/teamai-cli)
-[![npm downloads](https://img.shields.io/npm/dm/teamai-cli.svg)](https://www.npmjs.com/package/teamai-cli)
+[![CI](https://github.com/wangduoyu414-cell/teamai-cli/actions/workflows/ci.yml/badge.svg)](https://github.com/wangduoyu414-cell/teamai-cli/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 [![用户交流](https://img.shields.io/badge/用户交流-Discord-5865F2?logo=discord&logoColor=white)](https://discord.gg/gervEZm58g)
@@ -20,12 +18,15 @@
 
 一个人也能用，团队用更强。
 
+> 这个 Fork 是 Autocode 资源仓库锁定使用的 TeamAI Core。它以 upstream v0.20.0 为基线，增加严格的跨宿主 Agent 渲染和基于清单的资源生命周期保护；安装来源是不可变提交压缩包，不从 npm 获取。
+
 ## 快速开始
 
 ### 安装
 
 ```bash
-npm install -g teamai-cli
+TEAMAI_CORE_COMMIT=<teamai-core.lock.json 中的提交>
+npm install -g "https://github.com/wangduoyu414-cell/teamai-cli/archive/${TEAMAI_CORE_COMMIT}.tar.gz"
 ```
 
 ### 团队管理员 / 个人使用者

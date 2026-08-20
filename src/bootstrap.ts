@@ -187,7 +187,7 @@ export async function bootstrapSelfRepo(
     // Inject hooks so session-start pull/report fire from now on.
     try {
       const { reconcileTeamHooksForConfig } = await import('./hooks.js');
-      await reconcileTeamHooksForConfig(teamConfig, localConfig, {});
+      await reconcileTeamHooksForConfig(teamConfig, localConfig, { auto: true });
     } catch (e) {
       log.debug(`[bootstrap] hook injection failed (non-blocking): ${(e as Error).message}`);
     }

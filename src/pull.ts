@@ -1235,8 +1235,13 @@ export async function pull(options: GlobalOptions): Promise<void> {
       await planPullForScope(localConfig, teamConfig);
       log.info('Plan — no Git refresh, bootstrap, hook migration, network, or file writes were performed.');
     } catch (error) {
-      log.debug(`Plan scan skipped: ${(error as Error).message}`);
-      log.info('Plan — pull would reconcile TeamAI resources if configured. No changes made.');
+      const message = (error as Error).message;
+      if (message.includes('teamai is not initialized') || message.includes('Team config (teamai.yaml) not found')) {
+        log.info('Plan — pull would reconcile TeamAI resources if configured. No changes made.');
+      } else {
+        log.error(`Plan failed: ${message}`);
+        process.exitCode = 1;
+      }
     }
     return;
   }

@@ -70,6 +70,20 @@ describe('managed resource lifecycle', () => {
     expect(await fse.pathExists(backupPath)).toBe(false);
   });
 
+  it('restores an unrelated target and removes its new backup when apply rolls back', async () => {
+    const { root, home } = await fixture();
+    const target = path.join(root, 'agent.md');
+    await fse.writeFile(target, 'user original');
+
+    await expect(reconcileManagedResources(home, [file('agents:a', target, 'team version')], {
+      pruneTypes: ['agents'], failAfterApply: 1,
+    })).rejects.toThrow('Injected managed-resource failure');
+
+    expect(await fse.readFile(target, 'utf8')).toBe('user original');
+    expect(await fse.readdir(path.join(home, 'managed-resource-backups'))).toEqual([]);
+    expect((await loadManagedResourceManifest(home)).resources).toEqual({});
+  });
+
   it('blocks uninstall when a required original backup is missing', async () => {
     const { root, home } = await fixture();
     const target = path.join(root, 'agent.md');
@@ -78,9 +92,21 @@ describe('managed resource lifecycle', () => {
     const manifest = await loadManagedResourceManifest(home);
     await fse.remove(manifest.resources['agents:a'].targets[0].backupPath!);
 
-    await expect(uninstallManagedResources(home)).rejects.toThrow('backup is missing');
+    await expect(uninstallManagedResources(home)).rejects.toThrow('backup is missing or corrupt');
     expect(await fse.readFile(target, 'utf8')).toBe('team version');
     expect((await loadManagedResourceManifest(home)).resources['agents:a']).toBeDefined();
+  });
+
+  it('blocks uninstall when a required original backup was modified', async () => {
+    const { root, home } = await fixture();
+    const target = path.join(root, 'agent.md');
+    await fse.writeFile(target, 'user original');
+    await reconcileManagedResources(home, [file('agents:a', target, 'team version')], { pruneTypes: ['agents'] });
+    const manifest = await loadManagedResourceManifest(home);
+    await fse.writeFile(manifest.resources['agents:a'].targets[0].backupPath!, 'tampered');
+
+    await expect(uninstallManagedResources(home)).rejects.toThrow('backup is missing or corrupt');
+    expect(await fse.readFile(target, 'utf8')).toBe('team version');
   });
 
   it('preserves a locally modified managed target and keeps its ledger record', async () => {
@@ -201,6 +227,22 @@ describe('managed resource lifecycle', () => {
     expect(await fse.pathExists(target)).toBe(false);
   });
 
+  it('preserves a pre-existing empty project instruction file after removing its managed section', async () => {
+    const { root, home } = await fixture();
+    const target = path.join(root, 'AGENTS.md');
+    const section = { start: '<!-- [teamai:instructions:start] -->', end: '<!-- [teamai:instructions:end] -->' };
+    await fse.writeFile(target, '');
+    await reconcileManagedResources(home, [{
+      id: 'instructions:project-agents',
+      type: 'instructions',
+      targets: [{ path: target, kind: 'file', section, content: `${section.start}\nteam\n${section.end}` }],
+    }], { pruneTypes: ['instructions'] });
+
+    await uninstallManagedResources(home);
+    expect(await fse.pathExists(target)).toBe(true);
+    expect(await fse.readFile(target, 'utf8')).toBe('');
+  });
+
   it('rolls every already-replaced target back when a later replacement fails', async () => {
     const { root, home } = await fixture();
     const first = path.join(root, 'first.md');
@@ -219,7 +261,7 @@ describe('managed resource lifecycle', () => {
   it('recovers a crashed applying journal by restoring the previous target', async () => {
     const { root, home } = await fixture();
     const target = path.join(root, 'agent.md');
-    const rollbackRoot = path.join(root, '.rollback');
+    const rollbackRoot = path.join(root, '.teamai-rollback-crashed-a');
     const previous = path.join(rollbackRoot, 'previous');
     await fse.ensureDir(rollbackRoot);
     await fse.writeFile(previous, 'old');
@@ -230,7 +272,10 @@ describe('managed resource lifecycle', () => {
       transactionId: 'crashed',
       status: 'applying',
       resourceIds: ['agents:a'],
-      operations: [{ target, previous, rollbackRoot, hadPrevious: true, phase: 'applied' }],
+      operations: [{
+        target, previous, rollbackRoot, hadPrevious: true, previousKind: 'file',
+        previousHash: crypto.createHash('sha256').update('old').digest('hex'), phase: 'applied',
+      }],
       stagedRoots: [],
       createdBackups: [],
       backupCleanup: [],
@@ -271,7 +316,7 @@ describe('managed resource lifecycle', () => {
   it('keeps rollback evidence and the applying journal when restoration is impossible', async () => {
     const { root, home } = await fixture();
     const target = path.join(root, 'agent.md');
-    const rollbackRoot = path.join(root, '.rollback');
+    const rollbackRoot = path.join(root, '.teamai-rollback-broken-rollback-a');
     const previous = path.join(rollbackRoot, 'previous');
     await fse.writeFile(target, 'new');
     await fse.ensureDir(home);
@@ -280,7 +325,10 @@ describe('managed resource lifecycle', () => {
       transactionId: 'broken-rollback',
       status: 'applying',
       resourceIds: ['agents:a'],
-      operations: [{ target, previous, rollbackRoot, hadPrevious: true, phase: 'applied' }],
+      operations: [{
+        target, previous, rollbackRoot, hadPrevious: true, previousKind: 'file',
+        previousHash: crypto.createHash('sha256').update('old').digest('hex'), phase: 'applied',
+      }],
       stagedRoots: [],
       createdBackups: [],
       backupCleanup: [],
@@ -289,6 +337,48 @@ describe('managed resource lifecycle', () => {
 
     await expect(recoverManagedResourceTransaction(home)).rejects.toThrow('rollback incomplete');
     expect((await fse.readJson(path.join(home, 'managed-resources.journal.json'))).status).toBe('applying');
+  });
+
+  it('persists partial rollback progress so a later recovery can finish', async () => {
+    const { root, home } = await fixture();
+    const targetA = path.join(root, 'a.md');
+    const targetB = path.join(root, 'b.md');
+    const rollbackA = path.join(root, '.teamai-rollback-retry-a');
+    const rollbackB = path.join(root, '.teamai-rollback-retry-b');
+    const previousA = path.join(rollbackA, 'previous');
+    const previousB = path.join(rollbackB, 'previous');
+    await fse.outputFile(previousA, 'old-a');
+    await fse.writeFile(targetA, 'new-a');
+    await fse.writeFile(targetB, 'new-b');
+    await fse.ensureDir(home);
+    await fse.writeJson(path.join(home, 'managed-resources.journal.json'), {
+      version: 1,
+      transactionId: 'retry',
+      status: 'applying',
+      resourceIds: ['agents:a', 'agents:b'],
+      operations: [
+        {
+          target: targetB, previous: previousB, rollbackRoot: rollbackB, hadPrevious: true,
+          previousKind: 'file', previousHash: crypto.createHash('sha256').update('old-b').digest('hex'), phase: 'applied',
+        },
+        {
+          target: targetA, previous: previousA, rollbackRoot: rollbackA, hadPrevious: true,
+          previousKind: 'file', previousHash: crypto.createHash('sha256').update('old-a').digest('hex'), phase: 'applied',
+        },
+      ],
+      stagedRoots: [], createdBackups: [], backupCleanup: [], updatedAt: new Date().toISOString(),
+    });
+
+    await expect(recoverManagedResourceTransaction(home)).rejects.toThrow('rollback incomplete');
+    expect(await fse.readFile(targetA, 'utf8')).toBe('old-a');
+    const interrupted = await fse.readJson(path.join(home, 'managed-resources.journal.json'));
+    expect(interrupted.operations[1].rollbackComplete).toBe(true);
+
+    await fse.outputFile(previousB, 'old-b');
+    await recoverManagedResourceTransaction(home);
+    expect(await fse.readFile(targetA, 'utf8')).toBe('old-a');
+    expect(await fse.readFile(targetB, 'utf8')).toBe('old-b');
+    expect((await fse.readJson(path.join(home, 'managed-resources.journal.json'))).status).toBe('rolled-back');
   });
 
   it('plans without creating files, backups, journal, or manifest', async () => {
@@ -309,5 +399,58 @@ describe('managed resource lifecycle', () => {
     await expect(reconcileManagedResources(home, [file('agents:a', path.join(root, 'agent.md'), 'a')]))
       .rejects.toThrow('manifest is invalid');
     expect(await fse.readFile(path.join(home, 'managed-resources.json'), 'utf8')).toBe('{not-json');
+  });
+
+  it('rejects a structurally corrupt manifest instead of losing ledger records', async () => {
+    const { root, home } = await fixture();
+    await fse.ensureDir(home);
+    await fse.writeJson(path.join(home, 'managed-resources.json'), { version: 1, resources: [] });
+
+    await expect(reconcileManagedResources(home, [file('agents:a', path.join(root, 'agent.md'), 'a')]))
+      .rejects.toThrow('unsupported shape');
+    expect(await fse.readJson(path.join(home, 'managed-resources.json'))).toEqual({ version: 1, resources: [] });
+  });
+
+  it('rejects an out-of-scope journal before touching its target', async () => {
+    const { root, home } = await fixture();
+    const outside = path.join(os.tmpdir(), `teamai-outside-${crypto.randomBytes(5).toString('hex')}`);
+    await fse.writeFile(outside, 'keep');
+    try {
+      await fse.ensureDir(home);
+      await fse.writeJson(path.join(home, 'managed-resources.journal.json'), {
+        version: 1,
+        transactionId: 'unsafe',
+        status: 'applying',
+        resourceIds: ['agents:a'],
+        operations: [{
+          target: outside,
+          previous: path.join(root, '.teamai-rollback-unsafe-a', 'previous'),
+          rollbackRoot: path.join(root, '.teamai-rollback-unsafe-a'),
+          hadPrevious: false,
+          phase: 'applied',
+        }],
+        stagedRoots: [], createdBackups: [], backupCleanup: [], updatedAt: new Date().toISOString(),
+      });
+
+      await expect(recoverManagedResourceTransaction(home)).rejects.toThrow('journal is invalid');
+      expect(await fse.readFile(outside, 'utf8')).toBe('keep');
+    } finally {
+      await fse.remove(outside);
+    }
+  });
+
+  it('refuses to plan while a valid transaction still requires recovery', async () => {
+    const { root, home } = await fixture();
+    await fse.ensureDir(home);
+    await fse.writeJson(path.join(home, 'managed-resources.journal.json'), {
+      version: 1,
+      transactionId: 'pending',
+      status: 'applying',
+      resourceIds: [], operations: [], stagedRoots: [], createdBackups: [], backupCleanup: [],
+      updatedAt: new Date().toISOString(),
+    });
+
+    await expect(reconcileManagedResources(home, [file('agents:a', path.join(root, 'agent.md'), 'a')], { plan: true }))
+      .rejects.toThrow('requires recovery before plan');
   });
 });

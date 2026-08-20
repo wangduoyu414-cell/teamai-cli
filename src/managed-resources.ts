@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import path from 'node:path';
 import fse from 'fs-extra';
+import { z } from 'zod';
 import { getTeamaiHome, type Scope } from './types.js';
 
 /** One ownership ledger covers every resource channel; handlers only supply targets. */
@@ -40,6 +41,9 @@ interface ManagedTargetRecord {
   hash: string;
   ownership: ManagedOwnership;
   backupPath?: string;
+  backupHash?: string;
+  /** A section may own a block in a file that existed before TeamAI. */
+  sectionFileExisted?: boolean;
 }
 
 interface ManagedResourceRecord {
@@ -61,7 +65,10 @@ interface JournalOperation {
   rollbackRoot: string;
   stagedRoot?: string;
   hadPrevious: boolean;
+  previousKind?: ManagedPathKind;
+  previousHash?: string;
   phase: JournalPhase;
+  rollbackComplete?: boolean;
 }
 interface ManagedResourceJournal {
   version: 1;
@@ -102,6 +109,120 @@ export interface ManagedUninstallOptions {
 const MANIFEST_FILE = 'managed-resources.json';
 const JOURNAL_FILE = 'managed-resources.journal.json';
 const BACKUPS_DIR = 'managed-resource-backups';
+const HASH_PATTERN = /^[0-9a-f]{64}$/;
+
+const ManagedSectionSchema = z.object({ start: z.string().min(1), end: z.string().min(1) }).strict();
+const ManagedTargetRecordSchema = z.object({
+  path: z.string().min(1),
+  kind: z.enum(['file', 'directory']),
+  tool: z.string().min(1).optional(),
+  section: ManagedSectionSchema.optional(),
+  hash: z.string().regex(HASH_PATTERN),
+  ownership: z.enum(['created', 'adopted', 'replaced-with-backup']),
+  backupPath: z.string().min(1).optional(),
+  backupHash: z.string().regex(HASH_PATTERN).optional(),
+  sectionFileExisted: z.boolean().optional(),
+}).strict().superRefine((target, context) => {
+  const hasBackup = target.backupPath !== undefined || target.backupHash !== undefined;
+  if (target.ownership === 'replaced-with-backup' && (!target.backupPath || !target.backupHash)) {
+    context.addIssue({ code: z.ZodIssueCode.custom, message: 'replaced target requires backupPath and backupHash' });
+  } else if (target.ownership !== 'replaced-with-backup' && hasBackup) {
+    context.addIssue({ code: z.ZodIssueCode.custom, message: 'non-replaced target must not carry backup metadata' });
+  }
+  if (target.section && target.sectionFileExisted === undefined) {
+    context.addIssue({ code: z.ZodIssueCode.custom, message: 'section target requires sectionFileExisted' });
+  } else if (!target.section && target.sectionFileExisted !== undefined) {
+    context.addIssue({ code: z.ZodIssueCode.custom, message: 'non-section target must not carry sectionFileExisted' });
+  }
+});
+const ManagedResourceRecordSchema = z.object({
+  id: z.string().min(1),
+  type: z.enum(['skills', 'agents', 'instructions']),
+  targets: z.array(ManagedTargetRecordSchema),
+}).strict();
+const ManagedResourceManifestSchema = z.object({
+  version: z.literal(1),
+  resources: z.record(z.string().min(1), ManagedResourceRecordSchema),
+}).strict();
+
+const JournalOperationSchema = z.object({
+  target: z.string().min(1),
+  previous: z.string().min(1),
+  rollbackRoot: z.string().min(1),
+  stagedRoot: z.string().min(1).optional(),
+  hadPrevious: z.boolean(),
+  previousKind: z.enum(['file', 'directory']).optional(),
+  previousHash: z.string().regex(HASH_PATTERN).optional(),
+  phase: z.enum(['prepared', 'previous-moved', 'applied']),
+  rollbackComplete: z.boolean().optional(),
+}).strict().superRefine((operation, context) => {
+  if (operation.hadPrevious && (!operation.previousKind || !operation.previousHash)) {
+    context.addIssue({ code: z.ZodIssueCode.custom, message: 'operation with previous content requires kind and hash' });
+  } else if (!operation.hadPrevious && (operation.previousKind || operation.previousHash)) {
+    context.addIssue({ code: z.ZodIssueCode.custom, message: 'operation without previous content must not carry previous metadata' });
+  }
+});
+const ManagedResourceJournalSchema = z.object({
+  version: z.literal(1),
+  transactionId: z.string().regex(/^[A-Za-z0-9-]+$/),
+  status: z.enum(['staging', 'applying', 'committed', 'completed', 'rolled-back']),
+  resourceIds: z.array(z.string().min(1)),
+  operations: z.array(JournalOperationSchema),
+  stagedRoots: z.array(z.string().min(1)),
+  createdBackups: z.array(z.string().min(1)),
+  backupCleanup: z.array(z.string().min(1)),
+  nextManifestHash: z.string().regex(HASH_PATTERN).optional(),
+  updatedAt: z.string().datetime(),
+}).strict();
+
+function isWithin(root: string, candidate: string): boolean {
+  const relative = path.relative(path.resolve(root), path.resolve(candidate));
+  return relative === '' || (!relative.startsWith('..' + path.sep) && relative !== '..' && !path.isAbsolute(relative));
+}
+
+function assertAbsoluteWithin(root: string, candidate: string, label: string): void {
+  if (!path.isAbsolute(candidate) || !isWithin(root, candidate)) {
+    throw new Error(`${label} is outside the managed scope: ${candidate}`);
+  }
+}
+
+function validateManifestSemantics(home: string, manifest: ManagedResourceManifest): void {
+  const scopeRoot = path.dirname(path.resolve(home));
+  const backupRoot = path.join(path.resolve(home), BACKUPS_DIR);
+  const seenTargets = new Set<string>();
+  for (const [id, resource] of Object.entries(manifest.resources)) {
+    if (resource.id !== id) throw new Error(`Managed resource key/id mismatch: ${id}`);
+    for (const target of resource.targets) {
+      assertAbsoluteWithin(scopeRoot, target.path, 'Managed target');
+      if (seenTargets.has(target.path)) throw new Error(`Managed target is claimed more than once: ${target.path}`);
+      seenTargets.add(target.path);
+      if (target.backupPath) assertAbsoluteWithin(backupRoot, target.backupPath, 'Managed backup');
+    }
+  }
+}
+
+function validateJournalSemantics(home: string, journal: ManagedResourceJournal): void {
+  const scopeRoot = path.dirname(path.resolve(home));
+  const backupRoot = path.join(path.resolve(home), BACKUPS_DIR);
+  const operationTargets = new Set<string>();
+  for (const operation of journal.operations) {
+    assertAbsoluteWithin(scopeRoot, operation.target, 'Journal target');
+    assertAbsoluteWithin(scopeRoot, operation.rollbackRoot, 'Journal rollback root');
+    if (operationTargets.has(operation.target)) throw new Error(`Journal target is duplicated: ${operation.target}`);
+    operationTargets.add(operation.target);
+    if (!path.basename(operation.rollbackRoot).startsWith(`.teamai-rollback-${journal.transactionId}-`)) {
+      throw new Error(`Journal rollback root has an invalid transaction prefix: ${operation.rollbackRoot}`);
+    }
+    if (operation.previous !== path.join(operation.rollbackRoot, 'previous')) {
+      throw new Error(`Journal previous path does not match rollback root: ${operation.previous}`);
+    }
+    if (operation.stagedRoot) assertAbsoluteWithin(scopeRoot, operation.stagedRoot, 'Journal staged root');
+  }
+  for (const stagedRoot of journal.stagedRoots) assertAbsoluteWithin(scopeRoot, stagedRoot, 'Journal staged root');
+  for (const backup of [...journal.createdBackups, ...journal.backupCleanup]) {
+    assertAbsoluteWithin(backupRoot, backup, 'Journal backup');
+  }
+}
 
 export function managedResourceManifestPath(scope: Scope, projectRoot?: string): string {
   return path.join(getTeamaiHome(scope, projectRoot), MANIFEST_FILE);
@@ -126,11 +247,13 @@ export async function loadManagedResourceManifest(home: string): Promise<Managed
   } catch {
     throw new Error(`Managed resource manifest is invalid: ${manifestPath}`);
   }
-  const manifest = parsed as Partial<ManagedResourceManifest>;
-  if (manifest.version !== 1 || !manifest.resources || typeof manifest.resources !== 'object') {
+  const result = ManagedResourceManifestSchema.safeParse(parsed);
+  if (!result.success) {
     throw new Error(`Managed resource manifest has an unsupported shape: ${manifestPath}`);
   }
-  return { version: 1, resources: manifest.resources };
+  const manifest = result.data as ManagedResourceManifest;
+  validateManifestSemantics(home, manifest);
+  return manifest;
 }
 
 export async function managedManifestTargetPaths(home: string): Promise<Set<string>> {
@@ -173,8 +296,10 @@ async function readJournal(home: string): Promise<ManagedResourceJournal | null>
     throw error;
   }
   try {
-    const journal = JSON.parse(content) as ManagedResourceJournal;
-    if (journal.version !== 1 || !Array.isArray(journal.operations)) throw new Error('shape');
+    const result = ManagedResourceJournalSchema.safeParse(JSON.parse(content));
+    if (!result.success) throw new Error('shape');
+    const journal = result.data as ManagedResourceJournal;
+    validateJournalSemantics(home, journal);
     return journal;
   } catch {
     throw new Error(`Managed resource journal is invalid: ${journalPath}`);
@@ -207,6 +332,7 @@ function removeSection(content: string, section: ManagedSection): string {
   if (start === -1 || end === -1 || end < start) return content;
   const before = content.slice(0, start).replace(/\n+$/, '\n');
   const after = content.slice(end + section.end.length).replace(/^\n+/, '\n');
+  if (`${before}${after}`.trim() === '') return '';
   return `${before}${after}`.trimEnd() + (before || after ? '\n' : '');
 }
 
@@ -243,6 +369,30 @@ async function hashDirectory(root: string, relative: string, hash: crypto.Hash):
       hash.update(await fse.readFile(fullPath));
     } else {
       hash.update(`other:${rel}\0`);
+    }
+  }
+}
+
+async function snapshotPath(target: string): Promise<{ kind: ManagedPathKind; hash: string } | null> {
+  try {
+    const stat = await fse.lstat(target);
+    const kind: ManagedPathKind = stat.isDirectory() ? 'directory' : 'file';
+    const hash = await hashPath(target, kind);
+    if (!hash || !HASH_PATTERN.test(hash)) throw new Error(`Could not hash ${target}`);
+    return { kind, hash };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw error;
+  }
+}
+
+async function validateManagedBackups(manifest: ManagedResourceManifest): Promise<void> {
+  for (const resource of Object.values(manifest.resources)) {
+    for (const target of resource.targets) {
+      if (target.ownership !== 'replaced-with-backup') continue;
+      const backupKind: ManagedPathKind = target.section ? 'file' : target.kind;
+      const actual = await hashPath(target.backupPath!, backupKind);
+      if (actual !== target.backupHash) throw new Error(`Managed resource backup is missing or corrupt for ${target.path}`);
     }
   }
 }
@@ -305,6 +455,37 @@ async function stageSectionRemoval(
   return { root, payload };
 }
 
+async function createManagedBackup(
+  home: string,
+  journal: ManagedResourceJournal,
+  resourceId: string,
+  target: ManagedResourceTarget,
+): Promise<{ path: string; hash: string }> {
+  const backupPath = path.join(home, BACKUPS_DIR, token(`${resourceId}:${target.path}`));
+  if (await fse.pathExists(backupPath)) {
+    throw new Error(`Untracked managed resource backup already exists for ${target.path}`);
+  }
+  const stageRoot = path.join(home, BACKUPS_DIR, `.teamai-backup-stage-${journal.transactionId}-${token(target.path)}`);
+  const payload = path.join(stageRoot, 'payload');
+  journal.stagedRoots.push(stageRoot);
+  journal.createdBackups.push(backupPath);
+  await writeJournal(home, journal);
+  await fse.ensureDir(stageRoot);
+  if (target.section) {
+    const original = extractSection(await fse.readFile(target.path, 'utf8'), target.section);
+    if (original === null) throw new Error(`Cannot back up missing instruction section at ${target.path}`);
+    await fse.writeFile(payload, original, 'utf8');
+  } else {
+    await fse.copy(target.path, payload, { overwrite: false });
+  }
+  const backupKind: ManagedPathKind = target.section ? 'file' : target.kind;
+  const backupHash = await hashPath(payload, backupKind);
+  if (!backupHash || !HASH_PATTERN.test(backupHash)) throw new Error(`Could not hash backup for ${target.path}`);
+  await fse.ensureDir(path.dirname(backupPath));
+  await fse.rename(payload, backupPath);
+  return { path: backupPath, hash: backupHash };
+}
+
 function cloneManifest(manifest: ManagedResourceManifest): ManagedResourceManifest {
   return JSON.parse(JSON.stringify(manifest)) as ManagedResourceManifest;
 }
@@ -317,10 +498,10 @@ function findRecordByPath(manifest: ManagedResourceManifest, targetPath: string)
   return null;
 }
 
-async function rollbackJournal(journal: ManagedResourceJournal): Promise<void> {
-  const recoveredRoots: string[] = [];
+async function rollbackJournal(home: string, journal: ManagedResourceJournal): Promise<void> {
   const failures: string[] = [];
   for (const operation of [...journal.operations].reverse()) {
+    if (operation.rollbackComplete) continue;
     try {
       const previousExists = await fse.pathExists(operation.previous);
       if (previousExists) {
@@ -330,14 +511,14 @@ async function rollbackJournal(journal: ManagedResourceJournal): Promise<void> {
         // A crash after moving staged content but before recording phase must still
         // restore the original absence.
         await fse.remove(operation.target);
-      } else if (operation.hadPrevious && operation.phase !== 'prepared') {
-        throw new Error(`missing rollback payload for ${operation.target}`);
-      } else if (operation.hadPrevious && !await fse.pathExists(operation.target)) {
-        // `prepared` can mean no move happened yet, but a missing original cannot
-        // be guessed or discarded.
-        throw new Error(`missing original target for ${operation.target}`);
+      } else if (operation.hadPrevious) {
+        const current = await snapshotPath(operation.target);
+        if (!current || current.kind !== operation.previousKind || current.hash !== operation.previousHash) {
+          throw new Error(`missing rollback payload for ${operation.target}`);
+        }
       }
-      recoveredRoots.push(operation.rollbackRoot);
+      operation.rollbackComplete = true;
+      await writeJournal(home, journal);
     } catch {
       failures.push(operation.target);
     }
@@ -345,12 +526,11 @@ async function rollbackJournal(journal: ManagedResourceJournal): Promise<void> {
   if (failures.length > 0) {
     // Do not remove any remaining rollback/staging evidence or mark the journal
     // rolled back. A later invocation may regain access and complete recovery.
-    await Promise.all(recoveredRoots.map((entry) => fse.remove(entry).catch(() => undefined)));
     throw new Error(`Managed resource rollback incomplete: ${failures.join(', ')}`);
   }
   await Promise.all([
     ...journal.stagedRoots,
-    ...recoveredRoots,
+    ...journal.operations.map((operation) => operation.rollbackRoot),
     ...journal.createdBackups,
   ].map((entry) => fse.remove(entry).catch(() => undefined)));
 }
@@ -381,7 +561,7 @@ export async function recoverManagedResourceTransaction(home: string): Promise<v
     await finishCommittedJournal(home, journal);
     return;
   }
-  await rollbackJournal(journal);
+  await rollbackJournal(home, journal);
   journal.status = 'rolled-back';
   await writeJournal(home, journal);
 }
@@ -393,13 +573,25 @@ async function recordOperation(
   payload: string | null,
   stagedRoot?: string,
 ): Promise<void> {
-  const rollbackRoot = await fse.mkdtemp(path.join(path.dirname(target), `.teamai-rollback-${journal.transactionId}-`));
+  const rollbackRoot = path.join(
+    path.dirname(target),
+    `.teamai-rollback-${journal.transactionId}-${token(`${target}:${journal.operations.length}`)}`,
+  );
+  if (await fse.pathExists(rollbackRoot)) throw new Error(`Managed rollback path already exists: ${rollbackRoot}`);
   const previous = path.join(rollbackRoot, 'previous');
+  const previousSnapshot = await snapshotPath(target);
   const operation: JournalOperation = {
-    target, previous, rollbackRoot, stagedRoot, hadPrevious: await fse.pathExists(target), phase: 'prepared',
+    target,
+    previous,
+    rollbackRoot,
+    stagedRoot,
+    hadPrevious: previousSnapshot !== null,
+    ...(previousSnapshot ? { previousKind: previousSnapshot.kind, previousHash: previousSnapshot.hash } : {}),
+    phase: 'prepared',
   };
   journal.operations.push(operation);
   await writeJournal(home, journal);
+  await fse.ensureDir(rollbackRoot);
   if (operation.hadPrevious) await fse.rename(target, previous);
   operation.phase = 'previous-moved';
   await writeJournal(home, journal);
@@ -418,8 +610,16 @@ export async function reconcileManagedResources(
   desiredResources: DesiredManagedResource[],
   options: ManagedReconcileOptions = {},
 ): Promise<ManagedReconcileResult> {
-  if (!options.plan) await recoverManagedResourceTransaction(home);
+  if (options.plan) {
+    const pending = await readJournal(home);
+    if (pending && pending.status !== 'completed' && pending.status !== 'rolled-back') {
+      throw new Error(`Managed resource transaction ${pending.transactionId} requires recovery before plan`);
+    }
+  } else {
+    await recoverManagedResourceTransaction(home);
+  }
   const manifest = await loadManagedResourceManifest(home);
+  await validateManagedBackups(manifest);
   const result: ManagedReconcileResult = { applied: [], removed: [], conflicts: [], planned: [] };
 
   const desiredIds = new Set<string>();
@@ -500,31 +700,27 @@ export async function reconcileManagedResources(
       for (const target of resource.targets) {
         const entry = staged.get(`${resource.id}\0${target.path}`)!;
         const prior = findRecordByPath(manifest, target.path);
+        const targetExisted = await fse.pathExists(target.path);
         const currentHash = await hashPath(target.path, target.kind, target.section);
         let ownership: ManagedOwnership;
         let backupPath: string | undefined;
+        let backupHash: string | undefined;
+        const sectionFileExisted = target.section
+          ? (prior?.section ? prior.sectionFileExisted : targetExisted)
+          : undefined;
         if (prior) {
           ownership = prior.ownership;
           backupPath = prior.backupPath;
-        } else if (currentHash === null) {
+          backupHash = prior.backupHash;
+        } else if (!targetExisted || (target.section && currentHash === null)) {
           ownership = 'created';
         } else if (currentHash === entry.hash) {
           ownership = 'adopted';
         } else {
           ownership = 'replaced-with-backup';
-          backupPath = path.join(home, BACKUPS_DIR, token(`${resource.id}:${target.path}`));
-          if (!await fse.pathExists(backupPath)) {
-            await fse.ensureDir(path.dirname(backupPath));
-            if (target.section) {
-              const original = extractSection(await fse.readFile(target.path, 'utf8'), target.section);
-              if (original === null) throw new Error(`Cannot back up missing instruction section at ${target.path}`);
-              await fse.writeFile(backupPath, original, 'utf8');
-            } else {
-              await fse.copy(target.path, backupPath, { overwrite: false });
-            }
-            journal.createdBackups.push(backupPath);
-            await writeJournal(home, journal);
-          }
+          const backup = await createManagedBackup(home, journal, resource.id, target);
+          backupPath = backup.path;
+          backupHash = backup.hash;
         }
         if (currentHash !== entry.hash) {
           await recordOperation(home, journal, target.path, entry.payload, entry.root);
@@ -532,7 +728,17 @@ export async function reconcileManagedResources(
           appliedCount++;
           if (options.failAfterApply !== undefined && appliedCount >= options.failAfterApply) throw new Error('Injected managed-resource failure');
         }
-        records.push({ path: target.path, kind: target.kind, tool: target.tool, section: target.section, hash: entry.hash, ownership, backupPath });
+        records.push({
+          path: target.path,
+          kind: target.kind,
+          tool: target.tool,
+          section: target.section,
+          hash: entry.hash,
+          ownership,
+          backupPath,
+          backupHash,
+          sectionFileExisted,
+        });
       }
       // Empty desired targets mean "prune this resource". Keep the old record
       // until each stale target has passed its local-modification guard.
@@ -569,10 +775,7 @@ export async function reconcileManagedResources(
         let stagedRoot: string | undefined;
         let backupPath: string | null = null;
         if (oldTarget.ownership === 'replaced-with-backup') {
-          if (!oldTarget.backupPath || !await fse.pathExists(oldTarget.backupPath)) {
-            throw new Error(`Managed resource backup is missing for ${oldTarget.path}`);
-          }
-          backupPath = oldTarget.backupPath;
+          backupPath = oldTarget.backupPath!;
         }
         if (oldTarget.section) {
           let restore: string | undefined;
@@ -581,7 +784,8 @@ export async function reconcileManagedResources(
             journal.backupCleanup.push(backupPath);
           }
           const stagedRemoval = await stageSectionRemoval(oldTarget, transactionId, appliedCount, restore);
-          payload = (await fse.readFile(stagedRemoval.payload, 'utf8')).trim() === '' ? null : stagedRemoval.payload;
+          const empty = (await fse.readFile(stagedRemoval.payload, 'utf8')).trim() === '';
+          payload = empty && oldTarget.sectionFileExisted === false ? null : stagedRemoval.payload;
           stagedRoot = stagedRemoval.root;
           journal.stagedRoots.push(stagedRoot);
           await writeJournal(home, journal);
@@ -607,7 +811,7 @@ export async function reconcileManagedResources(
     committed = true;
   } catch (error) {
     if (!committed) {
-      await rollbackJournal(journal);
+      await rollbackJournal(home, journal);
       journal.status = 'rolled-back';
       await writeJournal(home, journal).catch(() => undefined);
     }

@@ -3107,6 +3107,52 @@ __export(managed_resources_exports, {
 import crypto2 from "crypto";
 import path11 from "path";
 import fse3 from "fs-extra";
+import { z as z3 } from "zod";
+function isWithin(root, candidate) {
+  const relative = path11.relative(path11.resolve(root), path11.resolve(candidate));
+  return relative === "" || !relative.startsWith(".." + path11.sep) && relative !== ".." && !path11.isAbsolute(relative);
+}
+function assertAbsoluteWithin(root, candidate, label) {
+  if (!path11.isAbsolute(candidate) || !isWithin(root, candidate)) {
+    throw new Error(`${label} is outside the managed scope: ${candidate}`);
+  }
+}
+function validateManifestSemantics(home, manifest) {
+  const scopeRoot = path11.dirname(path11.resolve(home));
+  const backupRoot = path11.join(path11.resolve(home), BACKUPS_DIR);
+  const seenTargets = /* @__PURE__ */ new Set();
+  for (const [id, resource] of Object.entries(manifest.resources)) {
+    if (resource.id !== id) throw new Error(`Managed resource key/id mismatch: ${id}`);
+    for (const target of resource.targets) {
+      assertAbsoluteWithin(scopeRoot, target.path, "Managed target");
+      if (seenTargets.has(target.path)) throw new Error(`Managed target is claimed more than once: ${target.path}`);
+      seenTargets.add(target.path);
+      if (target.backupPath) assertAbsoluteWithin(backupRoot, target.backupPath, "Managed backup");
+    }
+  }
+}
+function validateJournalSemantics(home, journal) {
+  const scopeRoot = path11.dirname(path11.resolve(home));
+  const backupRoot = path11.join(path11.resolve(home), BACKUPS_DIR);
+  const operationTargets = /* @__PURE__ */ new Set();
+  for (const operation of journal.operations) {
+    assertAbsoluteWithin(scopeRoot, operation.target, "Journal target");
+    assertAbsoluteWithin(scopeRoot, operation.rollbackRoot, "Journal rollback root");
+    if (operationTargets.has(operation.target)) throw new Error(`Journal target is duplicated: ${operation.target}`);
+    operationTargets.add(operation.target);
+    if (!path11.basename(operation.rollbackRoot).startsWith(`.teamai-rollback-${journal.transactionId}-`)) {
+      throw new Error(`Journal rollback root has an invalid transaction prefix: ${operation.rollbackRoot}`);
+    }
+    if (operation.previous !== path11.join(operation.rollbackRoot, "previous")) {
+      throw new Error(`Journal previous path does not match rollback root: ${operation.previous}`);
+    }
+    if (operation.stagedRoot) assertAbsoluteWithin(scopeRoot, operation.stagedRoot, "Journal staged root");
+  }
+  for (const stagedRoot of journal.stagedRoots) assertAbsoluteWithin(scopeRoot, stagedRoot, "Journal staged root");
+  for (const backup of [...journal.createdBackups, ...journal.backupCleanup]) {
+    assertAbsoluteWithin(backupRoot, backup, "Journal backup");
+  }
+}
 function managedResourceManifestPath(scope, projectRoot) {
   return path11.join(getTeamaiHome(scope, projectRoot), MANIFEST_FILE);
 }
@@ -3128,11 +3174,13 @@ async function loadManagedResourceManifest(home) {
   } catch {
     throw new Error(`Managed resource manifest is invalid: ${manifestPath}`);
   }
-  const manifest = parsed;
-  if (manifest.version !== 1 || !manifest.resources || typeof manifest.resources !== "object") {
+  const result = ManagedResourceManifestSchema.safeParse(parsed);
+  if (!result.success) {
     throw new Error(`Managed resource manifest has an unsupported shape: ${manifestPath}`);
   }
-  return { version: 1, resources: manifest.resources };
+  const manifest = result.data;
+  validateManifestSemantics(home, manifest);
+  return manifest;
 }
 async function managedManifestTargetPaths(home) {
   const manifest = await loadManagedResourceManifest(home);
@@ -3169,8 +3217,10 @@ async function readJournal(home) {
     throw error;
   }
   try {
-    const journal = JSON.parse(content);
-    if (journal.version !== 1 || !Array.isArray(journal.operations)) throw new Error("shape");
+    const result = ManagedResourceJournalSchema.safeParse(JSON.parse(content));
+    if (!result.success) throw new Error("shape");
+    const journal = result.data;
+    validateJournalSemantics(home, journal);
     return journal;
   } catch {
     throw new Error(`Managed resource journal is invalid: ${journalPath}`);
@@ -3200,6 +3250,7 @@ function removeSection(content, section) {
   if (start === -1 || end === -1 || end < start) return content;
   const before = content.slice(0, start).replace(/\n+$/, "\n");
   const after = content.slice(end + section.end.length).replace(/^\n+/, "\n");
+  if (`${before}${after}`.trim() === "") return "";
   return `${before}${after}`.trimEnd() + (before || after ? "\n" : "");
 }
 async function hashPath(target, kind, section) {
@@ -3234,6 +3285,28 @@ async function hashDirectory(root, relative, hash) {
       hash.update(await fse3.readFile(fullPath));
     } else {
       hash.update(`other:${rel}\0`);
+    }
+  }
+}
+async function snapshotPath(target) {
+  try {
+    const stat6 = await fse3.lstat(target);
+    const kind = stat6.isDirectory() ? "directory" : "file";
+    const hash = await hashPath(target, kind);
+    if (!hash || !HASH_PATTERN.test(hash)) throw new Error(`Could not hash ${target}`);
+    return { kind, hash };
+  } catch (error) {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  }
+}
+async function validateManagedBackups(manifest) {
+  for (const resource of Object.values(manifest.resources)) {
+    for (const target of resource.targets) {
+      if (target.ownership !== "replaced-with-backup") continue;
+      const backupKind = target.section ? "file" : target.kind;
+      const actual = await hashPath(target.backupPath, backupKind);
+      if (actual !== target.backupHash) throw new Error(`Managed resource backup is missing or corrupt for ${target.path}`);
     }
   }
 }
@@ -3279,6 +3352,31 @@ async function stageSectionRemoval(target, transactionId, index, restoreBlock) {
   await fse3.writeFile(payload, content, "utf8");
   return { root, payload };
 }
+async function createManagedBackup(home, journal, resourceId, target) {
+  const backupPath = path11.join(home, BACKUPS_DIR, token(`${resourceId}:${target.path}`));
+  if (await fse3.pathExists(backupPath)) {
+    throw new Error(`Untracked managed resource backup already exists for ${target.path}`);
+  }
+  const stageRoot = path11.join(home, BACKUPS_DIR, `.teamai-backup-stage-${journal.transactionId}-${token(target.path)}`);
+  const payload = path11.join(stageRoot, "payload");
+  journal.stagedRoots.push(stageRoot);
+  journal.createdBackups.push(backupPath);
+  await writeJournal(home, journal);
+  await fse3.ensureDir(stageRoot);
+  if (target.section) {
+    const original = extractSection(await fse3.readFile(target.path, "utf8"), target.section);
+    if (original === null) throw new Error(`Cannot back up missing instruction section at ${target.path}`);
+    await fse3.writeFile(payload, original, "utf8");
+  } else {
+    await fse3.copy(target.path, payload, { overwrite: false });
+  }
+  const backupKind = target.section ? "file" : target.kind;
+  const backupHash = await hashPath(payload, backupKind);
+  if (!backupHash || !HASH_PATTERN.test(backupHash)) throw new Error(`Could not hash backup for ${target.path}`);
+  await fse3.ensureDir(path11.dirname(backupPath));
+  await fse3.rename(payload, backupPath);
+  return { path: backupPath, hash: backupHash };
+}
 function cloneManifest(manifest) {
   return JSON.parse(JSON.stringify(manifest));
 }
@@ -3289,10 +3387,10 @@ function findRecordByPath(manifest, targetPath) {
   }
   return null;
 }
-async function rollbackJournal(journal) {
-  const recoveredRoots = [];
+async function rollbackJournal(home, journal) {
   const failures = [];
   for (const operation of [...journal.operations].reverse()) {
+    if (operation.rollbackComplete) continue;
     try {
       const previousExists = await fse3.pathExists(operation.previous);
       if (previousExists) {
@@ -3300,23 +3398,24 @@ async function rollbackJournal(journal) {
         await fse3.rename(operation.previous, operation.target);
       } else if (!operation.hadPrevious && await fse3.pathExists(operation.target)) {
         await fse3.remove(operation.target);
-      } else if (operation.hadPrevious && operation.phase !== "prepared") {
-        throw new Error(`missing rollback payload for ${operation.target}`);
-      } else if (operation.hadPrevious && !await fse3.pathExists(operation.target)) {
-        throw new Error(`missing original target for ${operation.target}`);
+      } else if (operation.hadPrevious) {
+        const current = await snapshotPath(operation.target);
+        if (!current || current.kind !== operation.previousKind || current.hash !== operation.previousHash) {
+          throw new Error(`missing rollback payload for ${operation.target}`);
+        }
       }
-      recoveredRoots.push(operation.rollbackRoot);
+      operation.rollbackComplete = true;
+      await writeJournal(home, journal);
     } catch {
       failures.push(operation.target);
     }
   }
   if (failures.length > 0) {
-    await Promise.all(recoveredRoots.map((entry) => fse3.remove(entry).catch(() => void 0)));
     throw new Error(`Managed resource rollback incomplete: ${failures.join(", ")}`);
   }
   await Promise.all([
     ...journal.stagedRoots,
-    ...recoveredRoots,
+    ...journal.operations.map((operation) => operation.rollbackRoot),
     ...journal.createdBackups
   ].map((entry) => fse3.remove(entry).catch(() => void 0)));
 }
@@ -3344,23 +3443,30 @@ async function recoverManagedResourceTransaction(home) {
     await finishCommittedJournal(home, journal);
     return;
   }
-  await rollbackJournal(journal);
+  await rollbackJournal(home, journal);
   journal.status = "rolled-back";
   await writeJournal(home, journal);
 }
 async function recordOperation(home, journal, target, payload, stagedRoot) {
-  const rollbackRoot = await fse3.mkdtemp(path11.join(path11.dirname(target), `.teamai-rollback-${journal.transactionId}-`));
+  const rollbackRoot = path11.join(
+    path11.dirname(target),
+    `.teamai-rollback-${journal.transactionId}-${token(`${target}:${journal.operations.length}`)}`
+  );
+  if (await fse3.pathExists(rollbackRoot)) throw new Error(`Managed rollback path already exists: ${rollbackRoot}`);
   const previous = path11.join(rollbackRoot, "previous");
+  const previousSnapshot = await snapshotPath(target);
   const operation = {
     target,
     previous,
     rollbackRoot,
     stagedRoot,
-    hadPrevious: await fse3.pathExists(target),
+    hadPrevious: previousSnapshot !== null,
+    ...previousSnapshot ? { previousKind: previousSnapshot.kind, previousHash: previousSnapshot.hash } : {},
     phase: "prepared"
   };
   journal.operations.push(operation);
   await writeJournal(home, journal);
+  await fse3.ensureDir(rollbackRoot);
   if (operation.hadPrevious) await fse3.rename(target, previous);
   operation.phase = "previous-moved";
   await writeJournal(home, journal);
@@ -3369,8 +3475,16 @@ async function recordOperation(home, journal, target, payload, stagedRoot) {
   await writeJournal(home, journal);
 }
 async function reconcileManagedResources(home, desiredResources, options = {}) {
-  if (!options.plan) await recoverManagedResourceTransaction(home);
+  if (options.plan) {
+    const pending = await readJournal(home);
+    if (pending && pending.status !== "completed" && pending.status !== "rolled-back") {
+      throw new Error(`Managed resource transaction ${pending.transactionId} requires recovery before plan`);
+    }
+  } else {
+    await recoverManagedResourceTransaction(home);
+  }
   const manifest = await loadManagedResourceManifest(home);
+  await validateManagedBackups(manifest);
   const result = { applied: [], removed: [], conflicts: [], planned: [] };
   const desiredIds = /* @__PURE__ */ new Set();
   const desiredOwners = /* @__PURE__ */ new Map();
@@ -3450,31 +3564,25 @@ async function reconcileManagedResources(home, desiredResources, options = {}) {
       for (const target of resource.targets) {
         const entry = staged.get(`${resource.id}\0${target.path}`);
         const prior = findRecordByPath(manifest, target.path);
+        const targetExisted = await fse3.pathExists(target.path);
         const currentHash = await hashPath(target.path, target.kind, target.section);
         let ownership;
         let backupPath;
+        let backupHash;
+        const sectionFileExisted = target.section ? prior?.section ? prior.sectionFileExisted : targetExisted : void 0;
         if (prior) {
           ownership = prior.ownership;
           backupPath = prior.backupPath;
-        } else if (currentHash === null) {
+          backupHash = prior.backupHash;
+        } else if (!targetExisted || target.section && currentHash === null) {
           ownership = "created";
         } else if (currentHash === entry.hash) {
           ownership = "adopted";
         } else {
           ownership = "replaced-with-backup";
-          backupPath = path11.join(home, BACKUPS_DIR, token(`${resource.id}:${target.path}`));
-          if (!await fse3.pathExists(backupPath)) {
-            await fse3.ensureDir(path11.dirname(backupPath));
-            if (target.section) {
-              const original = extractSection(await fse3.readFile(target.path, "utf8"), target.section);
-              if (original === null) throw new Error(`Cannot back up missing instruction section at ${target.path}`);
-              await fse3.writeFile(backupPath, original, "utf8");
-            } else {
-              await fse3.copy(target.path, backupPath, { overwrite: false });
-            }
-            journal.createdBackups.push(backupPath);
-            await writeJournal(home, journal);
-          }
+          const backup = await createManagedBackup(home, journal, resource.id, target);
+          backupPath = backup.path;
+          backupHash = backup.hash;
         }
         if (currentHash !== entry.hash) {
           await recordOperation(home, journal, target.path, entry.payload, entry.root);
@@ -3482,7 +3590,17 @@ async function reconcileManagedResources(home, desiredResources, options = {}) {
           appliedCount++;
           if (options.failAfterApply !== void 0 && appliedCount >= options.failAfterApply) throw new Error("Injected managed-resource failure");
         }
-        records.push({ path: target.path, kind: target.kind, tool: target.tool, section: target.section, hash: entry.hash, ownership, backupPath });
+        records.push({
+          path: target.path,
+          kind: target.kind,
+          tool: target.tool,
+          section: target.section,
+          hash: entry.hash,
+          ownership,
+          backupPath,
+          backupHash,
+          sectionFileExisted
+        });
       }
       if (resource.targets.length > 0) {
         next.resources[resource.id] = { id: resource.id, type: resource.type, targets: records };
@@ -3510,9 +3628,6 @@ async function reconcileManagedResources(home, desiredResources, options = {}) {
         let stagedRoot;
         let backupPath = null;
         if (oldTarget.ownership === "replaced-with-backup") {
-          if (!oldTarget.backupPath || !await fse3.pathExists(oldTarget.backupPath)) {
-            throw new Error(`Managed resource backup is missing for ${oldTarget.path}`);
-          }
           backupPath = oldTarget.backupPath;
         }
         if (oldTarget.section) {
@@ -3522,7 +3637,8 @@ async function reconcileManagedResources(home, desiredResources, options = {}) {
             journal.backupCleanup.push(backupPath);
           }
           const stagedRemoval = await stageSectionRemoval(oldTarget, transactionId, appliedCount, restore);
-          payload = (await fse3.readFile(stagedRemoval.payload, "utf8")).trim() === "" ? null : stagedRemoval.payload;
+          const empty = (await fse3.readFile(stagedRemoval.payload, "utf8")).trim() === "";
+          payload = empty && oldTarget.sectionFileExisted === false ? null : stagedRemoval.payload;
           stagedRoot = stagedRemoval.root;
           journal.stagedRoots.push(stagedRoot);
           await writeJournal(home, journal);
@@ -3547,7 +3663,7 @@ async function reconcileManagedResources(home, desiredResources, options = {}) {
     committed = true;
   } catch (error) {
     if (!committed) {
-      await rollbackJournal(journal);
+      await rollbackJournal(home, journal);
       journal.status = "rolled-back";
       await writeJournal(home, journal).catch(() => void 0);
     }
@@ -3583,7 +3699,7 @@ async function uninstallManagedResources(home, options = {}) {
     plan: options.plan
   });
 }
-var MANIFEST_FILE, JOURNAL_FILE, BACKUPS_DIR;
+var MANIFEST_FILE, JOURNAL_FILE, BACKUPS_DIR, HASH_PATTERN, ManagedSectionSchema, ManagedTargetRecordSchema, ManagedResourceRecordSchema, ManagedResourceManifestSchema, JournalOperationSchema, ManagedResourceJournalSchema;
 var init_managed_resources = __esm({
   "src/managed-resources.ts"() {
     "use strict";
@@ -3591,6 +3707,69 @@ var init_managed_resources = __esm({
     MANIFEST_FILE = "managed-resources.json";
     JOURNAL_FILE = "managed-resources.journal.json";
     BACKUPS_DIR = "managed-resource-backups";
+    HASH_PATTERN = /^[0-9a-f]{64}$/;
+    ManagedSectionSchema = z3.object({ start: z3.string().min(1), end: z3.string().min(1) }).strict();
+    ManagedTargetRecordSchema = z3.object({
+      path: z3.string().min(1),
+      kind: z3.enum(["file", "directory"]),
+      tool: z3.string().min(1).optional(),
+      section: ManagedSectionSchema.optional(),
+      hash: z3.string().regex(HASH_PATTERN),
+      ownership: z3.enum(["created", "adopted", "replaced-with-backup"]),
+      backupPath: z3.string().min(1).optional(),
+      backupHash: z3.string().regex(HASH_PATTERN).optional(),
+      sectionFileExisted: z3.boolean().optional()
+    }).strict().superRefine((target, context) => {
+      const hasBackup = target.backupPath !== void 0 || target.backupHash !== void 0;
+      if (target.ownership === "replaced-with-backup" && (!target.backupPath || !target.backupHash)) {
+        context.addIssue({ code: z3.ZodIssueCode.custom, message: "replaced target requires backupPath and backupHash" });
+      } else if (target.ownership !== "replaced-with-backup" && hasBackup) {
+        context.addIssue({ code: z3.ZodIssueCode.custom, message: "non-replaced target must not carry backup metadata" });
+      }
+      if (target.section && target.sectionFileExisted === void 0) {
+        context.addIssue({ code: z3.ZodIssueCode.custom, message: "section target requires sectionFileExisted" });
+      } else if (!target.section && target.sectionFileExisted !== void 0) {
+        context.addIssue({ code: z3.ZodIssueCode.custom, message: "non-section target must not carry sectionFileExisted" });
+      }
+    });
+    ManagedResourceRecordSchema = z3.object({
+      id: z3.string().min(1),
+      type: z3.enum(["skills", "agents", "instructions"]),
+      targets: z3.array(ManagedTargetRecordSchema)
+    }).strict();
+    ManagedResourceManifestSchema = z3.object({
+      version: z3.literal(1),
+      resources: z3.record(z3.string().min(1), ManagedResourceRecordSchema)
+    }).strict();
+    JournalOperationSchema = z3.object({
+      target: z3.string().min(1),
+      previous: z3.string().min(1),
+      rollbackRoot: z3.string().min(1),
+      stagedRoot: z3.string().min(1).optional(),
+      hadPrevious: z3.boolean(),
+      previousKind: z3.enum(["file", "directory"]).optional(),
+      previousHash: z3.string().regex(HASH_PATTERN).optional(),
+      phase: z3.enum(["prepared", "previous-moved", "applied"]),
+      rollbackComplete: z3.boolean().optional()
+    }).strict().superRefine((operation, context) => {
+      if (operation.hadPrevious && (!operation.previousKind || !operation.previousHash)) {
+        context.addIssue({ code: z3.ZodIssueCode.custom, message: "operation with previous content requires kind and hash" });
+      } else if (!operation.hadPrevious && (operation.previousKind || operation.previousHash)) {
+        context.addIssue({ code: z3.ZodIssueCode.custom, message: "operation without previous content must not carry previous metadata" });
+      }
+    });
+    ManagedResourceJournalSchema = z3.object({
+      version: z3.literal(1),
+      transactionId: z3.string().regex(/^[A-Za-z0-9-]+$/),
+      status: z3.enum(["staging", "applying", "committed", "completed", "rolled-back"]),
+      resourceIds: z3.array(z3.string().min(1)),
+      operations: z3.array(JournalOperationSchema),
+      stagedRoots: z3.array(z3.string().min(1)),
+      createdBackups: z3.array(z3.string().min(1)),
+      backupCleanup: z3.array(z3.string().min(1)),
+      nextManifestHash: z3.string().regex(HASH_PATTERN).optional(),
+      updatedAt: z3.string().datetime()
+    }).strict();
   }
 });
 
@@ -3746,7 +3925,7 @@ var init_builtin_hooks = __esm({
 
 // src/resources/hooks.ts
 import path13 from "path";
-import { z as z3 } from "zod";
+import { z as z4 } from "zod";
 import YAML2 from "yaml";
 function teamHooksYamlPath(repoPath) {
   return path13.join(repoPath, "hooks", "hooks.yaml");
@@ -3820,28 +3999,28 @@ var init_hooks = __esm({
     init_types();
     init_fs();
     init_logger();
-    TeamHookSchema = z3.object({
+    TeamHookSchema = z4.object({
       /** Unique id (marker + manifest index). */
-      id: z3.string().regex(/^[a-z0-9-]+$/),
+      id: z4.string().regex(/^[a-z0-9-]+$/),
       /** Written into the hook description. */
-      description: z3.string(),
+      description: z4.string(),
       /** Claude PascalCase event name. */
-      event: z3.string().min(1),
+      event: z4.string().min(1),
       /** Optional tool matcher (e.g. "Bash"). */
-      matcher: z3.string().optional(),
+      matcher: z4.string().optional(),
       /** Shell command to run. */
-      command: z3.string().min(1),
+      command: z4.string().min(1),
       /** Optional per-hook timeout in seconds. */
-      timeout: z3.number().optional(),
+      timeout: z4.number().optional(),
       /** Optional restriction to specific tools (default = all hook-capable tools). */
-      tools: z3.array(z3.string()).optional()
+      tools: z4.array(z4.string()).optional()
     });
-    BuiltinOverrideSchema = z3.object({
-      disabled: z3.array(z3.string()).default([]),
-      overrides: z3.record(z3.string(), z3.object({ timeout: z3.number().optional() })).default({})
+    BuiltinOverrideSchema = z4.object({
+      disabled: z4.array(z4.string()).default([]),
+      overrides: z4.record(z4.string(), z4.object({ timeout: z4.number().optional() })).default({})
     }).default({ disabled: [], overrides: {} });
-    HooksYamlSchema = z3.object({
-      hooks: z3.array(TeamHookSchema).default([]),
+    HooksYamlSchema = z4.object({
+      hooks: z4.array(TeamHookSchema).default([]),
       builtin: BuiltinOverrideSchema
     });
     HooksHandler = class extends ResourceHandler {
@@ -8745,7 +8924,7 @@ var init_docs = __esm({
 
 // src/resources/env.ts
 import path26 from "path";
-import { z as z4 } from "zod";
+import { z as z5 } from "zod";
 import YAML6 from "yaml";
 function maskEnvValue(value) {
   if (value.length < 4) return "****";
@@ -8762,13 +8941,13 @@ var init_env = __esm({
     init_types();
     init_fs();
     init_logger();
-    EnvVariableSchema = z4.object({
-      key: z4.string(),
-      value: z4.string(),
-      description: z4.string().optional()
+    EnvVariableSchema = z5.object({
+      key: z5.string(),
+      value: z5.string(),
+      description: z5.string().optional()
     });
-    EnvYamlSchema = z4.object({
-      variables: z4.array(EnvVariableSchema).default([])
+    EnvYamlSchema = z5.object({
+      variables: z5.array(EnvVariableSchema).default([])
     });
     EnvHandler = class extends ResourceHandler {
       type = "env";
@@ -9859,7 +10038,7 @@ var init_agents = __esm({
 
 // src/resources/mcp.ts
 import path31 from "path";
-import { z as z5 } from "zod";
+import { z as z6 } from "zod";
 import YAML7 from "yaml";
 function teamMcpYamlPath(repoPath) {
   return path31.join(repoPath, "mcp", "mcp.yaml");
@@ -9901,25 +10080,25 @@ var init_mcp = __esm({
     init_base();
     init_fs();
     init_logger();
-    TeamMcpServerSchema = z5.object({
-      name: z5.string().regex(/^[A-Za-z0-9_-]+$/, "name must be alphanumeric with - or _"),
-      description: z5.string().optional(),
-      transport: z5.enum(["stdio", "http", "sse"]),
-      command: z5.string().optional(),
-      args: z5.array(z5.string()).optional(),
-      url: z5.string().optional(),
-      headers: z5.record(z5.string(), z5.string()).optional(),
-      env: z5.record(z5.string(), z5.string()).optional(),
-      timeout: z5.number().int().positive().optional(),
-      requires: z5.array(z5.string()).optional(),
-      tools: z5.array(z5.string()).optional()
+    TeamMcpServerSchema = z6.object({
+      name: z6.string().regex(/^[A-Za-z0-9_-]+$/, "name must be alphanumeric with - or _"),
+      description: z6.string().optional(),
+      transport: z6.enum(["stdio", "http", "sse"]),
+      command: z6.string().optional(),
+      args: z6.array(z6.string()).optional(),
+      url: z6.string().optional(),
+      headers: z6.record(z6.string(), z6.string()).optional(),
+      env: z6.record(z6.string(), z6.string()).optional(),
+      timeout: z6.number().int().positive().optional(),
+      requires: z6.array(z6.string()).optional(),
+      tools: z6.array(z6.string()).optional()
     }).refine((s) => s.transport === "stdio" ? !!s.command : true, {
       message: "stdio transport requires `command`"
     }).refine((s) => s.transport === "stdio" ? true : !!s.url, {
       message: "http/sse transport requires `url`"
     });
-    McpYamlSchema = z5.object({
-      servers: z5.array(TeamMcpServerSchema).default([])
+    McpYamlSchema = z6.object({
+      servers: z6.array(TeamMcpServerSchema).default([])
     });
     McpHandler = class extends ResourceHandler {
       type = "mcp";
@@ -16616,8 +16795,13 @@ async function pull(options) {
       await planPullForScope(localConfig, teamConfig);
       log.info("Plan \u2014 no Git refresh, bootstrap, hook migration, network, or file writes were performed.");
     } catch (error) {
-      log.debug(`Plan scan skipped: ${error.message}`);
-      log.info("Plan \u2014 pull would reconcile TeamAI resources if configured. No changes made.");
+      const message = error.message;
+      if (message.includes("teamai is not initialized") || message.includes("Team config (teamai.yaml) not found")) {
+        log.info("Plan \u2014 pull would reconcile TeamAI resources if configured. No changes made.");
+      } else {
+        log.error(`Plan failed: ${message}`);
+        process.exitCode = 1;
+      }
     }
     return;
   }
@@ -29200,7 +29384,7 @@ var init_import_repo = __esm({
 });
 
 // src/repo-list/schema.ts
-import { z as z6 } from "zod";
+import { z as z7 } from "zod";
 function isOrgEntry(item) {
   return "org" in item;
 }
@@ -29208,24 +29392,24 @@ var RepoListEntrySchema, RepoListOrgEntrySchema, RepoListItemSchema, RepoListFil
 var init_schema = __esm({
   "src/repo-list/schema.ts"() {
     "use strict";
-    RepoListEntrySchema = z6.object({
-      url: z6.string().url(),
-      domain: z6.string().optional(),
-      iwiki_space: z6.string().optional(),
-      auth: z6.enum(["token", "ssh", "public"]).optional(),
-      priority: z6.enum(["low", "normal", "high"]).optional().default("normal")
+    RepoListEntrySchema = z7.object({
+      url: z7.string().url(),
+      domain: z7.string().optional(),
+      iwiki_space: z7.string().optional(),
+      auth: z7.enum(["token", "ssh", "public"]).optional(),
+      priority: z7.enum(["low", "normal", "high"]).optional().default("normal")
     });
-    RepoListOrgEntrySchema = z6.object({
-      org: z6.string().url(),
-      include_pattern: z6.string().optional(),
-      exclude_pattern: z6.string().optional(),
-      default_domain: z6.string().optional(),
-      auth: z6.enum(["token", "ssh", "public"]).optional()
+    RepoListOrgEntrySchema = z7.object({
+      org: z7.string().url(),
+      include_pattern: z7.string().optional(),
+      exclude_pattern: z7.string().optional(),
+      default_domain: z7.string().optional(),
+      auth: z7.enum(["token", "ssh", "public"]).optional()
     });
-    RepoListItemSchema = z6.union([RepoListOrgEntrySchema, RepoListEntrySchema]);
-    RepoListFileSchema = z6.object({
-      version: z6.literal(1).default(1),
-      repos: z6.array(RepoListItemSchema).default([])
+    RepoListItemSchema = z7.union([RepoListOrgEntrySchema, RepoListEntrySchema]);
+    RepoListFileSchema = z7.object({
+      version: z7.literal(1).default(1),
+      repos: z7.array(RepoListItemSchema).default([])
     });
   }
 });

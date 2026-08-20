@@ -228,6 +228,10 @@ export async function initHttp(
   url: string,
   options: GlobalOptions & { scope?: string; role?: string; agent?: string | string[]; force?: boolean; token?: string; inheritUserScope?: boolean },
 ): Promise<void> {
+  if (options.dryRun || options.plan) {
+    log.info('Plan — init would validate the HTTP source and configure local TeamAI files. No changes made.');
+    return;
+  }
   const { resolveApiKey, saveApiKey, getApiKeyPath } = await import('./api-key.js');
 
   log.info('Initializing teamai (HTTP read-only consumer)...');
@@ -586,6 +590,10 @@ export async function initSelfRepo(options: GlobalOptions & {
   force?: boolean;
   inheritUserScope?: boolean;
 }): Promise<void> {
+  if (options.dryRun || options.plan) {
+    log.info('Plan — init would prepare the single-repo TeamAI skeleton. No changes made.');
+    return;
+  }
   log.info('Initializing teamai (single-repo mode)...');
 
   const cwd = process.cwd();
@@ -865,6 +873,10 @@ export async function init(options: GlobalOptions & {
   inheritUserScope?: boolean;
   self?: boolean;
 }): Promise<void> {
+  if (options.dryRun || options.plan) {
+    log.info('Plan — init would validate the repository and configure TeamAI. No changes made.');
+    return;
+  }
   if (options.http) {
     return initHttp(options.http, options);
   }

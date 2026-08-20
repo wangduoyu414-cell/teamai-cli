@@ -13,6 +13,7 @@ program
   .description('TeamAI — The team harness for AI agents')
   .version(version)
   .option('--dry-run', 'Preview mode, no changes made')
+  .option('--plan', 'Preview lifecycle work with zero side effects (alias for --dry-run)')
   .option('-v, --verbose', 'Verbose output')
   .hook('preAction', (thisCommand) => {
     const opts = thisCommand.opts();
@@ -40,7 +41,7 @@ program
   .action(async (repoArg, cmdOpts) => {
     const globalOpts = program.opts() as GlobalOptions;
     const { init } = await import('./init.js');
-    await init({ ...globalOpts, ...cmdOpts, repoPositional: repoArg });
+    await init({ ...globalOpts, ...cmdOpts, dryRun: !!(globalOpts.dryRun || globalOpts.plan), repoPositional: repoArg });
   });
 
 program
@@ -64,7 +65,7 @@ program
     const globalOpts = program.opts() as GlobalOptions;
     if (cmdOpts.silent) setSilent(true);
     const { pull } = await import('./pull.js');
-    await pull({ ...globalOpts, ...cmdOpts });
+    await pull({ ...globalOpts, ...cmdOpts, dryRun: !!(globalOpts.dryRun || globalOpts.plan) });
   });
 
 program
@@ -436,7 +437,7 @@ program
   .action(async (cmdOpts) => {
     const globalOpts = program.opts() as GlobalOptions;
     const { uninstall } = await import('./uninstall.js');
-    await uninstall({ ...globalOpts, ...cmdOpts });
+    await uninstall({ ...globalOpts, ...cmdOpts, dryRun: !!(globalOpts.dryRun || globalOpts.plan) });
   });
 
 const envCmd = program

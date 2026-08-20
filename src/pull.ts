@@ -28,6 +28,7 @@ import {
 } from './types.js';
 import type { CultureFrontmatter } from './types.js';
 import { loadRolesManifest, resolveRoleResourceNamespaces, type ResourceNamespaces } from './roles.js';
+import { managedManifestTargetPaths, reconcileManagedResources, type DesiredManagedResource } from './managed-resources.js';
 
 interface RolePullContext {
   activeNamespaces: ResourceNamespaces;
@@ -341,9 +342,9 @@ async function pullForScope(
             try { const { deployBuiltinAgents } = await import('./builtin-agents.js'); await deployBuiltinAgents(cfg, localConfig, { skipRecall }); } catch {}
             try { const { deployBuiltinRules } = await import('./builtin-rules.js'); await deployBuiltinRules(cfg, localConfig, { skipRecall }); } catch {}
             try { const { deployBuiltinSkills } = await import('./builtin-skills.js'); await deployBuiltinSkills(cfg, localConfig, { reportingOnly, skipRecall }); } catch {}
-            // Also refresh the CLAUDE.md recall block so a CLI upgrade that ships
-            // a new block reaches CLAUDE.md even when the repo HEAD is unchanged.
-            await injectRecallBlockIntoTools(cfg, localConfig, scopeLabel);
+            // Instruction ownership is ledger-backed too, so a CLI update can
+            // refresh it without reintroducing the old direct-write path.
+            await reconcileManagedInstructions(cfg, localConfig, null, scopeLabel);
           }
         }
         return;
@@ -379,7 +380,6 @@ async function pullForScope(
   const resourceTypes: readonly ResourceType[] = policy.resourceTypes
     ?? ['skills', 'rules', 'docs', 'env', 'agents'];
   let totalSynced = 0;
-  let desiredSkillNames: Set<string> | null = null;
   let knownRepoSkillNames: Set<string> | null = null;
 
   for (const type of resourceTypes) {
@@ -436,11 +436,43 @@ async function pullForScope(
       if (excludedSkills.size > 0) {
         items = items.filter((item) => !excludedSkills.has(item.name));
       }
-      desiredSkillNames = new Set(items.map((i) => i.name));
       knownRepoSkillNames = new Set(allTeamSkills.map((i) => i.name));
     } else {
       items = await handler.scanTeamForPull(freshConfig, localConfig);
     }
+    if (type === 'skills' || type === 'agents') {
+      const home = getTeamaiHome(localConfig.scope, localConfig.projectRoot);
+      let resources: DesiredManagedResource[] = [];
+      let complete = true;
+      if (type === 'skills') {
+        const skillsHandler = handler as import('./resources/skills.js').SkillsHandler;
+        resources = await Promise.all(items.map((item) => skillsHandler.buildManagedResource(item, freshConfig, localConfig)));
+      } else {
+        const agentsHandler = handler as import('./resources/agents.js').AgentsHandler;
+        const plans = await Promise.all(items.map((item) => agentsHandler.buildManagedResource(item, freshConfig, localConfig)));
+        complete = plans.every((plan) => plan !== null);
+        resources = plans.filter((plan): plan is DesiredManagedResource => plan !== null);
+      }
+
+      if (options.dryRun) {
+        log.info(`[${scopeLabel}] [dry-run] Would reconcile ${items.length} ${type}`);
+      } else {
+        const result = await reconcileManagedResources(home, resources, {
+          // A malformed agent is intentionally non-destructive: update the valid
+          // ones, but wait to prune stale targets until every source rendered.
+          pruneTypes: complete ? [type] : [],
+        });
+        for (const conflict of result.conflicts) log.warn(`[${scopeLabel}] Preserved local change: ${conflict}`);
+        if (items.length > 0) {
+          log.success(`[${scopeLabel}] Synced ${items.length} ${type}`);
+        } else if (result.removed.length > 0) {
+          log.success(`[${scopeLabel}] Removed ${result.removed.length} stale ${type}`);
+        }
+      }
+      totalSynced += items.length;
+      continue;
+    }
+
     if (items.length === 0) continue;
 
     if (type === 'env') {
@@ -464,10 +496,10 @@ async function pullForScope(
       const fileCount = await docsHandler.countDocFiles(items[0].sourcePath);
 
       if (options.dryRun) {
-        log.info(`[${scopeLabel}] [dry-run] Would sync ${fileCount} docs`);
+        log.info(`[${scopeLabel}] [dry-run] Would ${(freshConfig.sharing.docs.mode ?? 'copy') === 'index-only' ? 'index' : 'sync'} ${fileCount} docs`);
       } else {
         await docsHandler.pullItem(items[0], freshConfig, localConfig);
-        log.success(`[${scopeLabel}] Synced ${fileCount} docs`);
+        log.success(`[${scopeLabel}] ${(freshConfig.sharing.docs.mode ?? 'copy') === 'index-only' ? 'Indexed' : 'Synced'} ${fileCount} docs${(freshConfig.sharing.docs.mode ?? 'copy') === 'index-only' ? ' (team checkout only)' : ''}`);
       }
       totalSynced += fileCount;
       continue;
@@ -480,12 +512,7 @@ async function pullForScope(
       const added = items.filter(i => !existingNames.has(i.name));
       const updated = items.filter(i => existingNames.has(i.name));
 
-      if (added.length > 0 && type === 'skills') {
-        log.info(`[${scopeLabel}] [dry-run] Would pull ${items.length} ${type} (${added.length} new, ${updated.length} updated)`);
-        log.dim(`    new: ${added.map(i => i.name).join(', ')}`);
-      } else {
-        log.info(`[${scopeLabel}] [dry-run] Would pull ${items.length} ${type}`);
-      }
+      log.info(`[${scopeLabel}] [dry-run] Would pull ${items.length} ${type}`);
       if (options.verbose) {
         for (const item of items) {
           log.dim(`  ${item.name}`);
@@ -496,11 +523,7 @@ async function pullForScope(
         await handler.pullItem(item, freshConfig, localConfig);
       }
 
-      if (type === 'skills') {
-        logSyncDetail(type, items, existingNames, !!options.verbose, scopeLabel, skippedByTags);
-      } else {
-        log.success(`[${scopeLabel}] Synced ${items.length} ${type}`);
-      }
+      log.success(`[${scopeLabel}] Synced ${items.length} ${type}`);
     }
 
     totalSynced += items.length;
@@ -517,11 +540,17 @@ async function pullForScope(
       toolPathField: 'rules' | 'skills' | 'agents';
     }[] = [
       { type: 'rules', ext: '.md', toolPathField: 'rules' },
+      // Pre-ledger installations have no ownership record. Retain their legacy
+      // tombstone cleanup, while ledger-owned targets are pruned transactionally
+      // above and are never deleted through this inference path.
       { type: 'skills', toolPathField: 'skills' },
       { type: 'agents', ext: '.md', toolPathField: 'agents' },
     ];
 
     const baseDir = resolveBaseDir(localConfig);
+    const managedPaths = await (await import('./managed-resources.js')).managedManifestTargetPaths(
+      getTeamaiHome(localConfig.scope, localConfig.projectRoot),
+    );
     for (const { type, ext, toolPathField } of tombstoneTypes) {
       const handler = getHandler(type);
       const tombstones = await handler.readTombstones(localConfig);
@@ -530,11 +559,12 @@ async function pullForScope(
       for (const [tool, toolPath] of Object.entries(freshConfig.toolPaths)) {
         const dir = toolPath[toolPathField];
         if (!dir) continue;
-        if (!await ResourceHandler.isToolInstalled(dir, baseDir)) continue;
+        if (!await ResourceHandler.isToolInstalled(dir, baseDir, toolPath.probe)) continue;
         if (isAgentDisabled(localConfig, tool)) continue;
 
         for (const name of tombstones) {
           const localPath = path.join(baseDir, dir, ext ? `${name}${ext}` : name);
+          if (managedPaths.has(localPath)) continue;
           if (await pathExists(localPath)) {
             await remove(localPath);
             log.debug(`[${scopeLabel}] Cleaned up tombstoned ${type} ${name} from ${dir}`);
@@ -543,51 +573,19 @@ async function pullForScope(
       }
     }
 
-    if (roleContext) {
-      await cleanupInactiveNamespaceSkills(
-        freshConfig,
-        localConfig,
-        roleContext.activeSkillNames,
-        roleContext.inactiveSkillNames,
-      );
-    }
-  }
-
-  // Step 3b: Clean up local skills not in the desired union set (role + tags)
-  if (!options.dryRun && desiredSkillNames && knownRepoSkillNames) {
-    const baseDir = resolveBaseDir(localConfig);
-
-    for (const [tool, toolPath] of Object.entries(freshConfig.toolPaths)) {
-      if (isAgentDisabled(localConfig, tool)) continue;
-      if (!toolPath.skills) continue;
-      if (!await ResourceHandler.isToolInstalled(toolPath.skills, baseDir, toolPath.probe)) continue;
-      const skillsDir = path.join(baseDir, toolPath.skills);
-      if (!await pathExists(skillsDir)) continue;
-
-      const localDirs = await listDirs(skillsDir);
-      for (const dir of localDirs) {
-        if (BUILTIN_SKILL_NAMES.has(dir)) continue;
-        if (desiredSkillNames.has(dir)) continue;
-        if (!knownRepoSkillNames.has(dir)) continue;
-        const skillDir = path.join(skillsDir, dir);
-        await remove(skillDir);
-        log.debug(`Removed excluded skill ${dir} from ${tool}`);
-      }
-
-      // Old releases could leave namespace-nested copies behind. Pull now
-      // installs skills flat, but remove an excluded nested copy as well.
-      if (excludedSkills.size > 0) {
-        for (const namespace of localDirs) {
-          const namespaceDir = path.join(skillsDir, namespace);
-          // A top-level skill is not a namespace; never traverse into it.
-          if (await pathExists(path.join(namespaceDir, 'SKILL.md'))) continue;
-          for (const skillName of await listDirs(namespaceDir)) {
-            if (!excludedSkills.has(skillName) || BUILTIN_SKILL_NAMES.has(skillName)) continue;
-            const nestedSkillDir = path.join(namespaceDir, skillName);
-            if (!await pathExists(path.join(nestedSkillDir, 'SKILL.md'))) continue;
-            await remove(nestedSkillDir);
-            log.debug(`Removed excluded skill ${namespace}/${skillName} from ${tool}`);
-          }
+    // Keep the explicit exclusion contract for pre-ledger installations. Managed
+    // targets are handled by the transaction engine (and retain its conflict
+    // guard); an older untracked copy can still be removed on the user's request.
+    if (excludedSkills.size > 0 && knownRepoSkillNames) {
+      for (const [tool, toolPath] of Object.entries(freshConfig.toolPaths)) {
+        if (isAgentDisabled(localConfig, tool) || !toolPath.skills) continue;
+        if (!await ResourceHandler.isToolInstalled(toolPath.skills, baseDir, toolPath.probe)) continue;
+        const skillsDir = path.join(baseDir, toolPath.skills);
+        for (const name of excludedSkills) {
+          if (!knownRepoSkillNames.has(name)) continue;
+          const localPath = path.join(skillsDir, name);
+          if (managedPaths.has(localPath)) continue;
+          if (await pathExists(localPath)) await remove(localPath);
         }
       }
     }
@@ -679,70 +677,11 @@ async function pullForScope(
     }
   }
 
-  // Step 3.6: Inject team culture into CLAUDE.md
+  // Step 3.6–3.8: Reconcile team instructions through the ownership ledger.
+  // User scope owns complete host instruction files; project scope only owns the
+  // TeamAI marker blocks inside <project>/AGENTS.md.
   if (!options.dryRun) {
-    try {
-      const culturePath = path.join(localConfig.repo.localPath, 'culture.md');
-      if (await pathExists(culturePath)) {
-        const cultureContent = await readFileSafe(culturePath);
-        if (cultureContent) {
-          const compiled = compileCulture(cultureContent);
-          if (compiled) {
-            const baseDir = resolveBaseDir(localConfig);
-            for (const [tool, toolPath] of Object.entries(freshConfig.toolPaths)) {
-              if (isAgentDisabled(localConfig, tool)) continue;
-              if (!toolPath.claudemd) continue;
-              if (toolPath.rules && !await ResourceHandler.isToolInstalled(toolPath.rules, baseDir)) continue;
-
-              const claudeMdPath = path.join(baseDir, toolPath.claudemd);
-              try {
-                await injectClaudeMdSection(claudeMdPath, TEAMAI_CULTURE_START, TEAMAI_CULTURE_END, compiled);
-                log.debug(`Injected culture into ${tool} CLAUDE.md`);
-              } catch (e) {
-                log.warn(`Failed to inject culture into ${tool} CLAUDE.md: ${(e as Error).message}`);
-              }
-            }
-            log.success('Synced team culture');
-          }
-        }
-      }
-    } catch (e) {
-      log.debug(`Culture sync skipped: ${(e as Error).message}`);
-    }
-  }
-
-  // Step 3.7: Inject shared claudemd instructions into CLAUDE.md
-  if (!options.dryRun) {
-    try {
-      const claudemdContents = await collectClaudemdFiles(
-          localConfig.repo.localPath, roleContext);
-      if (claudemdContents.length > 0) {
-        const compiled = compileClaudemd(claudemdContents);
-        if (compiled) {
-          const baseDir = resolveBaseDir(localConfig);
-          for (const [tool, toolPath] of Object.entries(freshConfig.toolPaths)) {
-            if (isAgentDisabled(localConfig, tool)) continue;
-            if (!toolPath.claudemd) continue;
-            if (toolPath.rules && !await ResourceHandler.isToolInstalled(toolPath.rules, baseDir)) continue;
-            const claudeMdPath = path.join(baseDir, toolPath.claudemd);
-            try {
-              await injectClaudeMdSection(claudeMdPath, TEAMAI_CLAUDEMD_START, TEAMAI_CLAUDEMD_END, compiled);
-              log.debug(`Injected shared instructions into ${tool} CLAUDE.md`);
-            } catch (e) {
-              log.warn(`Failed to inject shared instructions into ${tool} CLAUDE.md: ${(e as Error).message}`);
-            }
-          }
-          log.success(`[${scopeLabel}] Synced shared instructions (${claudemdContents.length} file(s))`);
-        }
-      }
-    } catch (e) {
-      log.debug(`Shared instructions sync skipped: ${(e as Error).message}`);
-    }
-  }
-
-  // Step 3.8: Inject teamai-recall subagent rules block (Phase 1)
-  if (!options.dryRun) {
-    await injectRecallBlockIntoTools(freshConfig, localConfig, scopeLabel);
+    await reconcileManagedInstructions(freshConfig, localConfig, roleContext, scopeLabel);
   }
 
   // Step 4: Deploy CLI built-in skills
@@ -944,6 +883,99 @@ export function compileClaudemd(contents: string[]): string | null {
 }
 
 /**
+ * Build instruction destinations after every source is known, then apply them in
+ * one transaction. This intentionally does not use injectClaudeMdSection: direct
+ * marker writes could race a resource update and left no ownership evidence.
+ */
+export async function reconcileManagedInstructions(
+  config: TeamaiConfig,
+  localConfig: LocalConfig,
+  roleContext: RolePullContext | null,
+  scopeLabel: string,
+  options: { plan?: boolean } = {},
+): Promise<import('./managed-resources.js').ManagedReconcileResult> {
+  try {
+    const sourcePath = path.join(localConfig.repo.localPath, config.sharing.instructions?.source ?? 'AGENTS.md');
+    let source = await readFileSafe(sourcePath);
+    // Existing team repositories may not have adopted root AGENTS.md yet. Keep
+    // their culture/claudemd behaviour as a read-only source compatibility path.
+    if (!source) {
+      const cultureRaw = await readFileSafe(path.join(localConfig.repo.localPath, 'culture.md'));
+      const culture = cultureRaw ? compileCulture(cultureRaw) : null;
+      const shared = compileClaudemd(await collectClaudemdFiles(localConfig.repo.localPath, roleContext));
+      source = [culture, shared].filter((block): block is string => !!block).join('\n\n') || null;
+    }
+    const home = getTeamaiHome(localConfig.scope, localConfig.projectRoot);
+    // Recall is a CLI-built-in instruction channel. Keep its established marker
+    // updater for repositories that have not opted into a root AGENTS.md yet;
+    // once a lifecycle ledger exists, absence of that source correctly prunes it.
+    if (!source && !options.plan && localConfig.scope === 'user' && isRecallEnabled(localConfig, config)
+      && (await managedManifestTargetPaths(home)).size === 0) {
+      await injectRecallBlockIntoTools(config, localConfig, scopeLabel);
+      return { applied: [], removed: [], conflicts: [], planned: [] };
+    }
+    const resources: DesiredManagedResource[] = [];
+    const instructionSection = {
+      start: '<!-- [teamai:instructions:start] -->',
+      end: '<!-- [teamai:instructions:end] -->',
+    };
+
+    if (localConfig.scope === 'project') {
+      if (source || isRecallEnabled(localConfig, config)) {
+        const target = path.join(resolveBaseDir(localConfig), 'AGENTS.md');
+        const body = [source, isRecallEnabled(localConfig, config) ? compileRecallRulesBlock() : null]
+          .filter((block): block is string => !!block)
+          .join('\n\n')
+          .trim();
+        resources.push({
+          id: 'instructions:project-agents',
+          type: 'instructions',
+          targets: [{
+            path: target,
+            kind: 'file',
+            section: instructionSection,
+            content: `${instructionSection.start}\n<!-- DO NOT EDIT: This section is auto-managed by teamai -->\n\n${body}\n${instructionSection.end}`,
+          }],
+        });
+      }
+    } else {
+      const baseDir = resolveBaseDir(localConfig);
+      for (const [tool, toolPath] of Object.entries(config.toolPaths)) {
+        const instructionPath = toolPath.instruction ?? toolPath.claudemd;
+        if (isAgentDisabled(localConfig, tool) || !instructionPath || !source) continue;
+        const installationPath = toolPath.skills ?? instructionPath;
+        if (!await ResourceHandler.isToolInstalled(installationPath, baseDir)) continue;
+        const blocks = [source, toolPath.agents && isRecallEnabled(localConfig, config) ? compileRecallRulesBlock() : null]
+          .filter((block): block is string => !!block);
+        resources.push({
+          id: `instructions:${tool}`,
+          type: 'instructions',
+          targets: [{
+            path: path.join(baseDir, instructionPath),
+            kind: 'file',
+            tool,
+            // User scope's host instruction file is a complete TeamAI-managed file.
+            content: `${blocks.join('\n\n').trim()}\n`,
+          }],
+        });
+      }
+    }
+
+    const result = await reconcileManagedResources(home, resources, { pruneTypes: ['instructions'], plan: options.plan });
+    for (const conflict of result.conflicts) log.warn(`[${scopeLabel}] Preserved local instruction: ${conflict}`);
+    if (options.plan) {
+      for (const target of result.planned) log.info(`[${scopeLabel}] [plan] instructions: ${target}`);
+    } else if (resources.length > 0) {
+      log.debug(`[${scopeLabel}] Reconciled ${resources.length} instruction host(s)`);
+    }
+    return result;
+  } catch (error) {
+    log.warn(`[${scopeLabel}] Instruction lifecycle failed: ${(error as Error).message}`);
+    throw error;
+  }
+}
+
+/**
  * Inject (or replace) the teamai-recall block into every Tier-1 tool's CLAUDE.md.
  *
  * Only injected for Tier-1 tools that have BOTH `agents` and `claudemd`
@@ -1140,6 +1172,53 @@ async function autoMigrateHooksIfNeeded(): Promise<void> {
   log.debug('Hooks migrated to dispatch format');
 }
 
+/** Read-only lifecycle preview using the already-present team checkout. */
+async function planPullForScope(localConfig: LocalConfig, teamConfig: TeamaiConfig): Promise<void> {
+  const scopeLabel = localConfig.scope;
+  let roleContext: RolePullContext | null = null;
+  try {
+    roleContext = await buildRolePullContext(localConfig);
+  } catch (error) {
+    log.warn(`[${scopeLabel}] Cannot resolve role profile for plan: ${(error as Error).message}`);
+  }
+  const tagsConfig = await loadTagsConfig(localConfig.repo.localPath);
+  const subscribedTags = localConfig.subscribedTags;
+  const excludedSkills = new Set(localConfig.excludedSkills ?? []);
+  const home = getTeamaiHome(localConfig.scope, localConfig.projectRoot);
+
+  const skillHandler = getHandler('skills') as import('./resources/skills.js').SkillsHandler;
+  const directoryItems = roleContext
+    ? await scanRoleAwareSkills(localConfig, roleContext.activeNamespaces)
+    : await skillHandler.scanTeamForPull(teamConfig, localConfig);
+  const allSkills = await skillHandler.scanTeamForPull(teamConfig, localConfig);
+  const tagged = tagsConfig && subscribedTags && subscribedTags.length > 0
+    ? filterByTags(allSkills, tagsConfig, subscribedTags, 'skills').included
+    : [];
+  const skillItems = [...new Map([...directoryItems, ...tagged].map((item) => [item.name, item])).values()]
+    .filter((item) => !excludedSkills.has(item.name));
+  const skillResources = await Promise.all(skillItems.map((item) => skillHandler.buildManagedResource(item, teamConfig, localConfig)));
+  const skillPlan = await reconcileManagedResources(home, skillResources, { pruneTypes: ['skills'], plan: true });
+  for (const target of skillPlan.planned) log.info(`[${scopeLabel}] [plan] skills: ${target}`);
+  for (const conflict of skillPlan.conflicts) log.warn(`[${scopeLabel}] [plan] conflict: ${conflict}`);
+
+  const agentHandler = getHandler('agents') as import('./resources/agents.js').AgentsHandler;
+  const agentItems = await agentHandler.scanTeamForPull(teamConfig, localConfig);
+  const agentPlans = await Promise.all(agentItems.map((item) => agentHandler.buildManagedResource(item, teamConfig, localConfig)));
+  const completeAgents = agentPlans.every((resource) => resource !== null);
+  const agentResources = agentPlans.filter((resource): resource is DesiredManagedResource => resource !== null);
+  const agentPlan = await reconcileManagedResources(home, agentResources, {
+    pruneTypes: completeAgents ? ['agents'] : [], plan: true,
+  });
+  for (const target of agentPlan.planned) log.info(`[${scopeLabel}] [plan] agents: ${target}`);
+  for (const conflict of agentPlan.conflicts) log.warn(`[${scopeLabel}] [plan] conflict: ${conflict}`);
+
+  const instructionPlan = await reconcileManagedInstructions(teamConfig, localConfig, roleContext, scopeLabel, { plan: true });
+  for (const conflict of instructionPlan.conflicts) log.warn(`[${scopeLabel}] [plan] conflict: ${conflict}`);
+  if (skillPlan.planned.length + agentPlan.planned.length + instructionPlan.planned.length === 0) {
+    log.info(`[${scopeLabel}] [plan] No managed resource changes`);
+  }
+}
+
 /**
  * Main pull entry point.
  *
@@ -1149,6 +1228,19 @@ async function autoMigrateHooksIfNeeded(): Promise<void> {
  * source skills are pulled only for the active project scope.
  */
 export async function pull(options: GlobalOptions): Promise<void> {
+  if (options.dryRun || options.plan) {
+    // Do not auto-migrate hooks, auto-bootstrap self mode, refresh git, spawn a
+    // provider command, or write a cache while planning.
+    try {
+      const { localConfig, teamConfig } = await (await import('./config.js')).autoDetectInit({ readOnly: true });
+      await planPullForScope(localConfig, teamConfig);
+      log.info('Plan — no Git refresh, bootstrap, hook migration, network, or file writes were performed.');
+    } catch (error) {
+      log.debug(`Plan scan skipped: ${(error as Error).message}`);
+      log.info('Plan — pull would reconcile TeamAI resources if configured. No changes made.');
+    }
+    return;
+  }
   // 0. Auto-migrate hooks if settings.json has old format (pre-dispatch era).
   //    This runs on the first session start after a CLI update — the new binary
   //    detects the old individual hooks and reinjects the merged dispatch format.

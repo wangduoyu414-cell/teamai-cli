@@ -20,6 +20,8 @@ import {
 } from './agent-format.js';
 import type { AgentSpec, ToolName, ReverseResult, ParseResult } from './agent-format.js';
 import { loadModelPolicy, resolveModelRef } from '../model-policy.js';
+import { reconcileManagedResources, type DesiredManagedResource } from '../managed-resources.js';
+import { getTeamaiHome } from '../types.js';
 
 /**
  * Extended ResourceItem for agents — carries merged spec or skip reason
@@ -306,38 +308,50 @@ export class AgentsHandler extends ResourceHandler {
    * Legacy format (.md): copies .md as-is to claude/claude-internal/codebuddy only.
    */
   async pullItem(item: ResourceItem, teamConfig: TeamaiConfig, localConfig: LocalConfig): Promise<void> {
+    const resource = await this.buildManagedResource(item, teamConfig, localConfig);
+    if (!resource) return;
+    const home = getTeamaiHome(localConfig.scope, localConfig.projectRoot);
+    const result = await reconcileManagedResources(home, [resource]);
+    for (const conflict of result.conflicts) log.warn(`Skipped agent sync: ${conflict}`);
+  }
+
+  /** Render all destinations first so a malformed agent cannot leave half a fleet updated. */
+  async buildManagedResource(
+    item: ResourceItem,
+    teamConfig: TeamaiConfig,
+    localConfig: LocalConfig,
+  ): Promise<DesiredManagedResource | null> {
     const agentItem = item as AgentResourceItem;
     const baseDir = resolveBaseDir(localConfig);
-
-    // Determine format: explicit flag takes precedence; fall back to extension detection
     const isLegacy = agentItem.legacy === true || (!agentItem.legacy && !item.sourcePath.endsWith('.yaml'));
-
+    const targets: DesiredManagedResource['targets'] = [];
     if (isLegacy) {
-      // Legacy: copy .md to tools that support agents
-      await this.pullLegacyMd(item, teamConfig, baseDir, localConfig);
-      return;
+      const legacyTools = new Set(['claude', 'claude-internal', 'tclaude', 'codebuddy']);
+      for (const [tool, toolPath] of Object.entries(teamConfig.toolPaths)) {
+        if (!legacyTools.has(tool) || !toolPath.agents || isAgentDisabled(localConfig, tool)) continue;
+        if (!await ResourceHandler.isToolInstalled(toolPath.agents, baseDir, toolPath.probe)) continue;
+        targets.push({ path: path.join(baseDir, toolPath.agents, `${item.name}.md`), kind: 'file', tool, sourcePath: item.sourcePath });
+      }
+      return { id: `agents:${item.name}`, type: 'agents', targets };
     }
 
-    // New YAML format: parse + render per-tool
     const content = await readFileSafe(item.sourcePath);
     if (!content) {
       log.warn(`agents: cannot read ${item.sourcePath}`);
-      return;
+      return null;
     }
-
-    let spec: AgentSpec;
     const parseResult: ParseResult = parseAgentYaml(content, item.name + '.yaml');
     if (!parseResult.ok) {
-      console.warn(`[agents] 解析失败 ${item.name}.yaml: ${parseResult.reason}, 已跳过`);
-      return;
+      log.warn(`[agents] 解析失败 ${item.name}.yaml: ${parseResult.reason}, 已跳过`);
+      return null;
     }
-    spec = parseResult.spec;
+    const spec = parseResult.spec;
 
     // v2 host-first files deploy only to explicitly declared hosts. v1 keeps
     // the historical all-supported behavior for backward compatibility.
-    const targets = spec.targets ?? (spec.schema_version === 2 && spec.hosts ? Object.keys(spec.hosts) as ToolName[] : ALL_SUPPORTED_TOOLS);
+    const targetTools = spec.targets ?? (spec.schema_version === 2 && spec.hosts ? Object.keys(spec.hosts) as ToolName[] : ALL_SUPPORTED_TOOLS);
 
-    for (const tool of targets) {
+    for (const tool of targetTools) {
       const toolPath = teamConfig.toolPaths[tool];
       if (!toolPath?.agents) {
         log.debug(`Skipping agent sync for ${tool}: no agents path configured`);
@@ -349,19 +363,18 @@ export class AgentsHandler extends ResourceHandler {
       }
       if (isAgentDisabled(localConfig, tool)) continue;
 
-      const destDir = path.join(baseDir, toolPath.agents);
-      try {
-        await ensureDir(destDir);
-        const renderSpec = await resolveAgentModel(spec, tool, localConfig.repo.localPath, teamConfig.modelPolicy);
-        const { ext, content: rendered } = renderForTool(renderSpec, tool);
-        const renderedFilename = agentFilename(renderSpec, tool);
-        const dest = path.join(destDir, renderedFilename.includes('.') ? renderedFilename : `${renderedFilename}${ext}`);
-        await writeFile(dest, rendered);
-        log.debug(`Rendered agent ${item.name} → ${tool} (${ext})`);
-      } catch (e) {
-        log.warn(`Failed to sync agent ${item.name} to ${tool}: ${(e as Error).message}`);
-      }
+      const renderSpec = await resolveAgentModel(spec, tool, localConfig.repo.localPath, teamConfig.modelPolicy);
+      const rendered = renderForTool(renderSpec, tool);
+      const declaredFilename = agentFilename(renderSpec, tool);
+      const filename = path.extname(declaredFilename) ? declaredFilename : `${declaredFilename}${rendered.ext}`;
+      targets.push({
+        path: path.join(baseDir, toolPath.agents, filename),
+        kind: 'file',
+        tool,
+        content: rendered.content,
+      });
     }
+    return { id: `agents:${item.name}`, type: 'agents', targets };
   }
 
   /**

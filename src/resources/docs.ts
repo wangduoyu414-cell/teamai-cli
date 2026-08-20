@@ -2,8 +2,7 @@ import path from 'node:path';
 import fse from 'fs-extra';
 import { ResourceHandler } from './base.js';
 import type { ResourceItem, TeamaiConfig, LocalConfig } from '../types.js';
-import { resolveBaseDir } from '../types.js';
-import { pathExists, expandHome, listFiles } from '../utils/fs.js';
+import { pathExists, listFiles, expandHome } from '../utils/fs.js';
 import { log } from '../utils/logger.js';
 
 export class DocsHandler extends ResourceHandler {
@@ -40,30 +39,20 @@ export class DocsHandler extends ResourceHandler {
     // No-op
   }
 
-  /**
-   * Sync docs from team repo to local docs directory.
-   */
   async pullItem(item: ResourceItem, teamConfig: TeamaiConfig, localConfig: LocalConfig): Promise<void> {
-    // For project scope, resolve docs dir relative to projectRoot
-    const docsLocalDir = teamConfig.sharing.docs.localDir;
-    let localDocsDir: string;
-    if (localConfig.scope === 'project' && localConfig.projectRoot) {
-      // Replace ~ with projectRoot
-      localDocsDir = docsLocalDir.startsWith('~/')
-        ? path.join(localConfig.projectRoot, docsLocalDir.substring(2))
-        : expandHome(docsLocalDir);
-    } else {
-      localDocsDir = expandHome(docsLocalDir);
-    }
+    if (teamConfig.sharing.docs.mode === 'index-only') return;
+    const configured = teamConfig.sharing.docs.localDir;
+    const localDir = localConfig.scope === 'project' && localConfig.projectRoot && configured.startsWith('~/')
+      ? path.join(localConfig.projectRoot, configured.slice(2))
+      : expandHome(configured);
     try {
-      const src = expandHome(item.sourcePath);
-      await fse.copy(src, localDocsDir, {
+      await fse.copy(item.sourcePath, localDir, {
         overwrite: true,
-        filter: (srcPath: string) => !path.basename(srcPath).startsWith('.'),
+        filter: (sourcePath: string) => !path.basename(sourcePath).startsWith('.'),
       });
-      log.debug(`Synced docs → ${localDocsDir}`);
-    } catch (e) {
-      log.warn(`Failed to sync docs: ${(e as Error).message}`);
+      log.debug(`Synced docs → ${localDir}`);
+    } catch (error) {
+      log.warn(`Failed to sync docs: ${(error as Error).message}`);
     }
   }
 

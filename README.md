@@ -230,7 +230,7 @@ When a recall hit comes from a codebase page, the result includes a `Sources:` l
 | `teamai doctor` | Diagnose configuration issues |
 | `teamai uninstall` | Remove all teamai resources and hooks |
 
-Global options: `--dry-run`, `--verbose`
+Global options: `--dry-run` / `--plan` (zero-side-effect lifecycle preview), `--verbose`
 
 ## License
 

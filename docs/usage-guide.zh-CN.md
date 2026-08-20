@@ -293,7 +293,8 @@ teamai skill show hai-deploy-test   # 看单个 skill 的来源 / 贡献者 / �
 
 ```bash
 teamai pull              # 手动拉取
-teamai pull --dry-run    # 试运行，不实际修改
+teamai pull --dry-run    # 只读计划：不刷新 Git、不 bootstrap、不改 hooks 或文件
+teamai pull --plan       # --dry-run 的别名
 ```
 
 > Project scope 默认与 user scope 隔离。当前工作目录包含 project scope 的 `.teamai/config.yaml` 时，`pull` 会处理该项目并跳过 user scope；仅当本地配置包含 `inheritUserScope: true` 时，才会先刷新安全的 user 资源通道。当前目录没有 project 配置时，`pull` 处理 user scope。project 模式下，user 的 `env`、hooks、MCP 定义、sources、reporting 和写入行为仍保持隔离。
@@ -1032,6 +1033,9 @@ sharing:
     enforced: [code-review-guide]
   docs:
     localDir: ./.teamai/docs
+    # mode: index-only  # 可选：docs 仅保留在团队 checkout 中供索引
+  instructions:
+    source: AGENTS.md   # 可选：部署到各工具的原生 instruction 文件
   env:
     injectShellProfile: true
 ```

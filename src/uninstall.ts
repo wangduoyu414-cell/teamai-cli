@@ -38,6 +38,7 @@ import {
 } from './utils/fs.js';
 import { log } from './utils/logger.js';
 import { askConfirmation } from './utils/prompt.js';
+import { managedManifestTargetPaths, uninstallManagedResources } from './managed-resources.js';
 
 // ─── Types ─────────────────────────────────────────────
 
@@ -383,18 +384,14 @@ async function buildRemovalPlan(
       }
     }
 
-    // (f) Docs directory
-    const docsLocalDir = teamConfig.sharing.docs.localDir;
-    let docsDir: string;
-    if (localConfig.scope === 'project' && localConfig.projectRoot) {
-      docsDir = docsLocalDir.startsWith('~/')
-        ? path.join(localConfig.projectRoot, docsLocalDir.substring(2))
-        : expandHome(docsLocalDir);
-    } else {
-      docsDir = expandHome(docsLocalDir);
-    }
-    if (await pathExists(docsDir)) {
-      plan.docsDir = docsDir;
+    // Index-only docs live solely in the team checkout. Legacy/default copy mode
+    // preserves the existing uninstall behaviour for the copied docs directory.
+    if ((teamConfig.sharing.docs.mode ?? 'copy') !== 'index-only') {
+      const configured = teamConfig.sharing.docs.localDir;
+      const docsDir = localConfig.scope === 'project' && localConfig.projectRoot && configured.startsWith('~/')
+        ? path.join(localConfig.projectRoot, configured.slice(2))
+        : expandHome(configured);
+      if (await pathExists(docsDir)) plan.docsDir = docsDir;
     }
   }
 
@@ -669,7 +666,7 @@ export async function uninstall(opts: UninstallOptions): Promise<void> {
   let teamConfig: TeamaiConfig | null = null;
 
   try {
-    const result = await autoDetectInit();
+    const result = await autoDetectInit({ readOnly: !!(opts.dryRun || opts.plan) });
     localConfig = result.localConfig;
     teamConfig = result.teamConfig;
   } catch {
@@ -689,16 +686,28 @@ export async function uninstall(opts: UninstallOptions): Promise<void> {
       }
       agentKey = matched; // normalize to canonical toolPaths key
     }
+    const lifecycleHome = getTeamaiHome(localConfig.scope, localConfig.projectRoot);
+    const lifecyclePlan = await uninstallManagedResources(lifecycleHome, { tool: agentKey, plan: true });
+    const managedPaths = await managedManifestTargetPaths(lifecycleHome);
     const plan = await buildRemovalPlan(localConfig, teamConfig, agentKey);
+    // Legacy discovery remains for hooks, rules and installations made by older
+    // CLIs. Never let it remove a path already governed by the ownership ledger.
+    plan.skillDirs = plan.skillDirs.filter((entry) => !managedPaths.has(entry));
+    plan.agentFiles = plan.agentFiles.filter((entry) => !managedPaths.has(entry));
+    plan.claudeMdFiles = plan.claudeMdFiles.filter((entry) => !managedPaths.has(entry));
 
-    if (isPlanEmpty(plan)) {
+    if (isPlanEmpty(plan) && lifecyclePlan.planned.length === 0 && lifecyclePlan.conflicts.length === 0) {
       log.info('没有需要卸载的内容');
       return;
     }
 
     printSummary(plan, agentKey);
+    if (lifecyclePlan.planned.length > 0 || lifecyclePlan.conflicts.length > 0) {
+      console.log(`   Managed resources (${lifecyclePlan.planned.length} safe, ${lifecyclePlan.conflicts.length} protected)`);
+      console.log('');
+    }
 
-    if (opts.dryRun) {
+    if (opts.dryRun || opts.plan) {
       log.info('Dry run — 未做任何更改');
       return;
     }
@@ -709,6 +718,16 @@ export async function uninstall(opts: UninstallOptions): Promise<void> {
         log.info('已取消');
         return;
       }
+    }
+
+    // Ownership-ledger cleanup precedes all name-based legacy discovery. This is
+    // the only path that can restore an original file replaced during installation.
+    const lifecycleResult = await uninstallManagedResources(lifecycleHome, { tool: agentKey });
+    for (const conflict of lifecycleResult.conflicts) log.warn(`Preserved local change: ${conflict}`);
+    if (lifecycleResult.conflicts.length > 0) {
+      // Keep the ledger and backup data so a later safe retry can still resolve
+      // the conflict. The rest of the requested teardown remains best-effort.
+      plan.teamaiHomeExists = false;
     }
 
     // MCP cleanup must run before executeRemoval deletes ~/.teamai/: ownership is
@@ -778,7 +797,7 @@ export async function uninstall(opts: UninstallOptions): Promise<void> {
     console.log(`     ${home}/`);
     console.log('');
 
-    if (opts.dryRun) {
+    if (opts.dryRun || opts.plan) {
       log.info('Dry run — 未做任何更改');
       return;
     }

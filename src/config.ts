@@ -68,14 +68,14 @@ export async function loadTeamConfig(repoPath: string): Promise<TeamaiConfig | n
 /**
  * Load the local config (~/.teamai/config.yaml)
  */
-export async function loadLocalConfig(): Promise<LocalConfig | null> {
+export async function loadLocalConfig(options: { readOnly?: boolean } = {}): Promise<LocalConfig | null> {
   const configPath = expandHome(TEAMAI_CONFIG_PATH);
   const content = await readFileSafe(configPath);
   if (!content) return null;
   try {
     const raw = YAML.parse(content);
     const parsed = LocalConfigSchema.parse(raw);
-    return await migrateLegacyRoleConfig(parsed, configPath);
+    return options.readOnly ? parsed : await migrateLegacyRoleConfig(parsed, configPath);
   } catch (e) {
     log.error(`Invalid local config: ${(e as Error).message}`);
     return null;
@@ -108,8 +108,8 @@ export async function saveState(state: State): Promise<void> {
 /**
  * Require that teamai is initialized (local config exists)
  */
-export async function requireInit(): Promise<{ localConfig: LocalConfig; teamConfig: TeamaiConfig }> {
-  const localConfig = await loadLocalConfig();
+export async function requireInit(options: { readOnly?: boolean } = {}): Promise<{ localConfig: LocalConfig; teamConfig: TeamaiConfig }> {
+  const localConfig = await loadLocalConfig(options);
   if (!localConfig) {
     throw new Error('teamai is not initialized. Run `teamai init` first.');
   }
@@ -130,6 +130,7 @@ export async function requireInit(): Promise<{ localConfig: LocalConfig; teamCon
 export async function loadLocalConfigForScope(
   scope: Scope,
   projectRoot?: string,
+  options: { readOnly?: boolean } = {},
 ): Promise<LocalConfig | null> {
   const configPath = getConfigPath(scope, projectRoot);
   const content = await readFileSafe(expandHome(configPath));
@@ -145,7 +146,7 @@ export async function loadLocalConfigForScope(
     const withProjectRoot = scope === 'project' && projectRoot && !parsed.projectRoot
       ? { ...parsed, projectRoot }
       : parsed;
-    return await migrateLegacyRoleConfig(withProjectRoot, configPath);
+    return options.readOnly ? withProjectRoot : await migrateLegacyRoleConfig(withProjectRoot, configPath);
   } catch (e) {
     log.error(`Invalid ${scope} config at ${configPath}: ${(e as Error).message}`);
     return null;
@@ -186,7 +187,10 @@ export async function saveStateForScope(state: State, scope: Scope, projectRoot?
  * Detect whether the given directory (default: cwd) has a project-scope teamai config.
  * Returns the parsed LocalConfig if scope === 'project', null otherwise.
  */
-export async function detectProjectConfig(cwd?: string): Promise<LocalConfig | null> {
+export async function detectProjectConfig(
+  cwd?: string,
+  options: { allowBootstrap?: boolean } = {},
+): Promise<LocalConfig | null> {
   const dir = cwd ?? process.cwd();
   const configPath = path.join(dir, '.teamai', 'config.yaml');
   if (!(await pathExists(configPath))) {
@@ -195,6 +199,7 @@ export async function detectProjectConfig(cwd?: string): Promise<LocalConfig | n
     // disk but no local config (it is gitignored, not cloned). Auto-bootstrap the
     // machine side, then re-read. bootstrapSelfRepo is a no-op ('skip') for any
     // dir that is not a self-mode project, so this stays cheap on the hot path.
+    if (options.allowBootstrap === false) return null;
     try {
       const { bootstrapSelfRepo } = await import('./bootstrap.js');
       const result = await bootstrapSelfRepo(dir, { silent: true });
@@ -248,8 +253,10 @@ export async function requireInitForScope(
  * If cwd has a project-scope config, uses that; otherwise falls back to user scope.
  * This is the recommended entry point for commands that support both scopes.
  */
-export async function autoDetectInit(): Promise<{ localConfig: LocalConfig; teamConfig: TeamaiConfig }> {
-  const projectConfig = await detectProjectConfig();
+export async function autoDetectInit(
+  options: { readOnly?: boolean } = {},
+): Promise<{ localConfig: LocalConfig; teamConfig: TeamaiConfig }> {
+  const projectConfig = await detectProjectConfig(undefined, { allowBootstrap: !options.readOnly });
   if (projectConfig) {
     const teamConfig = await loadTeamConfig(projectConfig.repo.localPath);
     if (!teamConfig) {
@@ -257,5 +264,5 @@ export async function autoDetectInit(): Promise<{ localConfig: LocalConfig; team
     }
     return { localConfig: projectConfig, teamConfig };
   }
-  return requireInit();
+  return requireInit({ readOnly: options.readOnly });
 }

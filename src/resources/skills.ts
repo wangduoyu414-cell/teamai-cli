@@ -7,6 +7,8 @@ import { log } from '../utils/logger.js';
 import { BUILTIN_SKILL_NAMES } from '../builtin-skills.js';
 import { resolveOpenclawWorkspaceDir } from '../openclaw-hooks.js';
 import { loadRolesManifest, resolveRoleResourceNamespaces } from '../roles.js';
+import { reconcileManagedResources, type DesiredManagedResource } from '../managed-resources.js';
+import { getTeamaiHome } from '../types.js';
 
 /** File name used to track who has contributed (pushed) a skill. */
 const CONTRIBUTORS_FILE = 'CONTRIBUTORS';
@@ -429,13 +431,23 @@ export class SkillsHandler extends ResourceHandler {
    * Pull a skill from team repo to all configured AI tool directories.
    */
   async pullItem(item: ResourceItem, teamConfig: TeamaiConfig, localConfig: LocalConfig): Promise<void> {
+    const resource = await this.buildManagedResource(item, teamConfig, localConfig);
+    const home = getTeamaiHome(localConfig.scope, localConfig.projectRoot);
+    const result = await reconcileManagedResources(home, [resource]);
+    for (const conflict of result.conflicts) log.warn(`Skipped skill sync: ${conflict}`);
+  }
+
+  /** Build every installed destination before the lifecycle engine stages them. */
+  async buildManagedResource(
+    item: ResourceItem,
+    teamConfig: TeamaiConfig,
+    localConfig: LocalConfig,
+  ): Promise<DesiredManagedResource> {
     const baseDir = resolveBaseDir(localConfig);
-
+    const targets: DesiredManagedResource['targets'] = [];
     for (const [tool, toolPath] of Object.entries(teamConfig.toolPaths)) {
-      if (isAgentDisabled(localConfig, tool)) continue;
-      if (!toolPath.skills) continue;
-
-      let dest: string;
+      if (isAgentDisabled(localConfig, tool) || !toolPath.skills) continue;
+      let dest: string | null = null;
       if (tool === 'openclaw') {
         const wsDir = await resolveOpenclawWorkspaceDir();
         if (!wsDir) {
@@ -450,15 +462,19 @@ export class SkillsHandler extends ResourceHandler {
         }
         dest = path.join(baseDir, toolPath.skills, item.name);
       }
-
-      try {
-        await copyDir(item.sourcePath, dest);
-        await ensureSkillFrontmatter(dest, item.name);
-        log.debug(`Synced skill ${item.name} → ${tool}`);
-      } catch (e) {
-        log.warn(`Failed to sync skill ${item.name} to ${tool}: ${(e as Error).message}`);
+      if (dest) {
+        targets.push({
+          path: dest,
+          kind: 'directory',
+          tool,
+          sourcePath: item.sourcePath,
+          // Preserve pull's historic destination-only frontmatter repair without
+          // mutating the team checkout that supplied the resource.
+          prepareStaged: async (payload) => { await ensureSkillFrontmatter(payload, item.name); },
+        });
       }
     }
+    return { id: `skills:${item.name}`, type: 'skills', targets };
   }
 
   /**

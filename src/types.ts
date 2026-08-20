@@ -10,6 +10,8 @@ export const ToolPathsSchema = z.object({
   rules: z.string().optional(),
   settings: z.string().optional(),
   claudemd: z.string().optional(),
+  /** Native instruction host file. Falls back to claudemd for legacy configs. */
+  instruction: z.string().optional(),
   /** Per-tool agents directory (Phase 1: teamai-recall subagent target).
    * Optional — tools without subagent support omit this and agents sync skips them. */
   agents: z.string().optional(),
@@ -36,7 +38,13 @@ export const SharingConfigSchema = z.object({
   }).default({}),
   docs: z.object({
     localDir: z.string().default('~/.teamai/docs'),
+    /** Default copy preserves existing distribution behaviour; index-only opts out. */
+    mode: z.enum(['copy', 'index-only']).optional(),
   }).default({}),
+  instructions: z.object({
+    /** Team-repository path, relative to the knowledge root. */
+    source: z.string().optional(),
+  }).optional(),
   env: z.object({
     injectShellProfile: z.boolean().default(true),
     shellProfilePath: z.string().optional(),
@@ -218,7 +226,7 @@ export const TeamaiConfigSchema = z.object({
   // wrong guess can never create a junk config file on a user's machine.
   toolPaths: z.record(z.string(), ToolPathsSchema).default({
     claude: { skills: '.claude/skills', rules: '.claude/rules', settings: '.claude/settings.json', claudemd: '.claude/CLAUDE.md', agents: '.claude/agents', mcp: '.claude.json', mcpProject: '.mcp.json' },
-    codex: { probe: '.codex', skills: '.agents/skills', rules: '.codex/rules', settings: '.codex/hooks.json', agents: '.codex/agents', mcp: '.codex/config.toml' },
+    codex: { probe: '.codex', skills: '.agents/skills', rules: '.codex/rules', settings: '.codex/hooks.json', instruction: '.codex/AGENTS.md', agents: '.codex/agents', mcp: '.codex/config.toml' },
     'codex-internal': { skills: '.codex-internal/skills', rules: '.codex-internal/rules', settings: '.codex-internal/hooks.json', agents: '.codex-internal/agents' },
     'claude-internal': { skills: '.claude-internal/skills', rules: '.claude-internal/rules', settings: '.claude-internal/settings.json', claudemd: '.claude-internal/CLAUDE.md', agents: '.claude-internal/agents' },
     // tclaude ships Claude Code with `customUserDataDir: .tclaude`, which
@@ -233,6 +241,7 @@ export const TeamaiConfigSchema = z.object({
     openclaw: { skills: '.openclaw/skills', rules: '.openclaw/rules', claudemd: '.openclaw/workspace/AGENTS.md' },
     hermes: { skills: '.hermes/skills', claudemd: 'AGENTS.md' },
     workbuddy: { skills: '.workbuddy/skills', rules: '.workbuddy/rules', settings: '.workbuddy/settings.json', claudemd: 'AGENTS.md', mcp: '.workbuddy/mcp.json', mcpProject: '.workbuddy/mcp.json' },
+    qwen: { probe: '.qwen', skills: '.qwen/skills', rules: '.qwen/rules', instruction: '.qwen/QWEN.md', agents: '.qwen/agents' },
   }),
 });
 
@@ -444,6 +453,8 @@ export function managedMcpManifestPath(scope: Scope, projectRoot?: string): stri
 
 export interface GlobalOptions {
   dryRun?: boolean;
+  /** Alias for dryRun used by lifecycle commands. */
+  plan?: boolean;
   verbose?: boolean;
   silent?: boolean;
   /** Force full sync even when repo HEAD matches lastPullRev. */

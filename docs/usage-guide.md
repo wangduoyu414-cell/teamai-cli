@@ -295,7 +295,8 @@ If you need to sync immediately, you can run it manually:
 
 ```bash
 teamai pull              # Manual pull
-teamai pull --dry-run    # Dry run, no actual changes
+teamai pull --dry-run    # Read-only plan: no Git refresh, bootstrap, hooks, or file writes
+teamai pull --plan       # Alias for --dry-run
 ```
 
 > Project scope is isolated by default. When the current working directory contains a project-scope `.teamai/config.yaml`, `pull` processes that project and skips user scope unless the local config has `inheritUserScope: true`; in that case it first refreshes the safe user-resource channel. Without a project config in the current directory, `pull` processes user scope. User `env`, hooks, MCP definitions, sources, reporting, and writes remain isolated in project mode.
@@ -1037,6 +1038,9 @@ sharing:
     enforced: [code-review-guide]
   docs:
     localDir: ./.teamai/docs
+    # mode: index-only  # optional: keep docs in the team checkout for indexing only
+  instructions:
+    source: AGENTS.md   # optional; deployed to each tool's native instruction host
   env:
     injectShellProfile: true
 ```

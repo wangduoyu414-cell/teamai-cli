@@ -227,7 +227,7 @@ teamai codebase --lint                      # 健康检查
 | `teamai doctor` | 诊断配置问题 |
 | `teamai uninstall` | 移除所有 teamai 资源和 hooks |
 
-全局选项：`--dry-run`、`--verbose`
+全局选项：`--dry-run` / `--plan`（生命周期零副作用预览）、`--verbose`
 
 ## 许可证
 

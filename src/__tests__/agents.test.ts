@@ -20,6 +20,7 @@ vi.mock('../utils/logger.js', () => ({
 }));
 
 import { AgentsHandler } from '../resources/agents.js';
+import { reconcileManagedResources } from '../managed-resources.js';
 import type { TeamaiConfig, LocalConfig } from '../types.js';
 
 /**
@@ -193,6 +194,21 @@ describe('AgentsHandler — Phase 1 push/pull/remove', () => {
 
     const items = await handler.scanLocalForPush(teamConfig, localConfig);
     expect(items.find((i) => i.name === 'same')).toBeUndefined();
+  });
+
+  it('scanLocalForPush ignores unchanged lifecycle-rendered agents but detects later edits', async () => {
+    const managed = path.join(homeDir, '.claude/agents/managed.md');
+    await fse.writeFile(path.join(repoPath, 'agents', 'managed.yaml'), 'name: managed\ndescription: managed\ninstructions: managed\n');
+    await reconcileManagedResources(path.join(homeDir, '.teamai'), [{
+      id: 'agents:managed',
+      type: 'agents',
+      targets: [{ path: managed, kind: 'file', tool: 'claude', content: 'rendered' }],
+    }]);
+
+    expect((await handler.scanLocalForPush(teamConfig, localConfig)).find((item) => item.name === 'managed')).toBeUndefined();
+
+    await fse.writeFile(managed, 'local edit');
+    expect((await handler.scanLocalForPush(teamConfig, localConfig)).find((item) => item.name === 'managed')).toBeDefined();
   });
 
   it('scanLocalForPush excludes built-in CLI agents (e.g. teamai-recall)', async () => {

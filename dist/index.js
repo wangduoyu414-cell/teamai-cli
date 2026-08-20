@@ -3103,6 +3103,7 @@ var managed_resources_exports = {};
 __export(managed_resources_exports, {
   loadManagedResourceManifest: () => loadManagedResourceManifest,
   managedManifestTargetPaths: () => managedManifestTargetPaths,
+  managedManifestUnchangedTargetPaths: () => managedManifestUnchangedTargetPaths,
   managedResourceJournalPath: () => managedResourceJournalPath,
   managedResourceManifestPath: () => managedResourceManifestPath,
   reconcileManagedResources: () => reconcileManagedResources,
@@ -3315,6 +3316,19 @@ async function hashPath(target, kind, section) {
     if (error.code === "ENOENT") return null;
     throw error;
   }
+}
+async function managedManifestUnchangedTargetPaths(home, type) {
+  const manifest = await loadManagedResourceManifest(home);
+  const unchanged = /* @__PURE__ */ new Set();
+  for (const resource of Object.values(manifest.resources)) {
+    if (resource.type !== type) continue;
+    for (const target of resource.targets) {
+      if (await hashPath(target.path, target.kind, target.section) === target.hash) {
+        unchanged.add(path11.resolve(target.path));
+      }
+    }
+  }
+  return unchanged;
 }
 async function hashDirectory(root, relative, hash) {
   const entries = await fse3.readdir(path11.join(root, relative), { withFileTypes: true });
@@ -9773,6 +9787,10 @@ var init_agents = __esm({
         const teamAgentsDir = path30.join(localConfig.repo.localPath, "agents");
         const tombstones = await this.readTombstones(localConfig);
         const baseDir = resolveBaseDir(localConfig);
+        const unchangedManagedPaths = await managedManifestUnchangedTargetPaths(
+          getTeamaiHome(localConfig.scope, localConfig.projectRoot),
+          "agents"
+        );
         const directItems = [];
         const directStems = /* @__PURE__ */ new Set();
         if (isSelfMode(localConfig) && localConfig.projectRoot) {
@@ -9814,6 +9832,7 @@ var init_agents = __esm({
             if (BUILTIN_AGENT_NAMES.has(stem)) continue;
             if (directStems.has(stem)) continue;
             const filePath = path30.join(agentsDir, file);
+            if (unchangedManagedPaths.has(path30.resolve(filePath))) continue;
             let toolGroup = grouped.get(stem);
             if (!toolGroup) {
               toolGroup = /* @__PURE__ */ new Map();

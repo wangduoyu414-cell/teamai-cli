@@ -20,7 +20,11 @@ import {
 } from './agent-format.js';
 import type { AgentSpec, ToolName, ReverseResult, ParseResult } from './agent-format.js';
 import { loadModelPolicy, resolveModelRef } from '../model-policy.js';
-import { reconcileManagedResources, type DesiredManagedResource } from '../managed-resources.js';
+import {
+  managedManifestUnchangedTargetPaths,
+  reconcileManagedResources,
+  type DesiredManagedResource,
+} from '../managed-resources.js';
 import { getTeamaiHome } from '../types.js';
 
 /**
@@ -59,6 +63,10 @@ export class AgentsHandler extends ResourceHandler {
     const teamAgentsDir = path.join(localConfig.repo.localPath, 'agents');
     const tombstones = await this.readTombstones(localConfig);
     const baseDir = resolveBaseDir(localConfig);
+    const unchangedManagedPaths = await managedManifestUnchangedTargetPaths(
+      getTeamaiHome(localConfig.scope, localConfig.projectRoot),
+      'agents',
+    );
 
     // Single-repo mode: users drop canonical agent files straight into the repo's
     // own .teamai/agents/ (<name>.yaml, or legacy <name>.md) rather than authoring
@@ -115,6 +123,7 @@ export class AgentsHandler extends ResourceHandler {
         if (directStems.has(stem)) continue; // canonical direct-pickup wins (self mode)
 
         const filePath = path.join(agentsDir, file);
+        if (unchangedManagedPaths.has(path.resolve(filePath))) continue;
         let toolGroup = grouped.get(stem);
         if (!toolGroup) {
           toolGroup = new Map();

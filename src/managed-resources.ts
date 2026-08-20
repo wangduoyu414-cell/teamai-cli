@@ -400,6 +400,23 @@ async function hashPath(target: string, kind: ManagedPathKind, section?: Managed
   }
 }
 
+export async function managedManifestUnchangedTargetPaths(
+  home: string,
+  type: DesiredManagedResource['type'],
+): Promise<Set<string>> {
+  const manifest = await loadManagedResourceManifest(home);
+  const unchanged = new Set<string>();
+  for (const resource of Object.values(manifest.resources)) {
+    if (resource.type !== type) continue;
+    for (const target of resource.targets) {
+      if (await hashPath(target.path, target.kind, target.section) === target.hash) {
+        unchanged.add(path.resolve(target.path));
+      }
+    }
+  }
+  return unchanged;
+}
+
 async function hashDirectory(root: string, relative: string, hash: crypto.Hash): Promise<void> {
   const entries = await fse.readdir(path.join(root, relative), { withFileTypes: true });
   entries.sort((a, b) => a.name.localeCompare(b.name));

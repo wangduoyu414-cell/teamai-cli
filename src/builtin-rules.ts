@@ -3,7 +3,7 @@ import { ensureDir, writeFile, pathExists } from './utils/fs.js';
 import { log } from './utils/logger.js';
 import { ResourceHandler } from './resources/base.js';
 import type { TeamaiConfig, LocalConfig } from './types.js';
-import { resolveBaseDir, isAgentDisabled } from './types.js';
+import { resolveBaseDir, isAgentDisabled, isBuiltinEnabled } from './types.js';
 import fs from 'node:fs/promises';
 
 // ─── Built-in rules deployment ──────────────────────────
@@ -73,6 +73,7 @@ export async function deployBuiltinRules(
 
             // Deploy current built-in rules
             for (const rule of builtinRules) {
+                if (!isBuiltinEnabled(teamConfig, 'rules', rule.name)) continue;
                 const destFile = path.join(rulesDir, `${rule.name}.md`);
                 await writeFile(destFile, rule.content);
                 log.debug(`Deployed built-in rule ${rule.name} → ${tool}`);
@@ -147,4 +148,3 @@ teamai-recall subagent 的返回里已列出本次检索到的候选 doc-id（�
 一个都没用到就留空：\`<!-- teamai:referenced-doc-ids: [] -->\`。
 若直接用 \`teamai recall\` 命令（未走 subagent），从召回结果的 File 路径推出 doc-id 自行填入。
 `;
-

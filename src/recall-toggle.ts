@@ -87,7 +87,7 @@ async function deployRecallArtifacts(teamConfig: TeamaiConfig, localConfig: Loca
 
   for (const [tool, toolPath] of Object.entries(teamConfig.toolPaths)) {
     if (!toolPath.claudemd || !toolPath.agents) continue;
-    if (!await ResourceHandler.isToolInstalled(toolPath.agents, baseDir)) continue;
+    if (!await ResourceHandler.isToolInstalled(toolPath.agents, baseDir, toolPath.probe)) continue;
 
     const claudeMdPath = path.join(baseDir, toolPath.claudemd);
     try {

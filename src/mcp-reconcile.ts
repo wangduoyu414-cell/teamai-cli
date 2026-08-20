@@ -200,7 +200,7 @@ export async function resolveMcpTargets(
     const rel = projectScope ? paths.mcpProject : paths.mcp;
     if (!rel) continue;
 
-    const probe = paths.skills ?? paths.settings ?? paths.agents;
+    const probe = paths.probe ?? paths.skills ?? paths.settings ?? paths.agents;
     if (!probe) continue;
     const toolRoot = path.join(baseDir, probe.split('/')[0]);
     if (!await pathExists(toolRoot)) {

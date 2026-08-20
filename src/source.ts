@@ -456,7 +456,7 @@ async function pullSingleSource(
     // Deploy to each tool's skills directory
     for (const [_tool, toolPath] of Object.entries(teamConfig.toolPaths)) {
       if (!toolPath.skills) continue;
-      if (!await ResourceHandler.isToolInstalled(toolPath.skills, baseDir)) continue;
+      if (!await ResourceHandler.isToolInstalled(toolPath.skills, baseDir, toolPath.probe)) continue;
 
       const targetDir = path.join(baseDir, toolPath.skills, skill.name);
       await copyDir(skill.sourcePath, targetDir);

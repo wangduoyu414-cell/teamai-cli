@@ -4,6 +4,8 @@ import path from 'node:path';
 // ─── Tool path config ───────────────────────────────────
 
 export const ToolPathsSchema = z.object({
+  /** Independent host installation probe. Defaults to the first path segment. */
+  probe: z.string().optional(),
   skills: z.string().optional(),
   rules: z.string().optional(),
   settings: z.string().optional(),
@@ -39,6 +41,14 @@ export const SharingConfigSchema = z.object({
     injectShellProfile: z.boolean().default(true),
     shellProfilePath: z.string().optional(),
   }).default({}),
+  usage: z.object({
+    enabled: z.boolean().default(true),
+    autoReport: z.boolean().default(true),
+    includePrompt: z.boolean().default(false),
+  }).optional(),
+  registration: z.object({
+    autoRegister: z.boolean().default(true),
+  }).optional(),
   // Optional (not .default) so existing TeamaiConfig literals stay valid; use
   // getHooksSharing() for the defaulted view.
   hooks: z.object({
@@ -63,6 +73,29 @@ export const SharingConfigSchema = z.object({
     allowedHosts: z.array(z.string()).default([]),
   }).optional(),
 });
+
+export const BuiltinResourcePolicySchema = z.object({
+  mode: z.enum(['all', 'allowlist', 'disabled']).default('all'),
+  names: z.array(z.string()).default([]),
+});
+
+export const BuiltinPolicySchema = z.object({
+  skills: BuiltinResourcePolicySchema.default({}),
+  agents: BuiltinResourcePolicySchema.default({}),
+  rules: BuiltinResourcePolicySchema.default({}),
+  hooks: BuiltinResourcePolicySchema.default({}),
+});
+
+export function isBuiltinEnabled(
+  config: { builtins?: { skills?: { mode?: string; names?: string[] }; agents?: { mode?: string; names?: string[] }; rules?: { mode?: string; names?: string[] }; hooks?: { mode?: string; names?: string[] } } },
+  kind: 'skills' | 'agents' | 'rules' | 'hooks',
+  name: string,
+): boolean {
+  const policy = config.builtins?.[kind];
+  if (!policy || !policy.mode || policy.mode === 'all') return true;
+  if (policy.mode === 'disabled') return false;
+  return (policy.names ?? []).includes(name);
+}
 
 /** Defaulted view of the optional `sharing.hooks` config. */
 export function getHooksSharing(config: { sharing?: { hooks?: { autoApply?: boolean; requireTeamScripts?: boolean } } }): {
@@ -174,12 +207,18 @@ export const TeamaiConfigSchema = z.object({
    * can override via `updatePolicy` in local config. Undefined = team has no
    * opinion (preserves legacy behavior). */
   autoUpdate: z.boolean().optional(),
+  builtins: BuiltinPolicySchema.optional(),
+  /** Optional strict model policy consumed by Agent Schema v2 model_ref. */
+  modelPolicy: z.object({
+    path: z.string().min(1),
+    strict: z.boolean().default(true),
+  }).optional(),
   // MCP paths are only set for tools whose config location has been verified.
   // Tools left without `mcp` are skipped by MCP sync rather than guessed at, so a
   // wrong guess can never create a junk config file on a user's machine.
   toolPaths: z.record(z.string(), ToolPathsSchema).default({
     claude: { skills: '.claude/skills', rules: '.claude/rules', settings: '.claude/settings.json', claudemd: '.claude/CLAUDE.md', agents: '.claude/agents', mcp: '.claude.json', mcpProject: '.mcp.json' },
-    codex: { skills: '.codex/skills', rules: '.codex/rules', settings: '.codex/hooks.json', agents: '.codex/agents', mcp: '.codex/config.toml' },
+    codex: { probe: '.codex', skills: '.agents/skills', rules: '.codex/rules', settings: '.codex/hooks.json', agents: '.codex/agents', mcp: '.codex/config.toml' },
     'codex-internal': { skills: '.codex-internal/skills', rules: '.codex-internal/rules', settings: '.codex-internal/hooks.json', agents: '.codex-internal/agents' },
     'claude-internal': { skills: '.claude-internal/skills', rules: '.claude-internal/rules', settings: '.claude-internal/settings.json', claudemd: '.claude-internal/CLAUDE.md', agents: '.claude-internal/agents' },
     // tclaude ships Claude Code with `customUserDataDir: .tclaude`, which

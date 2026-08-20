@@ -59,6 +59,7 @@ export interface KnownAgent {
   category: AgentCategory;
   /** Skills directory relative to the user's HOME (no leading slash). */
   skillsPath: string;
+  probePath?: string;
 }
 
 /**
@@ -71,7 +72,7 @@ export const KNOWN_AGENTS: KnownAgent[] = [
   { id: 'claude', displayName: 'Claude Code', category: 'coding', skillsPath: '.claude/skills' },
   { id: 'claude-internal', displayName: 'Claude Code Internal', category: 'coding', skillsPath: '.claude-internal/skills' },
   { id: 'tclaude', displayName: 'TClaude', category: 'coding', skillsPath: '.tclaude/skills' },
-  { id: 'codex', displayName: 'Codex CLI', category: 'coding', skillsPath: '.codex/skills' },
+  { id: 'codex', displayName: 'Codex CLI', category: 'coding', skillsPath: '.agents/skills', probePath: '.codex' },
   { id: 'codex-internal', displayName: 'Codex CLI Internal', category: 'coding', skillsPath: '.codex-internal/skills' },
   { id: 'tcodex', displayName: 'TCodex', category: 'coding', skillsPath: '.tcodex/skills' },
   { id: 'cursor', displayName: 'Cursor', category: 'coding', skillsPath: '.cursor/skills' },
@@ -182,7 +183,8 @@ export async function detectHomeInstalledAgents(
 
   const found: string[] = [];
   for (const id of candidateIds) {
-    const skillsPath = KNOWN_AGENTS.find((a) => a.id === id)?.skillsPath;
+    const known = KNOWN_AGENTS.find((a) => a.id === id);
+    const skillsPath = known?.probePath ?? known?.skillsPath;
     if (!skillsPath) continue;
     const rootSegment = skillsPath.split('/')[0]; // e.g. ".claude"
     if (!rootSegment) continue;
@@ -204,13 +206,14 @@ export function getEffectiveAgents(teamConfig: TeamaiConfig): KnownAgent[] {
     if (!paths.skills) continue;
     const existing = byId.get(id);
     if (existing) {
-      byId.set(id, { ...existing, skillsPath: paths.skills, fromTeamConfig: true });
+      byId.set(id, { ...existing, skillsPath: paths.skills, ...(paths.probe ? { probePath: paths.probe } : {}), fromTeamConfig: true });
     } else {
       byId.set(id, {
         id,
         displayName: id,
         category: 'coding',
         skillsPath: paths.skills,
+        probePath: paths.probe,
         fromTeamConfig: true,
       });
     }
@@ -237,7 +240,7 @@ export async function detectInstalledAgents(localConfig: LocalConfig, teamConfig
 
   const results: ResolvedAgent[] = [];
   for (const agent of agents) {
-    const segments = agent.skillsPath.split('/');
+    const segments = (agent.probePath ?? agent.skillsPath).split('/');
     const rootSegment = segments[0] ?? '';
     const rootPath = `${baseDir}/${rootSegment}`;
     const installed = rootSegment ? await pathExists(rootPath) : false;

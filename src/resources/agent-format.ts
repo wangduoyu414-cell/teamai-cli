@@ -5,7 +5,7 @@ import { stringify as stringifyToml, parse as parseToml } from 'smol-toml';
 
 // ─── Tool name type ──────────────────────────────────────────────────────────
 
-export type ToolName = 'claude' | 'claude-internal' | 'tclaude' | 'codebuddy' | 'codex' | 'codex-internal' | 'tcodex' | 'cursor';
+export type ToolName = 'claude' | 'claude-internal' | 'tclaude' | 'codebuddy' | 'codex' | 'codex-internal' | 'tcodex' | 'cursor' | 'qwen';
 
 export const ALL_SUPPORTED_TOOLS: ToolName[] = [
   'claude',
@@ -16,6 +16,7 @@ export const ALL_SUPPORTED_TOOLS: ToolName[] = [
   'codex-internal',
   'tcodex',
   'cursor',
+  'qwen',
 ];
 
 // ─── Intermediate format ─────────────────────────────────────────────────────
@@ -26,6 +27,9 @@ export const ALL_SUPPORTED_TOOLS: ToolName[] = [
  * Each tool renderer translates this into its native format.
  */
 export interface AgentSpec {
+  schema_version?: 1 | 2;
+  logical_id?: string;
+  filename?: string;
   /** Agent name, must match the YAML filename stem. */
   name: string;
   /** Single-line description shown in tool UI. */
@@ -34,6 +38,10 @@ export interface AgentSpec {
   instructions: string;
   /** Optional model override. */
   model?: string;
+  /** Canonical model policy reference; resolved by TeamAI's model policy. */
+  model_ref?: string;
+  effort?: string;
+  permissions?: Record<string, unknown>;
   /** Optional tool whitelist (claude / codebuddy / cursor use this). */
   tools?: string[];
   /**
@@ -50,12 +58,32 @@ export interface AgentSpec {
     'codex-internal'?: Record<string, unknown>;
     tcodex?: Record<string, unknown>;
     cursor?: Record<string, unknown>;
+    qwen?: Record<string, unknown>;
   };
+  /** Host-specific v2 overrides. Missing fields inherit the canonical values. */
+  hosts?: Partial<Record<ToolName, AgentHostSpec>>;
   /**
    * Which tools this agent should be deployed to.
    * When undefined, the agent is deployed to ALL installed supported tools.
    */
   targets?: ToolName[];
+}
+
+export interface AgentHostSpec {
+  filename?: string;
+  name?: string;
+  description?: string;
+  instructions?: string;
+  model?: string;
+  model_ref?: string;
+  effort?: string;
+  tools?: string[];
+  permissions?: Record<string, unknown>;
+  tools_style?: 'list' | 'comma_separated';
+  sandbox_mode?: string;
+  permission_mode?: string;
+  approval_mode?: string;
+  tool_extras?: Record<string, unknown>;
 }
 
 // ─── Parse intermediate YAML ─────────────────────────────────────────────────
@@ -91,21 +119,34 @@ export function parseAgentYaml(content: string, filename: string): ParseResult {
 
   const obj = raw as Record<string, unknown>;
 
-  for (const field of ['name', 'description', 'instructions'] as const) {
-    if (!obj[field] || typeof obj[field] !== 'string' || (obj[field] as string).trim() === '') {
-      return { ok: false, reason: `${filename} missing required field ${field}` };
-    }
+  const hosts = obj['hosts'];
+  const hostEntries = hosts && typeof hosts === 'object' && !Array.isArray(hosts)
+    ? Object.values(hosts as Record<string, unknown>).filter((v): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v))
+    : [];
+  const firstHost = hostEntries[0];
+  const name = typeof obj['name'] === 'string' ? obj['name'] : (typeof firstHost?.name === 'string' ? firstHost.name : undefined);
+  const description = typeof obj['description'] === 'string' ? obj['description'] : (typeof firstHost?.description === 'string' ? firstHost.description : undefined);
+  const instructions = typeof obj['instructions'] === 'string' ? obj['instructions'] : (typeof firstHost?.instructions === 'string' ? firstHost.instructions : undefined);
+  for (const [field, value] of [['name', name], ['description', description], ['instructions', instructions]] as const) {
+    if (!value || value.trim() === '') return { ok: false, reason: `${filename} missing required field ${field} (root or hosts.<tool>)` };
   }
 
   return {
     ok: true,
     spec: {
-      name: obj['name'] as string,
-      description: obj['description'] as string,
-      instructions: obj['instructions'] as string,
+      schema_version: obj['schema_version'] === 2 ? 2 : 1,
+      ...(typeof obj['logical_id'] === 'string' ? { logical_id: obj['logical_id'] } : {}),
+      ...(typeof obj['filename'] === 'string' ? { filename: obj['filename'] } : {}),
+      name: name!,
+      description: description!,
+      instructions: instructions!,
       ...(obj['model'] !== undefined ? { model: obj['model'] as string } : {}),
+      ...(obj['model_ref'] !== undefined ? { model_ref: obj['model_ref'] as string } : {}),
+      ...(obj['effort'] !== undefined ? { effort: obj['effort'] as string } : {}),
+      ...(obj['permissions'] !== undefined ? { permissions: obj['permissions'] as Record<string, unknown> } : {}),
       ...(obj['tools'] !== undefined ? { tools: obj['tools'] as string[] } : {}),
       ...(obj['tool_extras'] !== undefined ? { tool_extras: obj['tool_extras'] as AgentSpec['tool_extras'] } : {}),
+      ...(obj['hosts'] !== undefined ? { hosts: obj['hosts'] as AgentSpec['hosts'] } : {}),
       ...(obj['targets'] !== undefined ? { targets: obj['targets'] as ToolName[] } : {}),
     },
   };
@@ -136,7 +177,8 @@ export interface RenderResult {
  * Output: YAML frontmatter (.md) with optional model/tools and tool_extras.claude fields.
  */
 export function renderForClaude(spec: AgentSpec): RenderResult {
-  return { ext: '.md', content: renderMarkdownAgent(spec, spec.tool_extras?.['claude']) };
+  const resolved = materializeAgent(spec, 'claude');
+  return { ext: '.md', content: renderMarkdownAgent(resolved, resolved.tool_extras?.claude) };
 }
 
 /**
@@ -144,7 +186,8 @@ export function renderForClaude(spec: AgentSpec): RenderResult {
  * Same format as Claude — YAML frontmatter + body.
  */
 export function renderForClaudeInternal(spec: AgentSpec): RenderResult {
-  return { ext: '.md', content: renderMarkdownAgent(spec, spec.tool_extras?.['claude-internal']) };
+  const resolved = materializeAgent(spec, 'claude-internal');
+  return { ext: '.md', content: renderMarkdownAgent(resolved, resolved.tool_extras?.['claude-internal']) };
 }
 
 /**
@@ -152,7 +195,8 @@ export function renderForClaudeInternal(spec: AgentSpec): RenderResult {
  * Same format as Claude, but merges tool_extras.codebuddy into frontmatter.
  */
 export function renderForCodebuddy(spec: AgentSpec): RenderResult {
-  return { ext: '.md', content: renderMarkdownAgent(spec, spec.tool_extras?.['codebuddy']) };
+  const resolved = materializeAgent(spec, 'codebuddy');
+  return { ext: '.md', content: renderMarkdownAgent(resolved, resolved.tool_extras?.codebuddy) };
 }
 
 /**
@@ -160,7 +204,8 @@ export function renderForCodebuddy(spec: AgentSpec): RenderResult {
  * Output: TOML with developer_instructions and flattened tool_extras.codex fields.
  */
 export function renderForCodex(spec: AgentSpec): RenderResult {
-  return { ext: '.toml', content: renderTomlAgent(spec, spec.tool_extras?.['codex']) };
+  const resolved = materializeAgent(spec, 'codex');
+  return { ext: '.toml', content: renderTomlAgent(resolved, resolved.tool_extras?.codex) };
 }
 
 /**
@@ -168,7 +213,8 @@ export function renderForCodex(spec: AgentSpec): RenderResult {
  * Same format as Codex — TOML with developer_instructions.
  */
 export function renderForCodexInternal(spec: AgentSpec): RenderResult {
-  return { ext: '.toml', content: renderTomlAgent(spec, spec.tool_extras?.['codex-internal']) };
+  const resolved = materializeAgent(spec, 'codex-internal');
+  return { ext: '.toml', content: renderTomlAgent(resolved, resolved.tool_extras?.['codex-internal']) };
 }
 
 /**
@@ -176,6 +222,7 @@ export function renderForCodexInternal(spec: AgentSpec): RenderResult {
  * Output: YAML frontmatter (.md) using agent_id instead of name.
  */
 export function renderForCursor(spec: AgentSpec): RenderResult {
+  spec = materializeAgent(spec, 'cursor');
   const frontmatterData: Record<string, unknown> = {
     agent_id: spec.name,
     description: spec.description,
@@ -187,11 +234,48 @@ export function renderForCursor(spec: AgentSpec): RenderResult {
   const extras = spec.tool_extras?.['cursor'];
   if (extras) {
     for (const [key, value] of Object.entries(extras)) {
+      if (key === 'tools_style') continue;
       frontmatterData[key] = value;
     }
   }
   const content = matter.stringify(spec.instructions, frontmatterData);
   return { ext: '.md', content };
+}
+
+/** Qwen uses the markdown frontmatter/body agent contract. */
+export function renderForQwen(spec: AgentSpec): RenderResult {
+  const resolved = materializeAgent(spec, 'qwen');
+  return { ext: '.md', content: renderMarkdownAgent(resolved, resolved.tool_extras?.qwen) };
+}
+
+export function agentFilename(spec: AgentSpec, tool: ToolName): string {
+  return spec.hosts?.[tool]?.filename ?? spec.filename ?? spec.name;
+}
+
+function materializeAgent(spec: AgentSpec, tool: ToolName): AgentSpec {
+  const host = spec.hosts?.[tool];
+  if (!host) return spec;
+  const nativePermissions: Record<string, unknown> = { ...(spec.permissions ?? {}), ...(host.permissions ?? {}) };
+  if (tool === 'codex' || tool === 'codex-internal' || tool === 'tcodex') {
+    if (host.sandbox_mode !== undefined) nativePermissions.sandbox_mode = host.sandbox_mode;
+  }
+  if (tool === 'claude' || tool === 'claude-internal' || tool === 'tclaude' || tool === 'codebuddy') {
+    if (host.permission_mode !== undefined) nativePermissions.permissionMode = host.permission_mode;
+  }
+  if (tool === 'qwen' && host.approval_mode !== undefined) nativePermissions.approvalMode = host.approval_mode;
+  return {
+    ...spec,
+    ...(host.name !== undefined ? { name: host.name } : {}),
+    ...(host.description !== undefined ? { description: host.description } : {}),
+    ...(host.instructions !== undefined ? { instructions: host.instructions } : {}),
+    ...(host.model !== undefined ? { model: host.model } : {}),
+    ...(host.model_ref !== undefined ? { model_ref: host.model_ref } : {}),
+    ...(host.effort !== undefined ? { effort: host.effort } : {}),
+    ...(host.tools !== undefined ? { tools: host.tools } : {}),
+    ...(Object.keys(nativePermissions).length > 0 ? { permissions: nativePermissions } : {}),
+    ...(host.tools_style !== undefined ? { tool_extras: { ...spec.tool_extras, [tool]: { ...(spec.tool_extras?.[tool] ?? {}), tools_style: host.tools_style } } } : {}),
+    ...(host.tool_extras !== undefined ? { tool_extras: { ...spec.tool_extras, [tool]: host.tool_extras } } : {}),
+  };
 }
 
 // ─── Internal render helpers ─────────────────────────────────────────────────
@@ -200,23 +284,29 @@ export function renderForCursor(spec: AgentSpec): RenderResult {
  * Build a gray-matter .md file: YAML frontmatter (name/description/model?/tools?/extras) + body.
  */
 function renderMarkdownAgent(spec: AgentSpec, extras?: Record<string, unknown>): string {
-  const frontmatterData: Record<string, unknown> = {
-    name: spec.name,
-    description: spec.description,
-  };
-  if (spec.model !== undefined) {
-    frontmatterData['model'] = spec.model;
+  const lines = ['---', `name: ${spec.name}`, `description: ${spec.description}`];
+  if (spec.model !== undefined) lines.push(`model: ${spec.model}`);
+  if (spec.effort !== undefined) lines.push(`effort: ${spec.effort}`);
+  if (spec.permissions) {
+    for (const [key, value] of Object.entries(spec.permissions)) lines.push(`${key}: ${String(value)}`);
   }
   if (spec.tools !== undefined && spec.tools.length > 0) {
-    frontmatterData['tools'] = spec.tools;
+    if (extras?.tools_style === 'comma_separated') {
+      lines.push(`tools: ${spec.tools.join(', ')}`);
+    } else {
+      lines.push('tools:');
+      lines.push(...spec.tools.map((tool) => `  - ${tool}`));
+    }
   }
   // Flatten tool-private extras into frontmatter
   if (extras) {
     for (const [key, value] of Object.entries(extras)) {
-      frontmatterData[key] = value;
+      if (key === 'tools_style') continue;
+      lines.push(`${key}: ${String(value)}`);
     }
   }
-  return matter.stringify(spec.instructions, frontmatterData);
+  const body = spec.instructions.replace(/\n*$/, '');
+  return `${lines.join('\n')}\n---\n\n${body}\n`;
 }
 
 /**
@@ -224,21 +314,22 @@ function renderMarkdownAgent(spec: AgentSpec, extras?: Record<string, unknown>):
  * Note: `tools` is intentionally omitted from TOML output — Codex uses mcp_servers instead.
  */
 function renderTomlAgent(spec: AgentSpec, extras?: Record<string, unknown>): string {
-  const tomlData: Record<string, unknown> = {
-    name: spec.name,
-    description: spec.description,
-    developer_instructions: spec.instructions,
-  };
+  const tomlData: Record<string, unknown> = { name: spec.name, description: spec.description };
   if (spec.model !== undefined) {
     tomlData['model'] = spec.model;
   }
+  if (spec.effort !== undefined) tomlData['model_reasoning_effort'] = spec.effort;
+  if (spec.permissions) Object.assign(tomlData, spec.permissions);
   // Flatten tool-private extras into top-level TOML fields
   if (extras) {
     for (const [key, value] of Object.entries(extras)) {
+      if (key === 'tools_style') continue;
       tomlData[key] = value;
     }
   }
-  return stringifyToml(tomlData);
+  const prefix = stringifyToml(tomlData).trimEnd();
+  const instructions = spec.instructions.replace(/\n*$/, '').replaceAll('"""', '\\"\\"\\"');
+  return `${prefix}\ndeveloper_instructions = """\n${instructions}\n"""\n`;
 }
 
 // ─── Reverse: tool-native format → AgentSpec ────────────────────────────────
@@ -249,9 +340,9 @@ export type ReverseResult =
   | { ok: false; reason: string };
 
 /** Common fields that belong in the AgentSpec root (not tool_extras). */
-const COMMON_CLAUDE_FIELDS = new Set(['name', 'description', 'model', 'tools']);
-const COMMON_CURSOR_FIELDS = new Set(['agent_id', 'description', 'model', 'tools']);
-const COMMON_CODEX_FIELDS = new Set(['name', 'description', 'developer_instructions', 'model']);
+const COMMON_CLAUDE_FIELDS = new Set(['name', 'description', 'model', 'model_ref', 'effort', 'permissions', 'tools']);
+const COMMON_CURSOR_FIELDS = new Set(['agent_id', 'description', 'model', 'model_ref', 'effort', 'permissions', 'tools']);
+const COMMON_CODEX_FIELDS = new Set(['name', 'description', 'developer_instructions', 'model', 'model_ref', 'effort', 'permissions']);
 
 /**
  * Reverse a Claude-format .md file into an AgentSpec.
@@ -290,6 +381,9 @@ export function reverseFromClaude(filePath: string, content: string): ReverseRes
     instructions: body,
   };
   if (fm['model'] !== undefined) spec.model = fm['model'] as string;
+  if (fm['model_ref'] !== undefined) spec.model_ref = fm['model_ref'] as string;
+  if (fm['effort'] !== undefined) spec.effort = fm['effort'] as string;
+  if (fm['permissions'] !== undefined) spec.permissions = fm['permissions'] as Record<string, unknown>;
   if (fm['tools'] !== undefined) spec.tools = fm['tools'] as string[];
   if (Object.keys(extras).length > 0) spec.tool_extras = { claude: extras };
 
@@ -346,6 +440,9 @@ export function reverseFromCodex(filePath: string, content: string): ReverseResu
     instructions: parsed['developer_instructions'] as string,
   };
   if (parsed['model'] !== undefined) spec.model = parsed['model'] as string;
+  if (parsed['model_ref'] !== undefined) spec.model_ref = parsed['model_ref'] as string;
+  if (parsed['effort'] !== undefined) spec.effort = parsed['effort'] as string;
+  if (parsed['permissions'] !== undefined) spec.permissions = parsed['permissions'] as Record<string, unknown>;
   if (Object.keys(extras).length > 0) spec.tool_extras = { codex: extras };
 
   return { ok: true, spec };
@@ -385,9 +482,23 @@ export function reverseFromCursor(filePath: string, content: string): ReverseRes
     instructions: body,
   };
   if (fm['model'] !== undefined) spec.model = fm['model'] as string;
+  if (fm['model_ref'] !== undefined) spec.model_ref = fm['model_ref'] as string;
+  if (fm['effort'] !== undefined) spec.effort = fm['effort'] as string;
+  if (fm['permissions'] !== undefined) spec.permissions = fm['permissions'] as Record<string, unknown>;
   if (fm['tools'] !== undefined) spec.tools = fm['tools'] as string[];
   if (Object.keys(extras).length > 0) spec.tool_extras = { cursor: extras };
 
+  return { ok: true, spec };
+}
+
+/** Reverse a Qwen markdown agent using the v2 frontmatter/body contract. */
+export function reverseFromQwen(filePath: string, content: string): ReverseResult {
+  const result = reverseFromClaude(filePath, content);
+  if (!result.ok) return result;
+  const spec = result.spec;
+  if (spec.tool_extras?.claude) {
+    spec.tool_extras = { qwen: spec.tool_extras.claude };
+  }
   return { ok: true, spec };
 }
 
@@ -410,6 +521,9 @@ const MERGE_COMMON_FIELDS: Array<keyof AgentSpec> = [
   'description',
   'instructions',
   'model',
+  'model_ref',
+  'effort',
+  'permissions',
   'tools',
 ];
 
@@ -499,5 +613,6 @@ export function renderForTool(spec: AgentSpec, tool: ToolName): RenderResult {
     case 'codex-internal': return renderForCodexInternal(spec);
     case 'tcodex': return renderForCodex(spec);
     case 'cursor': return renderForCursor(spec);
+    case 'qwen': return renderForQwen(spec);
   }
 }

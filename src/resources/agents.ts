@@ -9,14 +9,17 @@ import {
   parseAgentYaml,
   serializeAgentYaml,
   renderForTool,
+  agentFilename,
   reverseFromClaude,
   reverseFromCodebuddy,
   reverseFromCodex,
   reverseFromCursor,
+  reverseFromQwen,
   mergeReverseResults,
   ALL_SUPPORTED_TOOLS,
 } from './agent-format.js';
 import type { AgentSpec, ToolName, ReverseResult, ParseResult } from './agent-format.js';
+import { loadModelPolicy, resolveModelRef } from '../model-policy.js';
 
 /**
  * Extended ResourceItem for agents — carries merged spec or skip reason
@@ -330,7 +333,9 @@ export class AgentsHandler extends ResourceHandler {
     }
     spec = parseResult.spec;
 
-    const targets = spec.targets ?? ALL_SUPPORTED_TOOLS;
+    // v2 host-first files deploy only to explicitly declared hosts. v1 keeps
+    // the historical all-supported behavior for backward compatibility.
+    const targets = spec.targets ?? (spec.schema_version === 2 && spec.hosts ? Object.keys(spec.hosts) as ToolName[] : ALL_SUPPORTED_TOOLS);
 
     for (const tool of targets) {
       const toolPath = teamConfig.toolPaths[tool];
@@ -338,7 +343,7 @@ export class AgentsHandler extends ResourceHandler {
         log.debug(`Skipping agent sync for ${tool}: no agents path configured`);
         continue;
       }
-      if (!await ResourceHandler.isToolInstalled(toolPath.agents, baseDir)) {
+      if (!await ResourceHandler.isToolInstalled(toolPath.agents, baseDir, toolPath.probe)) {
         log.debug(`Skipping agent sync for ${tool}: tool not installed`);
         continue;
       }
@@ -347,8 +352,10 @@ export class AgentsHandler extends ResourceHandler {
       const destDir = path.join(baseDir, toolPath.agents);
       try {
         await ensureDir(destDir);
-        const { ext, content: rendered } = renderForTool(spec, tool);
-        const dest = path.join(destDir, `${item.name}${ext}`);
+        const renderSpec = await resolveAgentModel(spec, tool, localConfig.repo.localPath, teamConfig.modelPolicy);
+        const { ext, content: rendered } = renderForTool(renderSpec, tool);
+        const renderedFilename = agentFilename(renderSpec, tool);
+        const dest = path.join(destDir, renderedFilename.includes('.') ? renderedFilename : `${renderedFilename}${ext}`);
         await writeFile(dest, rendered);
         log.debug(`Rendered agent ${item.name} → ${tool} (${ext})`);
       } catch (e) {
@@ -413,7 +420,7 @@ export class AgentsHandler extends ResourceHandler {
         log.debug(`Skipping legacy agent sync for ${tool}: no agents path configured`);
         continue;
       }
-      if (!await ResourceHandler.isToolInstalled(toolPath.agents, baseDir)) {
+      if (!await ResourceHandler.isToolInstalled(toolPath.agents, baseDir, toolPath.probe)) {
         log.debug(`Skipping legacy agent sync for ${tool}: tool not installed`);
         continue;
       }
@@ -430,6 +437,33 @@ export class AgentsHandler extends ResourceHandler {
       }
     }
   }
+}
+
+async function resolveAgentModel(
+  spec: AgentSpec,
+  tool: ToolName,
+  repoPath: string,
+  config?: { path: string; strict?: boolean },
+): Promise<AgentSpec> {
+  const host = spec.hosts?.[tool];
+  const ref = host?.model_ref ?? spec.model_ref;
+  if (!ref) return spec;
+  const policy = await loadModelPolicy(repoPath, config);
+  if (!policy) throw new Error(`Agent ${spec.name} uses model_ref but no modelPolicy is configured`);
+  const resolved = resolveModelRef(policy, tool, ref);
+  return {
+    ...spec,
+    model: resolved.model,
+    ...(resolved.effort ? { effort: resolved.effort } : {}),
+    hosts: {
+      ...spec.hosts,
+      [tool]: {
+        ...host,
+        model: resolved.model,
+        ...(resolved.effort ? { effort: resolved.effort } : {}),
+      },
+    },
+  };
 }
 
 // ─── Module-level helpers ──────────────────────────────────────────────────
@@ -468,5 +502,7 @@ function reverseByTool(tool: ToolName, filePath: string, content: string): Rever
       return reverseFromCodex(filePath, content);
     case 'cursor':
       return reverseFromCursor(filePath, content);
+    case 'qwen':
+      return reverseFromQwen(filePath, content);
   }
 }

@@ -23,6 +23,7 @@ import {
   resolveBaseDir,
   getTeamaiHome,
   isRecallEnabled,
+  isBuiltinEnabled,
   isAgentDisabled,
 } from './types.js';
 import type { CultureFrontmatter } from './types.js';
@@ -205,7 +206,7 @@ export async function cleanupInactiveNamespaceSkills(
   for (const [tool, toolPath] of Object.entries(teamConfig.toolPaths)) {
     if (isAgentDisabled(localConfig, tool)) continue;
     if (!toolPath.skills) continue;
-    if (!await ResourceHandler.isToolInstalled(toolPath.skills, baseDir)) continue;
+    if (!await ResourceHandler.isToolInstalled(toolPath.skills, baseDir, toolPath.probe)) continue;
     if (!await pathExists(path.join(baseDir, toolPath.skills))) continue;
 
     const localSkillNames = await listDirs(path.join(baseDir, toolPath.skills));
@@ -559,7 +560,7 @@ async function pullForScope(
     for (const [tool, toolPath] of Object.entries(freshConfig.toolPaths)) {
       if (isAgentDisabled(localConfig, tool)) continue;
       if (!toolPath.skills) continue;
-      if (!await ResourceHandler.isToolInstalled(toolPath.skills, baseDir)) continue;
+      if (!await ResourceHandler.isToolInstalled(toolPath.skills, baseDir, toolPath.probe)) continue;
       const skillsDir = path.join(baseDir, toolPath.skills);
       if (!await pathExists(skillsDir)) continue;
 
@@ -960,7 +961,7 @@ export async function injectRecallBlockIntoTools(
     localConfig: LocalConfig,
     scopeLabel: string,
 ): Promise<void> {
-    if (!isRecallEnabled(localConfig, config)) return;
+    if (!isRecallEnabled(localConfig, config) || !isBuiltinEnabled(config, 'rules', 'teamai-recall')) return;
     try {
         const baseDir = resolveBaseDir(localConfig);
         const recallBlock = compileRecallRulesBlock();
@@ -968,7 +969,7 @@ export async function injectRecallBlockIntoTools(
         for (const [tool, toolPath] of Object.entries(config.toolPaths)) {
             if (isAgentDisabled(localConfig, tool)) continue;
             if (!toolPath.claudemd || !toolPath.agents) continue;
-            if (!await ResourceHandler.isToolInstalled(toolPath.agents, baseDir)) continue;
+            if (!await ResourceHandler.isToolInstalled(toolPath.agents, baseDir, toolPath.probe)) continue;
 
             const claudeMdPath = path.join(baseDir, toolPath.claudemd);
             try {
@@ -1225,11 +1226,17 @@ export async function pull(options: GlobalOptions): Promise<void> {
   //    Scope filtering: project scope only gets sessions whose cwd is under
   //    projectRoot; user scope excludes those sessions.
   if (!options.dryRun) {
-    try {
+    const usageConfigs = [projectConfig, activeUserConfig].filter((c): c is LocalConfig => !!c);
+    const reportingConfigs = await Promise.all(usageConfigs.map(async (c) => ({ c, cfg: await loadTeamConfig(c.repo.localPath) })));
+    const reportingEnabled = reportingConfigs.some(({ cfg }) => cfg?.sharing.usage?.enabled !== false && cfg?.sharing.usage?.autoReport !== false);
+    if (!reportingEnabled) {
+      log.debug('Usage reporting disabled by team policy');
+    }
+    if (reportingEnabled) try {
       const { reportUsageToTeam } = await import('./team-push.js');
       const { truncateUsageAfterReport, readUsageEvents } = await import('./usage-tracker.js');
       const targets: Array<{ repoPath: string; username: string; opts: { skipTruncate: true; projectRoot?: string; excludeProjectRoots?: string[]; selfConfig?: LocalConfig } }> = [];
-      if (projectConfig && projectConfig.repo.kind !== 'http') {
+      if (projectConfig && projectConfig.repo.kind !== 'http' && reportingConfigs.find(x => x.c === projectConfig)?.cfg?.sharing.usage?.enabled !== false && reportingConfigs.find(x => x.c === projectConfig)?.cfg?.sharing.usage?.autoReport !== false) {
         targets.push({
           repoPath: projectConfig.repo.localPath,
           username: projectConfig.username,
@@ -1241,7 +1248,7 @@ export async function pull(options: GlobalOptions): Promise<void> {
           },
         });
       }
-      if (activeUserConfig && activeUserConfig.repo.kind !== 'http') {
+      if (activeUserConfig && activeUserConfig.repo.kind !== 'http' && reportingConfigs.find(x => x.c === activeUserConfig)?.cfg?.sharing.usage?.enabled !== false && reportingConfigs.find(x => x.c === activeUserConfig)?.cfg?.sharing.usage?.autoReport !== false) {
         targets.push({
           repoPath: activeUserConfig.repo.localPath,
           username: activeUserConfig.username,

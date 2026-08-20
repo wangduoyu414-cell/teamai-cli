@@ -4,6 +4,7 @@ import { log } from './utils/logger.js';
 import { TEAMAI_HOOK_DESCRIPTION_PREFIX, TEAMAI_CUSTOM_HOOK_PREFIX, TEAMAI_AGENT_HOOK_PREFIX, getManagedHooksPath, resolveBaseDir } from './types.js';
 import type { HookDef, TeamaiConfig, LocalConfig } from './types.js';
 import { builtinHookDefs, applyBuiltinOverride, ensureWrapperIfShellAvailable, SHELL_DEPENDENT_TOOLS } from './builtin-hooks.js';
+import { isBuiltinEnabled } from './types.js';
 import type { BuiltinHookOverride } from './builtin-hooks.js';
 import { resolveTeamHooks } from './resources/hooks.js';
 
@@ -861,9 +862,19 @@ export async function reconcileTeamHooksForConfig(
     const universe = filterAgents ?? Object.keys(teamConfig.toolPaths);
     filterAgents = universe.filter((t) => !disabled.includes(t));
   }
+  const hookPolicy = teamConfig.builtins?.hooks;
+  const policyDisabled = hookPolicy?.mode === 'disabled'
+    ? builtinHookDefs('claude').map((d) => d.key)
+    : hookPolicy?.mode === 'allowlist'
+      ? builtinHookDefs('claude').filter((d) => !isBuiltinEnabled(teamConfig, 'hooks', d.key)).map((d) => d.key)
+      : [];
+  const mergedBuiltin = {
+    ...(builtin ?? {}),
+    disabled: [...new Set([...(builtin?.disabled ?? []), ...policyDisabled])],
+  };
   await reconcileHooksToAllTools(teamConfig.toolPaths, baseDir, teamDefs, manifestPath, {
     removeAll: opts.removeAll,
-    builtinOverride: builtin,
+    builtinOverride: mergedBuiltin,
     filterAgents,
   });
   return teamDefs;

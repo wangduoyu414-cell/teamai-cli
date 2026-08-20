@@ -63,9 +63,9 @@ export abstract class ResourceHandler {
    * This prevents creating directories for tools the user hasn't installed.
    * @param baseDir - Override base directory (defaults to HOME). Used for project scope.
    */
-  static async isToolInstalled(toolPath: string, baseDir?: string): Promise<boolean> {
+  static async isToolInstalled(toolPath: string, baseDir?: string, probePath?: string): Promise<boolean> {
     const base = baseDir ?? process.env.HOME ?? '';
-    const toolRoot = path.join(base, toolPath.split('/')[0]);
+    const toolRoot = path.join(base, (probePath ?? toolPath).split('/')[0]);
     return pathExists(toolRoot);
   }
 

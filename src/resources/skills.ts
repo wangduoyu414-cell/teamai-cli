@@ -444,7 +444,7 @@ export class SkillsHandler extends ResourceHandler {
         }
         dest = path.join(wsDir, 'skills', item.name);
       } else {
-        if (!await ResourceHandler.isToolInstalled(toolPath.skills, baseDir)) {
+        if (!await ResourceHandler.isToolInstalled(toolPath.skills, baseDir, toolPath.probe)) {
           log.debug(`Skipping skill sync for ${tool}: tool not installed`);
           continue;
         }

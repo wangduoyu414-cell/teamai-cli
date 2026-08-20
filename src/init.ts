@@ -803,7 +803,7 @@ export async function initSelfRepo(options: GlobalOptions & {
   }
 
   // Step 6: register member on the reports orphan branch (never touches main / active tree).
-  if (!options.dryRun) {
+  if (!options.dryRun && teamConfig.sharing.registration?.autoRegister !== false) {
     try {
       const { ensureReportsWorktree, commitAndPushReports } = await import('./utils/reports-branch.js');
       const wt = await ensureReportsWorktree(localConfig);
@@ -1091,10 +1091,11 @@ export async function init(options: GlobalOptions & {
     }
   }
 
-  // Step 5: Create member file
+  // Step 5: Create member file unless registration is explicitly disabled.
+  const registrationEnabled = teamConfig?.sharing.registration?.autoRegister !== false;
   const memberPath = path.join(localPath, 'members', `${username}.yaml`);
-  const isNewMember = !await pathExists(memberPath);
-  if (isNewMember) {
+  const isNewMember = registrationEnabled && !await pathExists(memberPath);
+  if (registrationEnabled && isNewMember) {
     const memberYaml = YAML.stringify({
       username,
       displayName: username,
@@ -1118,15 +1119,17 @@ export async function init(options: GlobalOptions & {
         log.warn(`Push failed (you can push manually later): ${(e as Error).message}`);
       }
     }
-  } else {
+  } else if (registrationEnabled) {
     log.info(`Member ${username} already registered`);
+  } else {
+    log.info('Team member registration disabled by team policy');
   }
 
   // Step 5.5: Configure default MR reviewers (only for fresh setup with no reviewers yet).
   // --force implies non-interactive: skip reviewer prompts entirely (can be configured later).
   const currentConfig = await loadTeamConfig(localPath);
   const hasReviewers = currentConfig?.reviewers && currentConfig.reviewers.length > 0;
-  if (isNewMember && !hasReviewers && !options.force) {
+  if (registrationEnabled && isNewMember && !hasReviewers && !options.force) {
     const wantReviewers = await askConfirmation(
       '\nWould you like to configure default MR reviewers? [y/N] ',
     );

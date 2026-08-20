@@ -439,6 +439,63 @@ describe('managed resource lifecycle', () => {
     }
   });
 
+  it('rejects a journal path that escapes the managed scope through a symlink', async () => {
+    const { root, home } = await fixture();
+    const outsideRoot = await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-outside-link-'));
+    tempDirs.push(outsideRoot);
+    const outside = path.join(outsideRoot, 'keep.md');
+    const link = path.join(root, 'escape');
+    const rollbackRoot = path.join(root, '.teamai-rollback-symlink-a');
+    await fse.writeFile(outside, 'keep');
+    await fse.symlink(outsideRoot, link, 'dir');
+    await fse.ensureDir(home);
+    await fse.writeJson(path.join(home, 'managed-resources.journal.json'), {
+      version: 1,
+      transactionId: 'symlink',
+      status: 'applying',
+      resourceIds: ['agents:a'],
+      operations: [{
+        target: path.join(link, 'keep.md'),
+        previous: path.join(rollbackRoot, 'previous'),
+        rollbackRoot,
+        hadPrevious: false,
+        phase: 'applied',
+      }],
+      stagedRoots: [], createdBackups: [], backupCleanup: [], updatedAt: new Date().toISOString(),
+    });
+
+    await expect(recoverManagedResourceTransaction(home)).rejects.toThrow('journal is invalid');
+    expect(await fse.readFile(outside, 'utf8')).toBe('keep');
+  });
+
+  it('keeps an explicitly configured OpenClaw workspace valid for project scope', async () => {
+    const { root, home } = await fixture();
+    const externalRoot = await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-openclaw-'));
+    tempDirs.push(externalRoot);
+    const stateDir = path.join(externalRoot, 'state');
+    const workspace = path.join(externalRoot, 'workspace');
+    const source = path.join(root, 'source');
+    const target = path.join(workspace, 'skills', 'external');
+    await fse.outputFile(path.join(source, 'SKILL.md'), 'skill');
+    await fse.ensureDir(workspace);
+    await fse.outputJson(path.join(stateDir, 'openclaw.json'), { agents: { defaults: { workspace } } });
+    const previousStateDir = process.env.OPENCLAW_STATE_DIR;
+    process.env.OPENCLAW_STATE_DIR = stateDir;
+    try {
+      const desired: DesiredManagedResource = {
+        id: 'skills:external',
+        type: 'skills',
+        targets: [{ path: target, kind: 'directory', tool: 'openclaw', sourcePath: source }],
+      };
+      await reconcileManagedResources(home, [desired], { pruneTypes: ['skills'] });
+      await reconcileManagedResources(home, [desired], { pruneTypes: ['skills'] });
+      expect(await fse.readFile(path.join(target, 'SKILL.md'), 'utf8')).toBe('skill');
+    } finally {
+      if (previousStateDir === undefined) delete process.env.OPENCLAW_STATE_DIR;
+      else process.env.OPENCLAW_STATE_DIR = previousStateDir;
+    }
+  });
+
   it('refuses to plan while a valid transaction still requires recovery', async () => {
     const { root, home } = await fixture();
     await fse.ensureDir(home);

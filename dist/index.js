@@ -2917,6 +2917,7 @@ __export(openclaw_hooks_exports, {
   OPENCLAW_HOOK_DIR: () => OPENCLAW_HOOK_DIR,
   applyOpenClawAgentHook: () => applyOpenClawAgentHook,
   injectOpenClawHooks: () => injectOpenClawHooks,
+  openclawWorkspaceCandidates: () => openclawWorkspaceCandidates,
   removeOpenClawAgentHook: () => removeOpenClawAgentHook,
   removeOpenClawHooks: () => removeOpenClawHooks,
   resolveOpenClawHooksDir: () => resolveOpenClawHooksDir,
@@ -3047,7 +3048,7 @@ async function removeOpenClawAgentHook(opts) {
     log.success(`Removed OpenClaw agent hook [${opts.slug}] from ${dir}`);
   }
 }
-async function resolveOpenclawWorkspaceDir(workspacePath) {
+async function openclawWorkspaceCandidates(workspacePath) {
   const candidates = [];
   if (workspacePath) candidates.push(workspacePath);
   const stateDir = process.env.OPENCLAW_STATE_DIR;
@@ -3065,6 +3066,10 @@ async function resolveOpenclawWorkspaceDir(workspacePath) {
   }
   const home = process.env.HOME;
   if (home) candidates.push(path10.join(home, ".openclaw", "workspace"));
+  return candidates;
+}
+async function resolveOpenclawWorkspaceDir(workspacePath) {
+  const candidates = await openclawWorkspaceCandidates(workspacePath);
   for (const candidate of candidates) {
     if (await pathExists(candidate)) {
       log.debug(`openclaw: resolved workspace dir to ${candidate}`);
@@ -3112,32 +3117,67 @@ function isWithin(root, candidate) {
   const relative = path11.relative(path11.resolve(root), path11.resolve(candidate));
   return relative === "" || !relative.startsWith(".." + path11.sep) && relative !== ".." && !path11.isAbsolute(relative);
 }
-function assertAbsoluteWithin(root, candidate, label) {
-  if (!path11.isAbsolute(candidate) || !isWithin(root, candidate)) {
-    throw new Error(`${label} is outside the managed scope: ${candidate}`);
+async function nearestExistingRealPath(candidate) {
+  let current = path11.resolve(candidate);
+  while (true) {
+    try {
+      return await fse3.realpath(current);
+    } catch (error) {
+      const code = error.code;
+      if (code !== "ENOENT" && code !== "ENOTDIR") throw error;
+      const parent = path11.dirname(current);
+      if (parent === current) throw error;
+      current = parent;
+    }
   }
 }
-function validateManifestSemantics(home, manifest) {
+async function assertAbsoluteWithin(roots, candidate, label) {
+  if (path11.isAbsolute(candidate)) {
+    for (const root of roots) {
+      if (!isWithin(root, candidate)) continue;
+      const [realRoot, realCandidate] = await Promise.all([
+        nearestExistingRealPath(root),
+        nearestExistingRealPath(candidate)
+      ]);
+      if (isWithin(realRoot, realCandidate)) return;
+    }
+  }
+  throw new Error(`${label} is outside the managed scope: ${candidate}`);
+}
+async function managedTargetRoots(home, candidates) {
   const scopeRoot = path11.dirname(path11.resolve(home));
+  const roots = [scopeRoot];
+  if (candidates.some((candidate) => !path11.isAbsolute(candidate) || !isWithin(scopeRoot, candidate))) {
+    roots.push(...(await openclawWorkspaceCandidates()).filter((candidate) => path11.isAbsolute(candidate)));
+  }
+  return roots;
+}
+async function validateManifestSemantics(home, manifest) {
   const backupRoot = path11.join(path11.resolve(home), BACKUPS_DIR);
+  const targets = Object.values(manifest.resources).flatMap((resource) => resource.targets);
+  const targetRoots = await managedTargetRoots(home, targets.map((target) => target.path));
   const seenTargets = /* @__PURE__ */ new Set();
   for (const [id, resource] of Object.entries(manifest.resources)) {
     if (resource.id !== id) throw new Error(`Managed resource key/id mismatch: ${id}`);
     for (const target of resource.targets) {
-      assertAbsoluteWithin(scopeRoot, target.path, "Managed target");
+      await assertAbsoluteWithin(targetRoots, target.path, "Managed target");
       if (seenTargets.has(target.path)) throw new Error(`Managed target is claimed more than once: ${target.path}`);
       seenTargets.add(target.path);
-      if (target.backupPath) assertAbsoluteWithin(backupRoot, target.backupPath, "Managed backup");
+      if (target.backupPath) await assertAbsoluteWithin([backupRoot], target.backupPath, "Managed backup");
     }
   }
 }
-function validateJournalSemantics(home, journal) {
-  const scopeRoot = path11.dirname(path11.resolve(home));
+async function validateJournalSemantics(home, journal) {
   const backupRoot = path11.join(path11.resolve(home), BACKUPS_DIR);
+  const managedPaths = [
+    ...journal.operations.flatMap((operation) => [operation.target, operation.rollbackRoot, ...operation.stagedRoot ? [operation.stagedRoot] : []]),
+    ...journal.stagedRoots
+  ];
+  const targetRoots = await managedTargetRoots(home, managedPaths);
   const operationTargets = /* @__PURE__ */ new Set();
   for (const operation of journal.operations) {
-    assertAbsoluteWithin(scopeRoot, operation.target, "Journal target");
-    assertAbsoluteWithin(scopeRoot, operation.rollbackRoot, "Journal rollback root");
+    await assertAbsoluteWithin(targetRoots, operation.target, "Journal target");
+    await assertAbsoluteWithin(targetRoots, operation.rollbackRoot, "Journal rollback root");
     if (operationTargets.has(operation.target)) throw new Error(`Journal target is duplicated: ${operation.target}`);
     operationTargets.add(operation.target);
     if (!path11.basename(operation.rollbackRoot).startsWith(`.teamai-rollback-${journal.transactionId}-`)) {
@@ -3146,11 +3186,11 @@ function validateJournalSemantics(home, journal) {
     if (operation.previous !== path11.join(operation.rollbackRoot, "previous")) {
       throw new Error(`Journal previous path does not match rollback root: ${operation.previous}`);
     }
-    if (operation.stagedRoot) assertAbsoluteWithin(scopeRoot, operation.stagedRoot, "Journal staged root");
+    if (operation.stagedRoot) await assertAbsoluteWithin(targetRoots, operation.stagedRoot, "Journal staged root");
   }
-  for (const stagedRoot of journal.stagedRoots) assertAbsoluteWithin(scopeRoot, stagedRoot, "Journal staged root");
+  for (const stagedRoot of journal.stagedRoots) await assertAbsoluteWithin(targetRoots, stagedRoot, "Journal staged root");
   for (const backup of [...journal.createdBackups, ...journal.backupCleanup]) {
-    assertAbsoluteWithin(backupRoot, backup, "Journal backup");
+    await assertAbsoluteWithin([backupRoot], backup, "Journal backup");
   }
 }
 function managedResourceManifestPath(scope, projectRoot) {
@@ -3179,7 +3219,7 @@ async function loadManagedResourceManifest(home) {
     throw new Error(`Managed resource manifest has an unsupported shape: ${manifestPath}`);
   }
   const manifest = result.data;
-  validateManifestSemantics(home, manifest);
+  await validateManifestSemantics(home, manifest);
   return manifest;
 }
 async function managedManifestTargetPaths(home) {
@@ -3220,7 +3260,7 @@ async function readJournal(home) {
     const result = ManagedResourceJournalSchema.safeParse(JSON.parse(content));
     if (!result.success) throw new Error("shape");
     const journal = result.data;
-    validateJournalSemantics(home, journal);
+    await validateJournalSemantics(home, journal);
     return journal;
   } catch {
     throw new Error(`Managed resource journal is invalid: ${journalPath}`);
@@ -3488,10 +3528,13 @@ async function reconcileManagedResources(home, desiredResources, options = {}) {
   const result = { applied: [], removed: [], conflicts: [], planned: [] };
   const desiredIds = /* @__PURE__ */ new Set();
   const desiredOwners = /* @__PURE__ */ new Map();
+  const desiredTargetPaths = desiredResources.flatMap((resource) => resource.targets.map((target) => target.path));
+  const targetRoots = await managedTargetRoots(home, desiredTargetPaths);
   for (const resource of desiredResources) {
     if (desiredIds.has(resource.id)) throw new Error(`Managed resource id is duplicated: ${resource.id}`);
     desiredIds.add(resource.id);
     for (const target of resource.targets) {
+      await assertAbsoluteWithin(targetRoots, target.path, "Managed target");
       const owner = desiredOwners.get(target.path);
       if (owner) throw new Error(`Managed target is claimed by both ${owner} and ${resource.id}: ${target.path}`);
       desiredOwners.set(target.path, resource.id);
@@ -3703,6 +3746,7 @@ var MANIFEST_FILE, JOURNAL_FILE, BACKUPS_DIR, HASH_PATTERN, ManagedSectionSchema
 var init_managed_resources = __esm({
   "src/managed-resources.ts"() {
     "use strict";
+    init_openclaw_hooks();
     init_types();
     MANIFEST_FILE = "managed-resources.json";
     JOURNAL_FILE = "managed-resources.journal.json";

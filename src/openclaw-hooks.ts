@@ -217,7 +217,7 @@ export async function removeOpenClawAgentHook(opts: {
  *
  * Returns the first candidate whose directory exists, or null.
  */
-export async function resolveOpenclawWorkspaceDir(workspacePath?: string): Promise<string | null> {
+export async function openclawWorkspaceCandidates(workspacePath?: string): Promise<string[]> {
   const candidates: string[] = [];
   if (workspacePath) candidates.push(workspacePath);
   const stateDir = process.env.OPENCLAW_STATE_DIR;
@@ -233,6 +233,11 @@ export async function resolveOpenclawWorkspaceDir(workspacePath?: string): Promi
   }
   const home = process.env.HOME;
   if (home) candidates.push(path.join(home, '.openclaw', 'workspace'));
+  return candidates;
+}
+
+export async function resolveOpenclawWorkspaceDir(workspacePath?: string): Promise<string | null> {
+  const candidates = await openclawWorkspaceCandidates(workspacePath);
   for (const candidate of candidates) {
     if (await pathExists(candidate)) {
       log.debug(`openclaw: resolved workspace dir to ${candidate}`);

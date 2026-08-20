@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 import path from 'node:path';
 import fse from 'fs-extra';
 import { z } from 'zod';
+import { openclawWorkspaceCandidates } from './openclaw-hooks.js';
 import { getTeamaiHome, type Scope } from './types.js';
 
 /** One ownership ledger covers every resource channel; handlers only supply targets. */
@@ -180,34 +181,71 @@ function isWithin(root: string, candidate: string): boolean {
   return relative === '' || (!relative.startsWith('..' + path.sep) && relative !== '..' && !path.isAbsolute(relative));
 }
 
-function assertAbsoluteWithin(root: string, candidate: string, label: string): void {
-  if (!path.isAbsolute(candidate) || !isWithin(root, candidate)) {
-    throw new Error(`${label} is outside the managed scope: ${candidate}`);
-  }
-}
-
-function validateManifestSemantics(home: string, manifest: ManagedResourceManifest): void {
-  const scopeRoot = path.dirname(path.resolve(home));
-  const backupRoot = path.join(path.resolve(home), BACKUPS_DIR);
-  const seenTargets = new Set<string>();
-  for (const [id, resource] of Object.entries(manifest.resources)) {
-    if (resource.id !== id) throw new Error(`Managed resource key/id mismatch: ${id}`);
-    for (const target of resource.targets) {
-      assertAbsoluteWithin(scopeRoot, target.path, 'Managed target');
-      if (seenTargets.has(target.path)) throw new Error(`Managed target is claimed more than once: ${target.path}`);
-      seenTargets.add(target.path);
-      if (target.backupPath) assertAbsoluteWithin(backupRoot, target.backupPath, 'Managed backup');
+async function nearestExistingRealPath(candidate: string): Promise<string> {
+  let current = path.resolve(candidate);
+  while (true) {
+    try {
+      return await fse.realpath(current);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== 'ENOENT' && code !== 'ENOTDIR') throw error;
+      const parent = path.dirname(current);
+      if (parent === current) throw error;
+      current = parent;
     }
   }
 }
 
-function validateJournalSemantics(home: string, journal: ManagedResourceJournal): void {
+async function assertAbsoluteWithin(roots: string[], candidate: string, label: string): Promise<void> {
+  if (path.isAbsolute(candidate)) {
+    for (const root of roots) {
+      if (!isWithin(root, candidate)) continue;
+      const [realRoot, realCandidate] = await Promise.all([
+        nearestExistingRealPath(root),
+        nearestExistingRealPath(candidate),
+      ]);
+      if (isWithin(realRoot, realCandidate)) return;
+    }
+  }
+  throw new Error(`${label} is outside the managed scope: ${candidate}`);
+}
+
+async function managedTargetRoots(home: string, candidates: string[]): Promise<string[]> {
   const scopeRoot = path.dirname(path.resolve(home));
+  const roots = [scopeRoot];
+  if (candidates.some((candidate) => !path.isAbsolute(candidate) || !isWithin(scopeRoot, candidate))) {
+    roots.push(...(await openclawWorkspaceCandidates()).filter((candidate) => path.isAbsolute(candidate)));
+  }
+  return roots;
+}
+
+async function validateManifestSemantics(home: string, manifest: ManagedResourceManifest): Promise<void> {
   const backupRoot = path.join(path.resolve(home), BACKUPS_DIR);
+  const targets = Object.values(manifest.resources).flatMap((resource) => resource.targets);
+  const targetRoots = await managedTargetRoots(home, targets.map((target) => target.path));
+  const seenTargets = new Set<string>();
+  for (const [id, resource] of Object.entries(manifest.resources)) {
+    if (resource.id !== id) throw new Error(`Managed resource key/id mismatch: ${id}`);
+    for (const target of resource.targets) {
+      await assertAbsoluteWithin(targetRoots, target.path, 'Managed target');
+      if (seenTargets.has(target.path)) throw new Error(`Managed target is claimed more than once: ${target.path}`);
+      seenTargets.add(target.path);
+      if (target.backupPath) await assertAbsoluteWithin([backupRoot], target.backupPath, 'Managed backup');
+    }
+  }
+}
+
+async function validateJournalSemantics(home: string, journal: ManagedResourceJournal): Promise<void> {
+  const backupRoot = path.join(path.resolve(home), BACKUPS_DIR);
+  const managedPaths = [
+    ...journal.operations.flatMap((operation) => [operation.target, operation.rollbackRoot, ...(operation.stagedRoot ? [operation.stagedRoot] : [])]),
+    ...journal.stagedRoots,
+  ];
+  const targetRoots = await managedTargetRoots(home, managedPaths);
   const operationTargets = new Set<string>();
   for (const operation of journal.operations) {
-    assertAbsoluteWithin(scopeRoot, operation.target, 'Journal target');
-    assertAbsoluteWithin(scopeRoot, operation.rollbackRoot, 'Journal rollback root');
+    await assertAbsoluteWithin(targetRoots, operation.target, 'Journal target');
+    await assertAbsoluteWithin(targetRoots, operation.rollbackRoot, 'Journal rollback root');
     if (operationTargets.has(operation.target)) throw new Error(`Journal target is duplicated: ${operation.target}`);
     operationTargets.add(operation.target);
     if (!path.basename(operation.rollbackRoot).startsWith(`.teamai-rollback-${journal.transactionId}-`)) {
@@ -216,11 +254,11 @@ function validateJournalSemantics(home: string, journal: ManagedResourceJournal)
     if (operation.previous !== path.join(operation.rollbackRoot, 'previous')) {
       throw new Error(`Journal previous path does not match rollback root: ${operation.previous}`);
     }
-    if (operation.stagedRoot) assertAbsoluteWithin(scopeRoot, operation.stagedRoot, 'Journal staged root');
+    if (operation.stagedRoot) await assertAbsoluteWithin(targetRoots, operation.stagedRoot, 'Journal staged root');
   }
-  for (const stagedRoot of journal.stagedRoots) assertAbsoluteWithin(scopeRoot, stagedRoot, 'Journal staged root');
+  for (const stagedRoot of journal.stagedRoots) await assertAbsoluteWithin(targetRoots, stagedRoot, 'Journal staged root');
   for (const backup of [...journal.createdBackups, ...journal.backupCleanup]) {
-    assertAbsoluteWithin(backupRoot, backup, 'Journal backup');
+    await assertAbsoluteWithin([backupRoot], backup, 'Journal backup');
   }
 }
 
@@ -252,7 +290,7 @@ export async function loadManagedResourceManifest(home: string): Promise<Managed
     throw new Error(`Managed resource manifest has an unsupported shape: ${manifestPath}`);
   }
   const manifest = result.data as ManagedResourceManifest;
-  validateManifestSemantics(home, manifest);
+  await validateManifestSemantics(home, manifest);
   return manifest;
 }
 
@@ -299,7 +337,7 @@ async function readJournal(home: string): Promise<ManagedResourceJournal | null>
     const result = ManagedResourceJournalSchema.safeParse(JSON.parse(content));
     if (!result.success) throw new Error('shape');
     const journal = result.data as ManagedResourceJournal;
-    validateJournalSemantics(home, journal);
+    await validateJournalSemantics(home, journal);
     return journal;
   } catch {
     throw new Error(`Managed resource journal is invalid: ${journalPath}`);
@@ -624,10 +662,13 @@ export async function reconcileManagedResources(
 
   const desiredIds = new Set<string>();
   const desiredOwners = new Map<string, string>();
+  const desiredTargetPaths = desiredResources.flatMap((resource) => resource.targets.map((target) => target.path));
+  const targetRoots = await managedTargetRoots(home, desiredTargetPaths);
   for (const resource of desiredResources) {
     if (desiredIds.has(resource.id)) throw new Error(`Managed resource id is duplicated: ${resource.id}`);
     desiredIds.add(resource.id);
     for (const target of resource.targets) {
+      await assertAbsoluteWithin(targetRoots, target.path, 'Managed target');
       const owner = desiredOwners.get(target.path);
       if (owner) throw new Error(`Managed target is claimed by both ${owner} and ${resource.id}: ${target.path}`);
       desiredOwners.set(target.path, resource.id);

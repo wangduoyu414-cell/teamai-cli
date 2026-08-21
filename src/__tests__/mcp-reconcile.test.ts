@@ -291,6 +291,21 @@ servers:
     expect(await fse.pathExists(path.join(projectRoot, '.mcp.json'))).toBe(true);
   });
 
+  it('does not target MCP files for hosts outside the explicit allowlist', async () => {
+    localConfig.enabledAgents = ['cursor'];
+    const targets = await resolveMcpTargets(teamConfig, localConfig);
+    expect(targets.map((target) => target.tool)).toEqual(['cursor']);
+  });
+
+  it('never targets MCP for explicit-only hosts even when a custom config declares it', async () => {
+    await fse.ensureDir(path.join(homeDir, '.workbuddy', 'skills'));
+    teamConfig.toolPaths = {
+      workbuddy: { skills: '.workbuddy/skills', settings: '.workbuddy/settings.json', mcp: '.workbuddy/mcp.json' },
+    } as TeamaiConfig['toolPaths'];
+    localConfig.enabledAgents = ['workbuddy'];
+    expect(await resolveMcpTargets(teamConfig, localConfig)).toEqual([]);
+  });
+
   it('resolves a project secret to plaintext in every tool, keyed off `type`', async () => {
     const projectRoot = path.join(tmpDir, 'proj2');
     for (const d of ['.claude', '.cursor', '.codebuddy']) {

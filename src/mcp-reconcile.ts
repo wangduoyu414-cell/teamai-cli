@@ -33,6 +33,7 @@ import {
   expandHome,
 } from './utils/fs.js';
 import { log } from './utils/logger.js';
+import { EXPLICIT_ONLY_HOSTS, isHostSelected, normalizeHostId } from './host-adapters.js';
 
 // ─── Reconcile engine ────────────────────────────────────────
 //
@@ -189,6 +190,8 @@ export async function resolveMcpTargets(
   const targets: McpTarget[] = [];
 
   for (const [tool, paths] of Object.entries(teamConfig.toolPaths)) {
+    if (EXPLICIT_ONLY_HOSTS.has(normalizeHostId(tool))) continue;
+    if (!isHostSelected(localConfig, tool)) continue;
     const format = detectMcpFormat(tool);
     if (!format) continue;
 

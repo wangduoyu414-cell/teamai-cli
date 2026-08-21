@@ -15,6 +15,7 @@ import { getFileContentAtRev } from './git.js';
 import { ResourceHandler } from '../resources/base.js';
 import { EXCLUDED_RULE_NAMES } from '../builtin-rules.js';
 import { log } from './logger.js';
+import { EXPLICIT_ONLY_HOSTS, isHostSelected, normalizeHostId, supportsStaticResource } from '../host-adapters.js';
 
 /**
  * Sync team repo updates to local tool directories BEFORE scanning for push.
@@ -55,7 +56,7 @@ export async function syncTeamUpdatesToLocal(
  */
 async function syncRulesToLocal(
   teamConfig: TeamaiConfig,
-  _localConfig: LocalConfig,
+  localConfig: LocalConfig,
   repoPath: string,
   baseDir: string,
   lastPullRev: string,
@@ -64,7 +65,8 @@ async function syncRulesToLocal(
   if (!await pathExists(teamRulesDir)) return;
 
   for (const [tool, toolPath] of Object.entries(teamConfig.toolPaths)) {
-    if (!toolPath.rules) continue;
+    if (EXPLICIT_ONLY_HOSTS.has(normalizeHostId(tool))) continue;
+    if (!toolPath.rules || !isHostSelected(localConfig, tool) || !supportsStaticResource(tool, 'rules', localConfig.scope)) continue;
     if (!await ResourceHandler.isToolInstalled(toolPath.rules, baseDir)) continue;
 
     const rulesDir = path.join(baseDir, toolPath.rules);
@@ -103,7 +105,7 @@ async function syncRulesToLocal(
  */
 async function syncSkillsToLocal(
   teamConfig: TeamaiConfig,
-  _localConfig: LocalConfig,
+  localConfig: LocalConfig,
   repoPath: string,
   baseDir: string,
   lastPullRev: string,
@@ -133,7 +135,10 @@ async function syncSkillsToLocal(
   const CONTRIBUTORS_FILE = 'CONTRIBUTORS';
 
   for (const [tool, toolPath] of Object.entries(teamConfig.toolPaths)) {
-    if (!toolPath.skills) continue;
+    // This path writes directly and does not update the ownership ledger. Keep
+    // external product roots on the normal pull lifecycle instead.
+    if (EXPLICIT_ONLY_HOSTS.has(normalizeHostId(tool))) continue;
+    if (!toolPath.skills || !isHostSelected(localConfig, tool) || !supportsStaticResource(tool, 'skills', localConfig.scope)) continue;
     if (!await ResourceHandler.isToolInstalled(toolPath.skills, baseDir)) continue;
 
     const skillsDir = path.join(baseDir, toolPath.skills);

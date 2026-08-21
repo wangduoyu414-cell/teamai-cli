@@ -26,11 +26,12 @@ import type {
   GlobalOptions,
 } from './types.js';
 import { resolveBaseDir, SOURCE_PULL_TTL_MS } from './types.js';
+import { EXPLICIT_ONLY_HOSTS, homeDir, isHostSelected, normalizeHostId, supportsStaticResource } from './host-adapters.js';
 
 // ─── Source repo management ──────────────────────────────
 
 function getSourceDir(sourceName: string): string {
-  return path.join(process.env.HOME ?? '', '.teamai', 'sources', sourceName);
+  return path.join(homeDir(), '.teamai', 'sources', sourceName);
 }
 
 function getSourceRepoDir(sourceName: string): string {
@@ -454,8 +455,11 @@ async function pullSingleSource(
     }
 
     // Deploy to each tool's skills directory
-    for (const [_tool, toolPath] of Object.entries(teamConfig.toolPaths)) {
-      if (!toolPath.skills) continue;
+    for (const [tool, toolPath] of Object.entries(teamConfig.toolPaths)) {
+      // Cross-team sources still use the legacy direct-copy lifecycle. Keep the
+      // external product roots out of that path until it is manifest-backed.
+      if (EXPLICIT_ONLY_HOSTS.has(normalizeHostId(tool))) continue;
+      if (!toolPath.skills || !isHostSelected(localConfig, tool) || !supportsStaticResource(tool, 'skills', localConfig.scope)) continue;
       if (!await ResourceHandler.isToolInstalled(toolPath.skills, baseDir, toolPath.probe)) continue;
 
       const targetDir = path.join(baseDir, toolPath.skills, skill.name);
@@ -475,7 +479,7 @@ async function pullSingleSource(
     const deployedSet = new Set(deployed);
     for (const oldSkill of oldInstalled) {
       if (!deployedSet.has(oldSkill) && !localTeamSkills.has(oldSkill)) {
-        await removeSkillFromToolPaths(oldSkill, teamConfig, baseDir);
+        await removeSkillFromToolPaths(oldSkill, teamConfig, localConfig);
         log.debug(`[source:${source.name}] Removed "${oldSkill}" (no longer public)`);
       }
     }
@@ -590,9 +594,11 @@ async function getLocalTeamSkillNames(teamConfig: TeamaiConfig, localConfig: Loc
 /**
  * Remove a skill from all tool paths.
  */
-async function removeSkillFromToolPaths(skillName: string, teamConfig: TeamaiConfig, baseDir: string): Promise<void> {
-  for (const [_tool, toolPath] of Object.entries(teamConfig.toolPaths)) {
-    if (!toolPath.skills) continue;
+async function removeSkillFromToolPaths(skillName: string, teamConfig: TeamaiConfig, localConfig: LocalConfig): Promise<void> {
+  const baseDir = resolveBaseDir(localConfig);
+  for (const [tool, toolPath] of Object.entries(teamConfig.toolPaths)) {
+    if (EXPLICIT_ONLY_HOSTS.has(normalizeHostId(tool))) continue;
+    if (!toolPath.skills || !isHostSelected(localConfig, tool) || !supportsStaticResource(tool, 'skills', localConfig.scope)) continue;
     const skillDir = path.join(baseDir, toolPath.skills, skillName);
     if (await pathExists(skillDir)) {
       await remove(skillDir);
@@ -609,7 +615,7 @@ async function cleanupSourceSkills(sourceName: string, teamConfig: TeamaiConfig,
 
   const baseDir = resolveBaseDir(localConfig);
   for (const skillName of manifest.installedSkills) {
-    await removeSkillFromToolPaths(skillName, teamConfig, baseDir);
+    await removeSkillFromToolPaths(skillName, teamConfig, localConfig);
   }
 }
 
@@ -619,7 +625,7 @@ async function cleanupSourceSkills(sourceName: string, teamConfig: TeamaiConfig,
  */
 export async function getAllSourceSkillNames(): Promise<Set<string>> {
   const names = new Set<string>();
-  const sourcesDir = path.join(process.env.HOME ?? '', '.teamai', 'sources');
+  const sourcesDir = path.join(homeDir(), '.teamai', 'sources');
   if (!await pathExists(sourcesDir)) return names;
 
   const sourceDirs = await listDirs(sourcesDir);

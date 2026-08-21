@@ -13,13 +13,15 @@ import {
   type TeamaiConfig,
   type LocalConfig,
 } from './types.js';
+import { assertHostRootsStable, isHostSelected, resolveHostResourcePath, supportsStaticResource } from './host-adapters.js';
 
 async function removeRecallArtifacts(teamConfig: TeamaiConfig, localConfig: LocalConfig): Promise<void> {
   const baseDir = resolveBaseDir(localConfig);
 
   for (const [tool, toolPath] of Object.entries(teamConfig.toolPaths)) {
+    if (!isHostSelected(localConfig, tool)) continue;
     // Remove recall rule file
-    if (toolPath.rules) {
+    if (toolPath.rules && supportsStaticResource(tool, 'rules', localConfig.scope)) {
       const ruleFile = path.join(baseDir, toolPath.rules, 'teamai-recall.md');
       if (await pathExists(ruleFile)) {
         await remove(ruleFile);
@@ -28,7 +30,7 @@ async function removeRecallArtifacts(teamConfig: TeamaiConfig, localConfig: Loca
     }
 
     // Remove recall agent file
-    if (toolPath.agents) {
+    if (toolPath.agents && supportsStaticResource(tool, 'agents', localConfig.scope)) {
       const agentFile = path.join(baseDir, toolPath.agents, 'teamai-recall.md');
       if (await pathExists(agentFile)) {
         await remove(agentFile);
@@ -37,9 +39,10 @@ async function removeRecallArtifacts(teamConfig: TeamaiConfig, localConfig: Loca
     }
 
     // Remove recall-dependent built-in skills
-    if (toolPath.skills) {
+    if (toolPath.skills && supportsStaticResource(tool, 'skills', localConfig.scope)) {
+      const skillsDir = resolveHostResourcePath(tool, 'skills', localConfig) ?? path.join(baseDir, toolPath.skills);
       for (const skillName of RECALL_DEPENDENT_SKILLS) {
-        const skillDir = path.join(baseDir, toolPath.skills, skillName);
+        const skillDir = path.join(skillsDir, skillName);
         if (await pathExists(skillDir)) {
           await remove(skillDir);
           log.debug(`Removed recall skill ${skillName} from ${tool}`);
@@ -48,7 +51,7 @@ async function removeRecallArtifacts(teamConfig: TeamaiConfig, localConfig: Loca
     }
 
     // Remove recall block from CLAUDE.md
-    if (toolPath.claudemd) {
+    if (toolPath.claudemd && supportsStaticResource(tool, 'instructions', localConfig.scope)) {
       const claudeMdPath = path.join(baseDir, toolPath.claudemd);
       const content = await readFileSafe(claudeMdPath);
       if (content && content.includes(TEAMAI_RECALL_RULES_START)) {
@@ -86,6 +89,7 @@ async function deployRecallArtifacts(teamConfig: TeamaiConfig, localConfig: Loca
   const recallBlock = compileRecallRulesBlock();
 
   for (const [tool, toolPath] of Object.entries(teamConfig.toolPaths)) {
+    if (!isHostSelected(localConfig, tool) || !supportsStaticResource(tool, 'agents', localConfig.scope)) continue;
     if (!toolPath.claudemd || !toolPath.agents) continue;
     if (!await ResourceHandler.isToolInstalled(toolPath.agents, baseDir, toolPath.probe)) continue;
 
@@ -105,6 +109,7 @@ async function deployRecallArtifacts(teamConfig: TeamaiConfig, localConfig: Loca
 
 export async function recallDisable(_opts: GlobalOptions): Promise<void> {
   const { localConfig, teamConfig } = await autoDetectInit();
+  assertHostRootsStable(localConfig);
 
   const updated = { ...localConfig, recallEnabled: false };
   await saveLocalConfigForScope(updated, localConfig.scope, localConfig.projectRoot);
@@ -115,6 +120,7 @@ export async function recallDisable(_opts: GlobalOptions): Promise<void> {
 
 export async function recallEnable(_opts: GlobalOptions): Promise<void> {
   const { localConfig, teamConfig } = await autoDetectInit();
+  assertHostRootsStable(localConfig);
 
   const updated = { ...localConfig, recallEnabled: true };
   await saveLocalConfigForScope(updated, localConfig.scope, localConfig.projectRoot);

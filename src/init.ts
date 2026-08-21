@@ -2,6 +2,7 @@ import YAML from 'yaml';
 import fs from 'node:fs';
 import path from 'node:path';
 import { saveLocalConfig, loadTeamConfig, saveLocalConfigForScope, loadLocalConfigForScope, loadStateForScope, saveStateForScope } from './config.js';
+import { homeDir, prepareSelectedProjectHostRoots } from './host-adapters.js';
 import { reconcileTeamHooksForConfig } from './hooks.js';
 import { configureGitUser, initRepo, isGitRepo, getRemoteUrl } from './utils/git.js';
 import { pushRepoDirectly } from './utils/git.js';
@@ -198,7 +199,7 @@ function printScopeSummary(
   explicit: boolean,
 ): void {
   const configPath = getConfigPath(scope, projectRoot);
-  const baseDir = scope === 'project' ? (projectRoot ?? process.cwd()) : (process.env.HOME ?? '~');
+  const baseDir = scope === 'project' ? (projectRoot ?? process.cwd()) : homeDir();
   log.info(`Scope: ${scope}${scope === 'project' ? ` (${projectRoot})` : ''}`);
   log.info(`  config    → ${configPath}`);
   log.info(`  resources → ${baseDir}/.claude/skills, ...`);
@@ -245,7 +246,7 @@ export async function initHttp(
     ({ scope, projectRoot, explicit, fallbackReason } = resolveInitScope(
       options.scope,
       process.cwd(),
-      process.env.HOME ?? '',
+      homeDir(),
     ));
   } catch (e) {
     log.error((e as Error).message);
@@ -320,6 +321,9 @@ export async function initHttp(
     projectRoot,
     additionalRoles: [],
     ...(inheritUserScope !== undefined ? { inheritUserScope } : {}),
+    ...(existingLocalConfig?.enabledAgents ? { enabledAgents: existingLocalConfig.enabledAgents } : {}),
+    ...(existingLocalConfig?.disabledAgents ? { disabledAgents: existingLocalConfig.disabledAgents } : {}),
+    ...(existingLocalConfig?.hostRoots ? { hostRoots: existingLocalConfig.hostRoots } : {}),
   };
   try {
     Object.assign(localConfig, await promptForRoleProfile(localPath, options.role));
@@ -333,13 +337,13 @@ export async function initHttp(
   // Persist --agent into enabledAgents (additive across runs)
   const requestedAgents = normalizeAgentList(options.agent);
   if (requestedAgents.length > 0) {
-    const existing = await loadLocalConfigForScope(scope, projectRoot);
-    const prev = existing?.enabledAgents ?? [];
+    const prev = existingLocalConfig?.enabledAgents ?? [];
     localConfig.enabledAgents = [...new Set([...prev, ...requestedAgents])];
-    localConfig.disabledAgents = (existing?.disabledAgents ?? []).filter((t) => !requestedAgents.includes(t));
+    localConfig.disabledAgents = (existingLocalConfig?.disabledAgents ?? []).filter((t) => !requestedAgents.includes(t));
   }
 
   await ensureDir(teamaiHome);
+  prepareSelectedProjectHostRoots(localConfig);
   if (scope === 'project') {
     await saveLocalConfigForScope(localConfig, scope, projectRoot);
   } else {
@@ -709,6 +713,7 @@ export async function initSelfRepo(options: GlobalOptions & {
   }
 
   // Step 4: assemble local config (kind: self).
+  const existingLocalConfig = await loadLocalConfigForScope('project', businessRepoRoot);
   const localConfig: LocalConfig = {
     repo: { localPath, remote: repoInfo.httpsUrl, kind: 'self', businessRepoRoot },
     username,
@@ -716,6 +721,9 @@ export async function initSelfRepo(options: GlobalOptions & {
     projectRoot: businessRepoRoot,
     additionalRoles: [],
     ...(inheritUserScope !== undefined ? { inheritUserScope } : {}),
+    ...(existingLocalConfig?.enabledAgents ? { enabledAgents: existingLocalConfig.enabledAgents } : {}),
+    ...(existingLocalConfig?.disabledAgents ? { disabledAgents: existingLocalConfig.disabledAgents } : {}),
+    ...(existingLocalConfig?.hostRoots ? { hostRoots: existingLocalConfig.hostRoots } : {}),
   };
   try {
     Object.assign(localConfig, await promptForRoleProfile(localPath, options.role));
@@ -731,14 +739,14 @@ export async function initSelfRepo(options: GlobalOptions & {
   // which drives seedSelfModeToolDirs and hook injection alike.
   const selectedAgents = await promptForSelfModeAgents(options);
   if (selectedAgents.length > 0) {
-    const existing = await loadLocalConfigForScope('project', businessRepoRoot);
-    const prev = existing?.enabledAgents ?? [];
+    const prev = existingLocalConfig?.enabledAgents ?? [];
     localConfig.enabledAgents = [...new Set([...prev, ...selectedAgents])];
-    localConfig.disabledAgents = (existing?.disabledAgents ?? []).filter((t) => !selectedAgents.includes(t));
+    localConfig.disabledAgents = (existingLocalConfig?.disabledAgents ?? []).filter((t) => !selectedAgents.includes(t));
   }
 
   // Step 5: write local config + single-repo gitignore.
   await ensureDir(teamaiHome);
+  prepareSelectedProjectHostRoots(localConfig);
   await saveLocalConfigForScope(localConfig, 'project', businessRepoRoot);
   log.success(`Local config saved to ${teamaiHome}/config.yaml`);
 
@@ -898,7 +906,7 @@ export async function init(options: GlobalOptions & {
     ({ scope, projectRoot, explicit, fallbackReason } = resolveInitScope(
       options.scope,
       process.cwd(),
-      process.env.HOME ?? '',
+      homeDir(),
     ));
   } catch (e) {
     log.error((e as Error).message);
@@ -1184,6 +1192,9 @@ export async function init(options: GlobalOptions & {
     projectRoot,
     additionalRoles: [],
     ...(inheritUserScope !== undefined ? { inheritUserScope } : {}),
+    ...(existingLocalConfig?.enabledAgents ? { enabledAgents: existingLocalConfig.enabledAgents } : {}),
+    ...(existingLocalConfig?.disabledAgents ? { disabledAgents: existingLocalConfig.disabledAgents } : {}),
+    ...(existingLocalConfig?.hostRoots ? { hostRoots: existingLocalConfig.hostRoots } : {}),
   };
 
   try {
@@ -1201,13 +1212,13 @@ export async function init(options: GlobalOptions & {
   // Persist --agent into enabledAgents (additive across runs)
   const requestedAgents = normalizeAgentList(options.agent);
   if (requestedAgents.length > 0) {
-    const existing = await loadLocalConfigForScope(scope, projectRoot);
-    const prev = existing?.enabledAgents ?? [];
+    const prev = existingLocalConfig?.enabledAgents ?? [];
     localConfig.enabledAgents = [...new Set([...prev, ...requestedAgents])];
-    localConfig.disabledAgents = (existing?.disabledAgents ?? []).filter((t) => !requestedAgents.includes(t));
+    localConfig.disabledAgents = (existingLocalConfig?.disabledAgents ?? []).filter((t) => !requestedAgents.includes(t));
   }
 
   await ensureDir(teamaiHome);
+  prepareSelectedProjectHostRoots(localConfig);
 
   if (scope === 'project') {
     await saveLocalConfigForScope(localConfig, scope, projectRoot);

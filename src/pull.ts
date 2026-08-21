@@ -24,16 +24,38 @@ import {
   getTeamaiHome,
   isRecallEnabled,
   isBuiltinEnabled,
-  isAgentDisabled,
 } from './types.js';
 import type { CultureFrontmatter } from './types.js';
 import { loadRolesManifest, resolveRoleResourceNamespaces, type ResourceNamespaces } from './roles.js';
-import { managedManifestTargetPaths, reconcileManagedResources, type DesiredManagedResource } from './managed-resources.js';
+import { loadManagedResourceManifest, managedManifestTargetPaths, reconcileManagedResources, type DesiredManagedResource } from './managed-resources.js';
+import { assertHostRootsStable, homeDir, isHostSelected, resolveHostResourcePath, resolveHostRoot, supportsStaticResource } from './host-adapters.js';
 
 interface RolePullContext {
   activeNamespaces: ResourceNamespaces;
   activeSkillNames: Set<string>;
   inactiveSkillNames: Set<string>;
+}
+
+/** Keep ledger ownership for hosts excluded from this pull, even when the
+ * upstream resource itself disappeared. Explicit uninstall remains the only
+ * operation allowed to remove those held targets. */
+export async function retainMissingUnselectedTargets(
+  home: string,
+  type: 'skills' | 'agents',
+  resources: DesiredManagedResource[],
+  localConfig: LocalConfig,
+): Promise<DesiredManagedResource[]> {
+  const manifest = await loadManagedResourceManifest(home);
+  const desiredIds = new Set(resources.map((resource) => resource.id));
+  const retained = [...resources];
+  for (const [id, record] of Object.entries(manifest.resources)) {
+    if (record.type !== type || desiredIds.has(id)) continue;
+    const retainTargetPaths = record.targets
+      .filter((target) => !target.tool || !isHostSelected(localConfig, target.tool))
+      .map((target) => target.path);
+    if (retainTargetPaths.length > 0) retained.push({ id, type, targets: [], retainTargetPaths });
+  }
+  return retained;
 }
 
 /**
@@ -205,18 +227,19 @@ export async function cleanupInactiveNamespaceSkills(
   const baseDir = resolveBaseDir(localConfig);
 
   for (const [tool, toolPath] of Object.entries(teamConfig.toolPaths)) {
-    if (isAgentDisabled(localConfig, tool)) continue;
+    if (!isHostSelected(localConfig, tool) || !supportsStaticResource(tool, 'skills', localConfig.scope)) continue;
     if (!toolPath.skills) continue;
-    if (!await ResourceHandler.isToolInstalled(toolPath.skills, baseDir, toolPath.probe)) continue;
-    if (!await pathExists(path.join(baseDir, toolPath.skills))) continue;
+    if (!await ResourceHandler.isToolInstalled(toolPath.skills, baseDir, toolPath.probe, resolveHostRoot(tool, localConfig.scope, localConfig.projectRoot))) continue;
+    const skillsDir = resolveHostResourcePath(tool, 'skills', localConfig) ?? path.join(baseDir, toolPath.skills);
+    if (!await pathExists(skillsDir)) continue;
 
-    const localSkillNames = await listDirs(path.join(baseDir, toolPath.skills));
+    const localSkillNames = await listDirs(skillsDir);
     for (const skillName of localSkillNames) {
       if (BUILTIN_SKILL_NAMES.has(skillName)) continue;
       if (activeSkillNames.has(skillName)) continue;
       if (!inactiveSkillNames.has(skillName)) continue;
 
-      const localSkillDir = path.join(baseDir, toolPath.skills, skillName);
+      const localSkillDir = path.join(skillsDir, skillName);
       await remove(localSkillDir);
       log.debug(`[${localConfig.scope}] Removed inactive role-scoped skill ${skillName} from ${tool}`);
     }
@@ -304,6 +327,7 @@ async function pullForScope(
   } = {},
 ): Promise<void> {
   const scopeLabel = localConfig.scope;
+  if (!options.dryRun) assertHostRootsStable(localConfig);
   const revisionField = policy.revisionField ?? 'lastPullRev';
   const teamConfig = await loadTeamConfig(localConfig.repo.localPath);
   if (!teamConfig) {
@@ -453,6 +477,7 @@ async function pullForScope(
         complete = plans.every((plan) => plan !== null);
         resources = plans.filter((plan): plan is DesiredManagedResource => plan !== null);
       }
+      resources = await retainMissingUnselectedTargets(home, type, resources, localConfig);
 
       if (options.dryRun) {
         log.info(`[${scopeLabel}] [dry-run] Would reconcile ${items.length} ${type}`);
@@ -558,12 +583,12 @@ async function pullForScope(
 
       for (const [tool, toolPath] of Object.entries(freshConfig.toolPaths)) {
         const dir = toolPath[toolPathField];
-        if (!dir) continue;
-        if (!await ResourceHandler.isToolInstalled(dir, baseDir, toolPath.probe)) continue;
-        if (isAgentDisabled(localConfig, tool)) continue;
+        if (!dir || !isHostSelected(localConfig, tool) || !supportsStaticResource(tool, toolPathField, localConfig.scope)) continue;
+        if (!await ResourceHandler.isToolInstalled(dir, baseDir, toolPath.probe, resolveHostRoot(tool, localConfig.scope, localConfig.projectRoot))) continue;
+        const specialDir = toolPathField === 'skills' ? resolveHostResourcePath(tool, 'skills', localConfig) : undefined;
 
         for (const name of tombstones) {
-          const localPath = path.join(baseDir, dir, ext ? `${name}${ext}` : name);
+          const localPath = path.join(specialDir ?? path.join(baseDir, dir), ext ? `${name}${ext}` : name);
           if (managedPaths.has(localPath)) continue;
           if (await pathExists(localPath)) {
             await remove(localPath);
@@ -578,9 +603,9 @@ async function pullForScope(
     // guard); an older untracked copy can still be removed on the user's request.
     if (excludedSkills.size > 0 && knownRepoSkillNames) {
       for (const [tool, toolPath] of Object.entries(freshConfig.toolPaths)) {
-        if (isAgentDisabled(localConfig, tool) || !toolPath.skills) continue;
-        if (!await ResourceHandler.isToolInstalled(toolPath.skills, baseDir, toolPath.probe)) continue;
-        const skillsDir = path.join(baseDir, toolPath.skills);
+        if (!isHostSelected(localConfig, tool) || !supportsStaticResource(tool, 'skills', localConfig.scope) || !toolPath.skills) continue;
+        if (!await ResourceHandler.isToolInstalled(toolPath.skills, baseDir, toolPath.probe, resolveHostRoot(tool, localConfig.scope, localConfig.projectRoot))) continue;
+        const skillsDir = resolveHostResourcePath(tool, 'skills', localConfig) ?? path.join(baseDir, toolPath.skills);
         for (const name of excludedSkills) {
           if (!knownRepoSkillNames.has(name)) continue;
           const localPath = path.join(skillsDir, name);
@@ -895,6 +920,7 @@ export async function reconcileManagedInstructions(
   options: { plan?: boolean } = {},
 ): Promise<import('./managed-resources.js').ManagedReconcileResult> {
   try {
+    assertHostRootsStable(localConfig);
     const sourcePath = path.join(localConfig.repo.localPath, config.sharing.instructions?.source ?? 'AGENTS.md');
     let source = await readFileSafe(sourcePath);
     // Existing team repositories may not have adopted root AGENTS.md yet. Keep
@@ -940,24 +966,42 @@ export async function reconcileManagedInstructions(
       }
     } else {
       const baseDir = resolveBaseDir(localConfig);
+      const manifest = await loadManagedResourceManifest(home);
       for (const [tool, toolPath] of Object.entries(config.toolPaths)) {
         const instructionPath = toolPath.instruction ?? toolPath.claudemd;
-        if (isAgentDisabled(localConfig, tool) || !instructionPath || !source) continue;
+        if (!isHostSelected(localConfig, tool) || !supportsStaticResource(tool, 'instructions', localConfig.scope) || !instructionPath || !source) continue;
         const installationPath = toolPath.skills ?? instructionPath;
-        if (!await ResourceHandler.isToolInstalled(installationPath, baseDir, toolPath.probe)) continue;
+        const specialRoot = resolveHostRoot(tool, localConfig.scope, localConfig.projectRoot);
+        if (!await ResourceHandler.isToolInstalled(installationPath, baseDir, toolPath.probe, specialRoot)) continue;
         const blocks = [source, toolPath.agents && isRecallEnabled(localConfig, config) ? compileRecallRulesBlock() : null]
           .filter((block): block is string => !!block);
+        const specialInstructionPath = resolveHostResourcePath(tool, 'instructions', localConfig);
+        const priorTargets = manifest.resources[`instructions:${tool}`]?.targets ?? [];
+        const retainTargetPaths = priorTargets
+          .filter((target) => !target.tool || !isHostSelected(localConfig, target.tool))
+          .map((target) => target.path);
         resources.push({
           id: `instructions:${tool}`,
           type: 'instructions',
           targets: [{
-            path: path.join(baseDir, instructionPath),
+            path: specialInstructionPath ?? path.join(baseDir, instructionPath),
             kind: 'file',
             tool,
+            ...(specialInstructionPath ? { hostRoot: path.dirname(specialInstructionPath) } : {}),
             // User scope's host instruction file is a complete TeamAI-managed file.
             content: `${blocks.join('\n\n').trim()}\n`,
           }],
+          ...(retainTargetPaths.length > 0 ? { retainTargetPaths } : {}),
         });
+      }
+      // A host may be unselected for this pull. Keep its entire record (not
+      // merely the file) so normal allowlist changes never discard backups.
+      for (const [id, record] of Object.entries(manifest.resources)) {
+        if (record.type !== 'instructions' || resources.some((resource) => resource.id === id)) continue;
+        const retainTargetPaths = record.targets
+          .filter((target) => !target.tool || !isHostSelected(localConfig, target.tool))
+          .map((target) => target.path);
+        if (retainTargetPaths.length > 0) resources.push({ id, type: 'instructions', targets: [], retainTargetPaths });
       }
     }
 
@@ -999,7 +1043,7 @@ export async function injectRecallBlockIntoTools(
         const recallBlock = compileRecallRulesBlock();
         let injected = 0;
         for (const [tool, toolPath] of Object.entries(config.toolPaths)) {
-            if (isAgentDisabled(localConfig, tool)) continue;
+            if (!isHostSelected(localConfig, tool) || !supportsStaticResource(tool, 'agents', localConfig.scope)) continue;
             if (!toolPath.claudemd || !toolPath.agents) continue;
             if (!await ResourceHandler.isToolInstalled(toolPath.agents, baseDir, toolPath.probe)) continue;
 
@@ -1142,7 +1186,7 @@ async function collectClaudemdFiles(
  * Reinjects with the current version's hook definitions.
  */
 async function autoMigrateHooksIfNeeded(): Promise<void> {
-  const home = process.env.HOME ?? '';
+  const home = homeDir();
   // Quick check: read the primary settings file and see if it has hook-dispatch
   const primarySettings = path.join(home, '.claude', 'settings.json');
   if (!await pathExists(primarySettings)) return;
@@ -1174,6 +1218,7 @@ async function autoMigrateHooksIfNeeded(): Promise<void> {
 /** Read-only lifecycle preview using the already-present team checkout. */
 async function planPullForScope(localConfig: LocalConfig, teamConfig: TeamaiConfig): Promise<void> {
   const scopeLabel = localConfig.scope;
+  assertHostRootsStable(localConfig);
   let roleContext: RolePullContext | null = null;
   try {
     roleContext = await buildRolePullContext(localConfig);
@@ -1195,7 +1240,12 @@ async function planPullForScope(localConfig: LocalConfig, teamConfig: TeamaiConf
     : [];
   const skillItems = [...new Map([...directoryItems, ...tagged].map((item) => [item.name, item])).values()]
     .filter((item) => !excludedSkills.has(item.name));
-  const skillResources = await Promise.all(skillItems.map((item) => skillHandler.buildManagedResource(item, teamConfig, localConfig)));
+  const skillResources = await retainMissingUnselectedTargets(
+    home,
+    'skills',
+    await Promise.all(skillItems.map((item) => skillHandler.buildManagedResource(item, teamConfig, localConfig))),
+    localConfig,
+  );
   const skillPlan = await reconcileManagedResources(home, skillResources, { pruneTypes: ['skills'], plan: true });
   for (const target of skillPlan.planned) log.info(`[${scopeLabel}] [plan] skills: ${target}`);
   for (const conflict of skillPlan.conflicts) log.warn(`[${scopeLabel}] [plan] conflict: ${conflict}`);
@@ -1204,7 +1254,12 @@ async function planPullForScope(localConfig: LocalConfig, teamConfig: TeamaiConf
   const agentItems = await agentHandler.scanTeamForPull(teamConfig, localConfig);
   const agentPlans = await Promise.all(agentItems.map((item) => agentHandler.buildManagedResource(item, teamConfig, localConfig)));
   const completeAgents = agentPlans.every((resource) => resource !== null);
-  const agentResources = agentPlans.filter((resource): resource is DesiredManagedResource => resource !== null);
+  const agentResources = await retainMissingUnselectedTargets(
+    home,
+    'agents',
+    agentPlans.filter((resource): resource is DesiredManagedResource => resource !== null),
+    localConfig,
+  );
   const agentPlan = await reconcileManagedResources(home, agentResources, {
     pruneTypes: completeAgents ? ['agents'] : [], plan: true,
   });
@@ -1245,15 +1300,6 @@ export async function pull(options: GlobalOptions): Promise<void> {
     }
     return;
   }
-  // 0. Auto-migrate hooks if settings.json has old format (pre-dispatch era).
-  //    This runs on the first session start after a CLI update — the new binary
-  //    detects the old individual hooks and reinjects the merged dispatch format.
-  try {
-    await autoMigrateHooksIfNeeded();
-  } catch {
-    // Non-fatal — pull continues even if hook migration fails
-  }
-
   // 1. Detect project scope first. Its presence decides whether user scope is
   //    processed at all (issue #73: project install isolates from user).
   let projectConfig: LocalConfig | null = null;
@@ -1264,6 +1310,31 @@ export async function pull(options: GlobalOptions): Promise<void> {
   }
   const projectMode = projectConfig !== null;
   const inheritUserScope = projectConfig?.inheritUserScope === true;
+
+  // Validate every scope that may participate before hook migration, Git
+  // refresh, or any resource write. This prevents a later project-root drift
+  // from failing only after an inherited user scope has already changed.
+  let preflightUserConfig: LocalConfig | null = null;
+  if (!projectMode || inheritUserScope) {
+    preflightUserConfig = await loadLocalConfigForScope('user', undefined, { readOnly: true });
+  }
+  try {
+    for (const config of [preflightUserConfig, projectConfig]) {
+      if (config) assertHostRootsStable(config);
+    }
+  } catch (error) {
+    log.error(`Pull preflight failed: ${(error as Error).message}`);
+    process.exitCode = 1;
+    return;
+  }
+
+  // 1.5. Auto-migrate legacy hooks only after all active special-host bindings
+  // are proven stable. Failure remains non-fatal for unrelated legacy tools.
+  try {
+    await autoMigrateHooksIfNeeded();
+  } catch {
+    // Non-fatal — pull continues even if hook migration fails
+  }
 
   // 2. User scope — distinguish an active user install from an inherited one.
   //    Only the active config may drive control-plane effects below.

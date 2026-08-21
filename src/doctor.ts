@@ -10,6 +10,7 @@ import {
   type TeamaiConfig,
 } from './types.js';
 import { TEAMAI_HOOK_SUBCOMMANDS } from './hooks.js';
+import { DSH_EXACT_VERSION, WORKBUDDY_VALIDATED_VERSION, homeDir, resolveHostRoot } from './host-adapters.js';
 
 interface Check {
   name: string;
@@ -56,6 +57,13 @@ export async function doctor(options: GlobalOptions): Promise<void> {
     : '~/.teamai/config.yaml';
 
   console.log(`  Scope: ${scope}${scope === 'project' && localConfig?.projectRoot ? ` (${localConfig.projectRoot})` : ''}\n`);
+  const dshRoot = localConfig?.hostRoots?.dsh
+    ?? resolveHostRoot('dsh', scope, localConfig?.projectRoot);
+  const workbuddyRoot = localConfig?.hostRoots?.workbuddy
+    ?? resolveHostRoot('workbuddy', scope, localConfig?.projectRoot);
+  console.log(`  DSH root: ${dshRoot ?? 'not applicable'} (exact supported version: ${DSH_EXACT_VERSION})`);
+  console.log(`  WorkBuddy root: ${workbuddyRoot ?? 'not applicable'} (validated baseline: ${WORKBUDDY_VALIDATED_VERSION}; unknown versions require verification)`);
+  console.log(`  DSH shared Agents root: ${process.env.DSH_AGENTS_HOME?.trim() || '~/.agents'} (read-only compatibility path; TeamAI does not manage it as DSH)\n`);
 
   // Try to load team config for dynamic tool paths and provider
   let teamConfig: TeamaiConfig | null = null;
@@ -65,7 +73,7 @@ export async function doctor(options: GlobalOptions): Promise<void> {
   // Fall back to schema defaults if team config is unavailable
   const toolPaths = teamConfig?.toolPaths ?? TeamaiConfigSchema.shape.toolPaths.parse(undefined);
   const providerName = teamConfig?.provider ?? 'tgit';
-  const baseDir = localConfig ? resolveBaseDir(localConfig) : (process.env.HOME ?? '');
+  const baseDir = localConfig ? resolveBaseDir(localConfig) : homeDir();
 
   const checks: Check[] = [];
 
@@ -135,7 +143,7 @@ export async function doctor(options: GlobalOptions): Promise<void> {
         const envYamlPath = path.join(localConfig.repo.localPath, 'env', 'env.yaml');
         if (!await pathExists(envYamlPath)) return true;
 
-        const home = process.env.HOME ?? '';
+        const home = homeDir();
 
         const envShPath = path.join(home, '.teamai', 'env.sh');
         if (!await pathExists(envShPath)) return false;

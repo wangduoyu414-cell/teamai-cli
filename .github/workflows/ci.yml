@@ -78,6 +78,28 @@ jobs:
           name: dist
           path: dist/
 
+  special-hosts-windows:
+    name: Special host roots (Windows)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Type check special host paths
+        run: npm run typecheck
+
+      - name: Verify special host root lifecycle
+        run: npx vitest run src/__tests__/special-hosts.test.ts
+
   e2e:
     name: E2E (GitHub provider, full surface)
     needs: build

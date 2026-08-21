@@ -3,7 +3,8 @@ import { ensureDir, writeFile, pathExists } from './utils/fs.js';
 import { log } from './utils/logger.js';
 import { ResourceHandler } from './resources/base.js';
 import type { TeamaiConfig, LocalConfig } from './types.js';
-import { resolveBaseDir, isAgentDisabled, isBuiltinEnabled } from './types.js';
+import { resolveBaseDir, isBuiltinEnabled } from './types.js';
+import { homeDir, isHostSelected, supportsStaticResource } from './host-adapters.js';
 import fs from 'node:fs/promises';
 
 // ─── Built-in rules deployment ──────────────────────────
@@ -48,7 +49,7 @@ export async function deployBuiltinRules(
     localConfig?: LocalConfig,
     options?: { skipRecall?: boolean },
 ): Promise<number> {
-    const baseDir = localConfig ? resolveBaseDir(localConfig) : (process.env.HOME ?? '');
+    const baseDir = localConfig ? resolveBaseDir(localConfig) : homeDir();
     let deployed = 0;
 
     const builtinRules: Array<{ name: string; content: string }> = [
@@ -63,7 +64,7 @@ export async function deployBuiltinRules(
             log.debug(`Skipping built-in rules for ${tool}: tool not installed`);
             continue;
         }
-        if (localConfig && isAgentDisabled(localConfig, tool)) continue;
+        if (localConfig && (!isHostSelected(localConfig, tool) || !supportsStaticResource(tool, 'rules', localConfig.scope))) continue;
 
         const rulesDir = path.join(baseDir, toolPath.rules);
         if (!await pathExists(rulesDir)) continue;

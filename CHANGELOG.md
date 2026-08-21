@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file. See [standa
 
 ## [Unreleased]
 
+### Added
+
+- **Autocode Core 0.20.0-autocode.2**: explicit-only WorkBuddy and DeepSeek Harness static-resource adapters. DSH uses its configured home for user Skills and `AGENTS.md`; both hosts persist and verify their bound roots before writes. Existing managed targets for unselected hosts retain their ownership records and backups.
+
 ### 💥 破坏性变更
 
 - **`teamai init` 默认 scope 改为 project**（#250）：未传 `--scope` 时安装到 `<cwd>/.teamai/` 与 `<cwd>/.claude/...`，不再默认装到 `~/`。恢复旧行为：`teamai init <repo> --scope user`

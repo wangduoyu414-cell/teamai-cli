@@ -69,8 +69,8 @@ describe('detectHomeInstalledAgents', () => {
     expect(await detectHomeInstalledAgents(['cursor'])).toEqual(['cursor']);
   });
 
-  it('SELF_MODE_AGENT_CHOICES is the 5 common coding agents', () => {
-    expect([...SELF_MODE_AGENT_CHOICES]).toEqual(['claude', 'codex', 'cursor', 'codebuddy', 'workbuddy']);
+  it('SELF_MODE_AGENT_CHOICES excludes explicit-only hosts from automatic detection', () => {
+    expect([...SELF_MODE_AGENT_CHOICES]).toEqual(['claude', 'codex', 'cursor', 'codebuddy']);
   });
 });
 

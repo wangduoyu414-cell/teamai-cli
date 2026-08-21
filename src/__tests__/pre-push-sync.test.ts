@@ -207,8 +207,8 @@ describe('syncTeamUpdatesToLocal — rules', () => {
     );
   });
 
-  it('should sync all installed tool directories', async () => {
-    // Add a second tool
+  it('syncs supported tools but leaves WorkBuddy rules untouched', async () => {
+    // Add WorkBuddy with an unsupported rules path from an older/custom config.
     await fse.ensureDir(path.join(homeDir, '.workbuddy', 'rules'));
     teamConfig.toolPaths.workbuddy = { skills: '.workbuddy/skills', rules: '.workbuddy/rules' };
 
@@ -222,11 +222,11 @@ describe('syncTeamUpdatesToLocal — rules', () => {
 
     await syncTeamUpdatesToLocal(teamConfig, localConfig, 'abc1234');
 
-    // Both should now have v2
+    // Claude follows the team update; WorkBuddy remains outside this channel.
     const claudeContent = await fse.readFile(path.join(homeDir, '.claude/rules', 'shared.md'), 'utf-8');
     const wbContent = await fse.readFile(path.join(homeDir, '.workbuddy/rules', 'shared.md'), 'utf-8');
     expect(claudeContent).toBe('v2');
-    expect(wbContent).toBe('v2');
+    expect(wbContent).toBe('v1');
   });
 
   it('should skip uninstalled tool directories', async () => {
@@ -349,6 +349,25 @@ describe('syncTeamUpdatesToLocal — skills', () => {
     // Local should now have v2
     const content = await fse.readFile(path.join(localSkillDir, 'SKILL.md'), 'utf-8');
     expect(content).toBe('v2 skill');
+  });
+
+  it('keeps explicit-only host roots on the manifest-backed pull lifecycle', async () => {
+    const teamSkillDir = path.join(repoPath, 'skills', 'my-skill');
+    const claudeSkillDir = path.join(homeDir, '.claude', 'skills', 'my-skill');
+    const workbuddyRoot = path.join(tmpDir, 'custom workbuddy');
+    const workbuddySkillDir = path.join(workbuddyRoot, 'skills', 'my-skill');
+    await fse.outputFile(path.join(teamSkillDir, 'SKILL.md'), 'v2 skill');
+    await fse.outputFile(path.join(claudeSkillDir, 'SKILL.md'), 'v1 skill');
+    await fse.outputFile(path.join(workbuddySkillDir, 'SKILL.md'), 'v1 skill');
+    teamConfig.toolPaths.workbuddy = { probe: '.workbuddy', skills: '.workbuddy/skills' };
+    localConfig.enabledAgents = ['claude', 'workbuddy'];
+    localConfig.hostRoots = { workbuddy: workbuddyRoot };
+    mockGetFileContentAtRev.mockResolvedValue(Buffer.from('v1 skill'));
+
+    await syncTeamUpdatesToLocal(teamConfig, localConfig, 'abc1234');
+
+    expect(await fse.readFile(path.join(claudeSkillDir, 'SKILL.md'), 'utf8')).toBe('v2 skill');
+    expect(await fse.readFile(path.join(workbuddySkillDir, 'SKILL.md'), 'utf8')).toBe('v1 skill');
   });
 
   it('should NOT sync skill dir when user edited any file', async () => {

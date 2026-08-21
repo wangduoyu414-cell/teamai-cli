@@ -17322,6 +17322,7 @@ async function pull(options) {
       if (config) assertHostRootsStable(config);
     }
   } catch (error) {
+    setFileLogging(false);
     log.error(`Pull preflight failed: ${error.message}`);
     process.exitCode = 1;
     return;

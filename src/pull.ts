@@ -3,7 +3,7 @@ import fse from 'fs-extra';
 import matter from 'gray-matter';
 import { requireInit, loadState, saveState, detectProjectConfig, loadLocalConfigForScope, loadTeamConfig, loadStateForScope, saveStateForScope } from './config.js';
 import { pullRepo, getHeadRev } from './utils/git.js';
-import { log, spinner } from './utils/logger.js';
+import { log, setFileLogging, spinner } from './utils/logger.js';
 import { pathExists, remove, listFiles, listDirs, readFileSafe } from './utils/fs.js';
 import { injectClaudeMdSection } from './utils/claudemd.js';
 import { getHandler, RulesHandler, DocsHandler, EnvHandler } from './resources/index.js';
@@ -1323,6 +1323,9 @@ export async function pull(options: GlobalOptions): Promise<void> {
       if (config) assertHostRootsStable(config);
     }
   } catch (error) {
+    // A failed special-host preflight is a read-only refusal. Even the durable
+    // debug transport must remain untouched so callers can verify zero writes.
+    setFileLogging(false);
     log.error(`Pull preflight failed: ${(error as Error).message}`);
     process.exitCode = 1;
     return;

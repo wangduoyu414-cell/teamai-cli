@@ -23,12 +23,13 @@ __export(logger_exports, {
   spinner: () => spinner
 });
 import fs from "fs";
+import os from "os";
 import path from "path";
 import chalk from "chalk";
 import ora from "ora";
 function getLogFilePath() {
   if (!_logFilePath) {
-    _logFilePath = path.join(process.env.HOME ?? "/tmp", ".teamai", "debug.log");
+    _logFilePath = path.join(os.homedir(), ".teamai", "debug.log");
   }
   return _logFilePath;
 }
@@ -247,7 +248,7 @@ __export(types_exports, {
 });
 import { z } from "zod";
 import path2 from "path";
-import os from "os";
+import os2 from "os";
 function isBuiltinEnabled(config, kind, name) {
   const policy = config.builtins?.[kind];
   if (!policy || !policy.mode || policy.mode === "all") return true;
@@ -303,7 +304,7 @@ function resolveBaseDir(localConfig) {
     }
     return localConfig.projectRoot;
   }
-  return os.homedir();
+  return os2.homedir();
 }
 function isAgentDisabled(localConfig, tool) {
   return localConfig.disabledAgents?.includes(tool) ?? false;
@@ -329,7 +330,7 @@ function getTeamaiHome(scope, projectRoot) {
     }
     return path2.join(projectRoot, ".teamai");
   }
-  return path2.join(os.homedir(), ".teamai");
+  return path2.join(os2.homedir(), ".teamai");
 }
 function getEnvBackupPath(localConfig) {
   const home = getTeamaiHome(localConfig.scope, localConfig.projectRoot);
@@ -345,7 +346,7 @@ function getManagedHooksPath(scope, projectRoot) {
   return path2.join(getTeamaiHome(scope, projectRoot), "managed-hooks.json");
 }
 function getPushignorePath() {
-  return path2.join(os.homedir(), ".teamai", "pushignore");
+  return path2.join(os2.homedir(), ".teamai", "pushignore");
 }
 function areTeamHooksDisabled() {
   return process.env.TEAMAI_HOOKS_DISABLED === "1" || process.env.TEAMAI_HOOKS_DISABLED === "true";
@@ -442,7 +443,7 @@ var init_types = __esm({
       repo: z.string().min(1)
     });
     SOURCE_PULL_TTL_MS = 24 * 60 * 60 * 1e3;
-    TEAMAI_SOURCES_DIR = path2.join(os.homedir(), ".teamai", "sources");
+    TEAMAI_SOURCES_DIR = path2.join(os2.homedir(), ".teamai", "sources");
     TeamaiConfigSchema = z.object({
       team: z.string(),
       description: z.string().default(""),
@@ -574,7 +575,7 @@ var init_types = __esm({
       lastUpdateCheck: z.string().nullable().default(null),
       availableUpdate: z.string().nullable().default(null)
     });
-    TEAMAI_HOME = path2.join(os.homedir(), ".teamai");
+    TEAMAI_HOME = path2.join(os2.homedir(), ".teamai");
     TEAMAI_CONFIG_PATH = path2.join(TEAMAI_HOME, "config.yaml");
     TEAMAI_STATE_PATH = path2.join(TEAMAI_HOME, "state.json");
     TEAMAI_TOKEN_PATH = path2.join(TEAMAI_HOME, "token");
@@ -716,13 +717,13 @@ __export(fs_exports, {
 import fse from "fs-extra";
 import crypto from "crypto";
 import path3 from "path";
-import os2 from "os";
+import os3 from "os";
 function isIgnored(name) {
   return IGNORED_NAMES.has(name) || name.endsWith(".pyc");
 }
 function expandHome(p) {
   if (p.startsWith("~/") || p === "~") {
-    return path3.join(os2.homedir(), p.slice(1));
+    return path3.join(os3.homedir(), p.slice(1));
   }
   return p;
 }
@@ -1087,12 +1088,12 @@ var init_roles = __esm({
 });
 
 // src/host-adapters.ts
-import os3 from "os";
+import os4 from "os";
 import path5 from "path";
 import fs2 from "fs";
 import { execFileSync } from "child_process";
 function homeDir() {
-  return os3.homedir();
+  return os4.homedir();
 }
 function normalizeHostId(value) {
   const normalized = value.trim().toLowerCase();
@@ -1245,7 +1246,7 @@ var init_read_only = __esm({
 
 // src/resources/base.ts
 import path6 from "path";
-import os4 from "os";
+import os5 from "os";
 var TOMBSTONE_FILE, ResourceHandler;
 var init_base = __esm({
   "src/resources/base.ts"() {
@@ -1260,7 +1261,7 @@ var init_base = __esm({
        * @param baseDir - Override base directory (defaults to HOME). Used for project scope.
        */
       static async isToolInstalled(toolPath, baseDir, probePath, rootOverride) {
-        const base = baseDir ?? os4.homedir();
+        const base = baseDir ?? os5.homedir();
         const toolRoot = rootOverride ?? path6.join(base, (probePath ?? toolPath).split("/")[0]);
         return pathExists(toolRoot);
       }
@@ -1616,7 +1617,7 @@ var init_rest_auth = __esm({
 // src/providers/tgit/gf-cli.ts
 import { execSync, spawnSync } from "child_process";
 import fs4 from "fs";
-import os5 from "os";
+import os6 from "os";
 import path9 from "path";
 function shellQuote(s) {
   return "'" + s.replace(/'/g, "'\\''") + "'";
@@ -1664,8 +1665,8 @@ function getGfPath() {
   );
 }
 function getGfDownloadUrl() {
-  const arch = os5.arch();
-  const platform = os5.platform();
+  const arch = os6.arch();
+  const platform = os6.platform();
   let osName;
   if (platform === "darwin") {
     osName = "darwin";
@@ -1754,7 +1755,7 @@ function ensureAuthenticated() {
 }
 function gfGetOAuthToken() {
   try {
-    const netrcPath = path9.join(os5.homedir(), ".netrc");
+    const netrcPath = path9.join(os6.homedir(), ".netrc");
     if (!fs4.existsSync(netrcPath)) return null;
     const content = fs4.readFileSync(netrcPath, "utf-8");
     const match = content.match(
@@ -6101,7 +6102,7 @@ var init_agent_version = __esm({
 import crypto3 from "crypto";
 import fs9 from "fs";
 import { execFileSync as execFileSync2 } from "child_process";
-import os6 from "os";
+import os7 from "os";
 function getMachineId() {
   if (cachedMachineId !== null) return cachedMachineId;
   cachedMachineId = detectMachineId();
@@ -6123,7 +6124,7 @@ function detectMachineId(platform = process.platform) {
     }
   } catch {
   }
-  return id || os6.hostname() || "";
+  return id || os7.hostname() || "";
 }
 function readDarwinMachineId() {
   const out = execFileSync2("ioreg", ["-rd1", "-c", "IOPlatformExpertDevice"], {
@@ -6168,7 +6169,7 @@ var init_machine_id = __esm({
 });
 
 // src/utils/path-safety.ts
-import os7 from "os";
+import os8 from "os";
 import path21 from "path";
 import fs10 from "fs";
 function assertSafePath(target, allowedRoots) {
@@ -6184,7 +6185,7 @@ function assertSafePath(target, allowedRoots) {
   );
 }
 function resolveReal(p) {
-  const expanded = p.startsWith("~") ? path21.join(os7.homedir(), p.slice(1)) : p;
+  const expanded = p.startsWith("~") ? path21.join(os8.homedir(), p.slice(1)) : p;
   const abs = path21.resolve(expanded);
   try {
     return fs10.realpathSync(abs);
@@ -6193,7 +6194,7 @@ function resolveReal(p) {
   }
 }
 function defaultAllowedRoots() {
-  return [process.cwd(), os7.homedir()];
+  return [process.cwd(), os8.homedir()];
 }
 function assertSafeResourceName(name) {
   if (name.includes("\0")) {
@@ -6572,7 +6573,7 @@ __export(local_agent_exports, {
   writeTokenFile: () => writeTokenFile
 });
 import fs11 from "fs";
-import os8 from "os";
+import os9 from "os";
 import path22 from "path";
 import readline3 from "readline";
 import { execFile as execFile2 } from "child_process";
@@ -6797,7 +6798,7 @@ function createResourceLocalConfig(config, scope, repoPath, workspacePath) {
   const projectScope = scope === "project";
   return {
     repo: { localPath: repoPath, remote: config.endpoint },
-    username: os8.userInfo().username,
+    username: os9.userInfo().username,
     scope: projectScope ? "project" : "user",
     projectRoot: projectScope ? workspacePath : void 0,
     additionalRoles: []
@@ -7107,7 +7108,7 @@ async function bindWorkspaceToProject(workspacePath, projectId) {
 async function ensureWorkspaceBinding(config, workspacePath, sessionId) {
   if (config.workspaceBindings[workspacePath]) return;
   const markerKey = sessionId || `ppid-${process.ppid}`;
-  const hintMarker = path22.join(os8.tmpdir(), `teamai-bind-session-${markerKey}`);
+  const hintMarker = path22.join(os9.tmpdir(), `teamai-bind-session-${markerKey}`);
   if (fs11.existsSync(hintMarker)) return;
   try {
     fs11.writeFileSync(hintMarker, "");
@@ -7155,7 +7156,7 @@ function isBindPromptEnabled() {
 async function emitBindingHint(config, workspacePath, sessionId) {
   if (config.workspaceBindings[workspacePath]) return;
   const markerKey = sessionId || `ppid-${process.ppid}`;
-  const hintMarker = path22.join(os8.tmpdir(), `teamai-bind-hint-${markerKey}`);
+  const hintMarker = path22.join(os9.tmpdir(), `teamai-bind-hint-${markerKey}`);
   if (fs11.existsSync(hintMarker)) return;
   try {
     fs11.writeFileSync(hintMarker, "");
@@ -7316,8 +7317,8 @@ async function buildReportPayload(config, context) {
     agent_type: normalizeAgentType(tool),
     agent_version: await getAgentVersion(tool),
     local_agent_id: resolveLocalAgentId(context),
-    host_name: os8.hostname(),
-    os: os8.platform(),
+    host_name: os9.hostname(),
+    os: os9.platform(),
     started_at: config.createdAt,
     last_status: context.status ?? "running",
     // Instance-level skills/rules are a phase-1 legacy concept. They are
@@ -7428,7 +7429,7 @@ function assertHttpUrl(rawUrl) {
   return parsed;
 }
 async function downloadResource(downloadUrl) {
-  const tmpDir = await fs11.promises.mkdtemp(path22.join(os8.tmpdir(), "teamai-local-agent-"));
+  const tmpDir = await fs11.promises.mkdtemp(path22.join(os9.tmpdir(), "teamai-local-agent-"));
   const filePath = path22.join(tmpDir, "resource");
   let current = assertHttpUrl(downloadUrl);
   let response;
@@ -11328,8 +11329,8 @@ async function pushCore(localConfig, teamConfig, options) {
       process.exitCode = 2;
       return;
     }
-    const os12 = await import("os");
-    const skillPath = options.skill.startsWith("~") ? path35.join(os12.homedir(), options.skill.slice(1)) : path35.resolve(options.skill);
+    const os13 = await import("os");
+    const skillPath = options.skill.startsWith("~") ? path35.join(os13.homedir(), options.skill.slice(1)) : path35.resolve(options.skill);
     let matchedItem;
     for (const item of allItems) {
       if (item.type !== "skills") continue;
@@ -11341,7 +11342,7 @@ async function pushCore(localConfig, teamConfig, options) {
         matchedItem = item;
         break;
       }
-      const skillInput = options.skill.replace(/^~/, os12.homedir());
+      const skillInput = options.skill.replace(/^~/, os13.homedir());
       if (item.sourcePath.endsWith(skillInput) || item.sourcePath.includes(path35.sep + skillInput)) {
         matchedItem = item;
         break;
@@ -23893,10 +23894,10 @@ var init_recall_toggle = __esm({
 
 // src/utils/cache-index.ts
 import path78 from "path";
-import os9 from "os";
+import os10 from "os";
 import fs26 from "fs-extra";
 function getCacheRoot() {
-  return process.env.TEAMAI_CACHE_DIR ?? path78.join(os9.homedir(), ".teamai", "cache", "repos");
+  return process.env.TEAMAI_CACHE_DIR ?? path78.join(os10.homedir(), ".teamai", "cache", "repos");
 }
 function buildKey(provider, owner, repo) {
   return `${provider}/${owner}/${repo}`;
@@ -28785,10 +28786,10 @@ __export(repo_cache_exports, {
   writeLastSync: () => writeLastSync
 });
 import path91 from "path";
-import os10 from "os";
+import os11 from "os";
 import fs32 from "fs-extra";
 function getCacheRoot2() {
-  return process.env.TEAMAI_CACHE_DIR ?? path91.join(os10.homedir(), ".teamai", "cache", "repos");
+  return process.env.TEAMAI_CACHE_DIR ?? path91.join(os11.homedir(), ".teamai", "cache", "repos");
 }
 function getRepoCacheDir(provider, owner, repo) {
   return path91.join(getCacheRoot2(), provider, owner, repo);
@@ -30843,7 +30844,7 @@ __export(import_exports, {
   importCmd: () => importCmd
 });
 import path101 from "path";
-import os11 from "os";
+import os12 from "os";
 import fs39 from "fs-extra";
 import { Listr, PRESET_TIMER } from "listr2";
 async function importCmd(opts) {
@@ -31037,7 +31038,7 @@ async function importCmd(opts) {
         log.success(`Local directory ${slug} import complete (dry-run)`);
         return;
       }
-      const tmpExtractDir = await fs39.mkdtemp(path101.join(os11.tmpdir(), "teamai-extract-"));
+      const tmpExtractDir = await fs39.mkdtemp(path101.join(os12.tmpdir(), "teamai-extract-"));
       try {
         const { extractCodebase: extractCodebase2 } = await Promise.resolve().then(() => (init_codebase_extract(), codebase_extract_exports));
         await extractCodebase2({

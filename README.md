@@ -18,7 +18,7 @@ Git-native management of skills, rules, and docs across Claude Code / Codex / Co
 
 For you or your whole team.
 
-> This fork is the pinned TeamAI Core used by the Autocode resource repository. It keeps upstream v0.20.0 behavior while adding strict host-aware Agent rendering and manifest-backed resource lifecycle safety. Version `0.20.0-autocode.2` adds explicit-only WorkBuddy/DeepSeek Harness static-resource adapters, persisted host-root drift protection, and DSH `0.1.1-rc.1` contract diagnostics. It is installed from an immutable commit archive, not from npm.
+> This fork is the pinned TeamAI Core used by the Autocode resource repository. It keeps upstream v0.20.0 behavior while adding strict host-aware Agent rendering and manifest-backed resource lifecycle safety. Version `0.20.0-autocode.4` adds explicit-only WorkBuddy/DeepSeek Harness static-resource adapters, persisted host-root drift protection, machine-readable diagnostics with reliable exit codes, and WorkBuddy version discovery on macOS and Windows. It is installed from an immutable commit archive, not from npm.
 
 ## Quick Start
 
@@ -228,7 +228,7 @@ When a recall hit comes from a codebase page, the result includes a `Sources:` l
 | `teamai remove <type> <name>` | Remove a resource and open MR |
 | `teamai session save` | Record a privacy-scrubbed session summary to a monthly log (`--push` feeds `digest`) |
 | `teamai digest` | Generate weekly team usage digest |
-| `teamai doctor` | Diagnose configuration issues |
+| `teamai doctor [--json]` | Diagnose configuration issues; JSON mode is suitable for automation and exits nonzero on failure |
 | `teamai uninstall` | Remove all teamai resources and hooks |
 
 Global options: `--dry-run` / `--plan` (zero-side-effect lifecycle preview), `--verbose`

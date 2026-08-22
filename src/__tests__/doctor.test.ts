@@ -246,3 +246,39 @@ describe('doctor — explicit host checks', () => {
         expect(allCalls.some((msg: string) => msg.includes('Install DSH 0.1.1-rc.1'))).toBe(true);
     });
 });
+
+describe('doctor — JSON report', () => {
+    it('emits one machine-readable report without human output', async () => {
+        mockedLoadTeamConfig.mockResolvedValue({
+            ...mockTeamConfig,
+            sharing: { env: { injectShellProfile: false } },
+        });
+
+        const report = await doctor({ json: true });
+
+        expect(report).toMatchObject({
+            schemaVersion: 1,
+            ok: true,
+            scope: 'user',
+            provider: 'tgit',
+            hosts: {
+                workbuddy: { selected: false, runtimeSmoke: 'manual' },
+                dsh: { selected: false, runtimeSmoke: 'opt-in-read-only' },
+            },
+        });
+        expect(consoleSpy).toHaveBeenCalledTimes(1);
+        expect(JSON.parse(consoleSpy.mock.calls[0][0])).toEqual(report);
+    });
+
+    it('returns ok=false and structured failed checks for an invalid team config', async () => {
+        mockedLoadTeamConfig.mockResolvedValue(null);
+
+        const report = await doctor({ json: true });
+
+        expect(report.ok).toBe(false);
+        expect(report.checks).toContainEqual(expect.objectContaining({
+            name: 'Team config (teamai.yaml) is valid',
+            ok: false,
+        }));
+    });
+});

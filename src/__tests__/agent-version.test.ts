@@ -5,8 +5,10 @@ import path from 'node:path';
 import {
   getAgentVersion,
   clearVersionCache,
+  _normalizeDetectedVersion,
   _readPlistVersion,
   _workbuddyAppPaths,
+  _workbuddyWindowsExePaths,
 } from '../agent-version.js';
 
 beforeEach(() => {
@@ -53,6 +55,22 @@ describe('getAgentVersion', () => {
   it('checks both user-level and system-level WorkBuddy applications', () => {
     expect(_workbuddyAppPaths).toContain(path.join(os.homedir(), 'Applications', 'WorkBuddy.app'));
     expect(_workbuddyAppPaths).toContain('/Applications/WorkBuddy.app');
+  });
+
+  it('builds common Windows WorkBuddy executable locations', () => {
+    const candidates = _workbuddyWindowsExePaths({
+      LOCALAPPDATA: 'C:\\Users\\tester\\AppData\\Local',
+      ProgramFiles: 'C:\\Program Files',
+      'ProgramFiles(x86)': 'C:\\Program Files (x86)',
+    });
+    expect(candidates).toContain('C:\\Users\\tester\\AppData\\Local\\Programs\\WorkBuddy\\WorkBuddy.exe');
+    expect(candidates).toContain('C:\\Program Files\\WorkBuddy\\WorkBuddy.exe');
+    expect(candidates).toContain('C:\\Program Files (x86)\\WorkBuddy\\WorkBuddy.exe');
+  });
+
+  it('normalizes Windows four-part product versions to the validated baseline shape', () => {
+    expect(_normalizeDetectedVersion('5.3.13.0')).toBe('5.3.13');
+    expect(_normalizeDetectedVersion('ProductVersion 5,3,13,0')).toBe('5.3.13');
   });
 
   it('detects dsh version from its CLI', async () => {

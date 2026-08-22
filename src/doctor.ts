@@ -27,6 +27,40 @@ interface Check {
   fix?: string;
 }
 
+export interface DoctorCheckResult {
+  name: string;
+  ok: boolean;
+  fix?: string;
+  detail?: string;
+}
+
+export interface DoctorHostReport {
+  selected: boolean;
+  root: string | null;
+  detectedVersion: string | null;
+  expectedVersion: string;
+  managedResources: string[];
+  runtimeSmoke: 'manual' | 'opt-in-read-only';
+}
+
+export interface DoctorReport {
+  schemaVersion: 1;
+  ok: boolean;
+  scope: Scope;
+  projectRoot: string | null;
+  provider: string;
+  hosts: {
+    workbuddy: DoctorHostReport;
+    dsh: DoctorHostReport;
+  };
+  notices: string[];
+  checks: DoctorCheckResult[];
+}
+
+export interface DoctorOptions extends GlobalOptions {
+  json?: boolean;
+}
+
 interface SpecialHostDiagnostics {
   checks: Check[];
   notices: string[];
@@ -52,22 +86,41 @@ async function filesMatch(left: string, right: string): Promise<boolean> {
   return leftText !== null && leftText === rightText;
 }
 
+async function buildSpecialHostReports(localConfig: LocalConfig | null): Promise<DoctorReport['hosts']> {
+  const scope: Scope = localConfig?.scope ?? 'user';
+  const build = async (host: 'workbuddy' | 'dsh'): Promise<DoctorHostReport> => {
+    const selected = Boolean(localConfig && isHostSelected(localConfig, host));
+    const root = selected
+      ? localConfig?.hostRoots?.[host] ?? resolveHostRoot(host, scope, localConfig?.projectRoot) ?? null
+      : null;
+    const detectedVersion = selected ? await getAgentVersion(host) || null : null;
+    return {
+      selected,
+      root,
+      detectedVersion,
+      expectedVersion: host === 'dsh' ? DSH_EXACT_VERSION : WORKBUDDY_VALIDATED_VERSION,
+      managedResources: host === 'dsh' && scope === 'user' ? ['skills', 'instructions'] : ['skills'],
+      runtimeSmoke: host === 'dsh' ? 'opt-in-read-only' : 'manual',
+    };
+  };
+  const [workbuddy, dsh] = await Promise.all([build('workbuddy'), build('dsh')]);
+  return { workbuddy, dsh };
+}
+
 async function buildSpecialHostDiagnostics(
   localConfig: LocalConfig | null,
   teamConfig: TeamaiConfig | null,
+  hosts: DoctorReport['hosts'],
 ): Promise<SpecialHostDiagnostics> {
   const diagnostics: SpecialHostDiagnostics = { checks: [], notices: [] };
   if (!localConfig) return diagnostics;
 
-  const selectedHosts = ['workbuddy', 'dsh'].filter((host) => isHostSelected(localConfig, host));
+  const selectedHosts = (['workbuddy', 'dsh'] as const).filter((host) => hosts[host].selected);
   if (selectedHosts.length === 0) return diagnostics;
 
   const skillNames = await canonicalSkillNames(localConfig.repo.localPath);
   for (const host of selectedHosts) {
-    const root = localConfig.hostRoots?.[host]
-      ?? resolveHostRoot(host, localConfig.scope, localConfig.projectRoot);
-    const version = await getAgentVersion(host);
-    const expectedVersion = host === 'dsh' ? DSH_EXACT_VERSION : WORKBUDDY_VALIDATED_VERSION;
+    const { root, detectedVersion: version, expectedVersion } = hosts[host];
     const displayName = host === 'dsh' ? 'DSH' : 'WorkBuddy';
 
     diagnostics.notices.push(
@@ -80,7 +133,7 @@ async function buildSpecialHostDiagnostics(
         fix: `Run targeted uninstall, then re-run \`teamai init --agent ${host}\` to bind the current host root`,
       },
       {
-        name: `${displayName} version matches ${expectedVersion} (detected: ${version || 'unavailable'})`,
+        name: `${displayName} version matches ${expectedVersion} (detected: ${version ?? 'unavailable'})`,
         check: async () => version === expectedVersion,
         fix: host === 'dsh'
           ? `Install DSH ${expectedVersion} before syncing`
@@ -149,8 +202,7 @@ async function buildHookChecks(toolPaths: TeamaiConfig['toolPaths'], baseDir: st
   return checks;
 }
 
-export async function doctor(options: GlobalOptions): Promise<void> {
-  log.info('Running diagnostics...\n');
+export async function doctor(options: DoctorOptions): Promise<DoctorReport> {
   const projectConfig = await detectProjectConfig();
   const localConfig = projectConfig ?? (await loadLocalConfig());
   const scope: Scope = localConfig?.scope ?? 'user';
@@ -158,36 +210,17 @@ export async function doctor(options: GlobalOptions): Promise<void> {
     ? `${projectConfig.projectRoot}/.teamai/config.yaml`
     : '~/.teamai/config.yaml';
 
-  console.log(`  Scope: ${scope}${scope === 'project' && localConfig?.projectRoot ? ` (${localConfig.projectRoot})` : ''}\n`);
-  const dshSelected = Boolean(localConfig && isHostSelected(localConfig, 'dsh'));
-  const workbuddySelected = Boolean(localConfig && isHostSelected(localConfig, 'workbuddy'));
-  const dshRoot = dshSelected
-    ? localConfig?.hostRoots?.dsh ?? resolveHostRoot('dsh', scope, localConfig?.projectRoot)
-    : undefined;
-  const workbuddyRoot = workbuddySelected
-    ? localConfig?.hostRoots?.workbuddy ?? resolveHostRoot('workbuddy', scope, localConfig?.projectRoot)
-    : undefined;
-  console.log(`  DSH: ${dshSelected ? `selected (${dshRoot})` : 'not selected'}`);
-  console.log(`  WorkBuddy: ${workbuddySelected ? `selected (${workbuddyRoot})` : 'not selected'}`);
-  if (dshSelected) {
-    console.log(`  DSH shared Agents root: ${process.env.DSH_AGENTS_HOME?.trim() || '~/.agents'} (read-only compatibility path; TeamAI does not manage it as DSH)`);
-  }
-  console.log('');
-
-  // Try to load team config for dynamic tool paths and provider
   let teamConfig: TeamaiConfig | null = null;
   if (localConfig) {
     teamConfig = await loadTeamConfig(localConfig.repo.localPath);
   }
-  // Fall back to schema defaults if team config is unavailable
   const toolPaths = teamConfig?.toolPaths ?? TeamaiConfigSchema.shape.toolPaths.parse(undefined);
   const providerName = teamConfig?.provider ?? 'tgit';
   const baseDir = localConfig ? resolveBaseDir(localConfig) : homeDir();
+  const hosts = await buildSpecialHostReports(localConfig);
 
   const checks: Check[] = [];
-  const specialHostDiagnostics = await buildSpecialHostDiagnostics(localConfig, teamConfig);
-  for (const notice of specialHostDiagnostics.notices) console.log(`  ⚠ ${notice}`);
-  if (specialHostDiagnostics.notices.length > 0) console.log('');
+  const specialHostDiagnostics = await buildSpecialHostDiagnostics(localConfig, teamConfig, hosts);
 
   // Provider-specific checks: gf CLI only needed for TGit, gh CLI for GitHub
   if (providerName === 'tgit') {
@@ -238,11 +271,7 @@ export async function doctor(options: GlobalOptions): Promise<void> {
     },
     {
       name: 'Team config (teamai.yaml) is valid',
-      check: async () => {
-        if (!localConfig) return false;
-        const config = await loadTeamConfig(localConfig.repo.localPath);
-        return config !== null;
-      },
+      check: async () => localConfig !== null && teamConfig !== null,
       fix: 'Check teamai.yaml in team repo for syntax errors',
     },
     ...await buildHookChecks(toolPaths, baseDir),
@@ -275,16 +304,51 @@ export async function doctor(options: GlobalOptions): Promise<void> {
     ...specialHostDiagnostics.checks,
   );
 
-  let allPassed = true;
+  const checkResults: DoctorCheckResult[] = [];
   for (const { name, check, fix } of checks) {
-    const ok = await check();
-    if (ok) {
-      console.log(`  ✔ ${name}`);
-    } else {
-      console.log(`  ✖ ${name}`);
-      if (fix) console.log(`    → ${fix}`);
-      allPassed = false;
+    try {
+      const ok = await check();
+      checkResults.push({ name, ok, ...(!ok && fix ? { fix } : {}) });
+    } catch (error) {
+      checkResults.push({
+        name,
+        ok: false,
+        ...(fix ? { fix } : {}),
+        detail: error instanceof Error ? error.message : String(error),
+      });
     }
+  }
+  const allPassed = checkResults.every((result) => result.ok);
+  const report: DoctorReport = {
+    schemaVersion: 1,
+    ok: allPassed,
+    scope,
+    projectRoot: localConfig?.projectRoot ?? null,
+    provider: providerName,
+    hosts,
+    notices: specialHostDiagnostics.notices,
+    checks: checkResults,
+  };
+
+  if (options.json) {
+    console.log(JSON.stringify(report, null, 2));
+    return report;
+  }
+
+  log.info('Running diagnostics...\n');
+  console.log(`  Scope: ${scope}${scope === 'project' && localConfig?.projectRoot ? ` (${localConfig.projectRoot})` : ''}\n`);
+  console.log(`  DSH: ${hosts.dsh.selected ? `selected (${hosts.dsh.root})` : 'not selected'}`);
+  console.log(`  WorkBuddy: ${hosts.workbuddy.selected ? `selected (${hosts.workbuddy.root})` : 'not selected'}`);
+  if (hosts.dsh.selected) {
+    console.log(`  DSH shared Agents root: ${process.env.DSH_AGENTS_HOME?.trim() || '~/.agents'} (read-only compatibility path; TeamAI does not manage it as DSH)`);
+  }
+  console.log('');
+  for (const notice of specialHostDiagnostics.notices) console.log(`  ⚠ ${notice}`);
+  if (specialHostDiagnostics.notices.length > 0) console.log('');
+  for (const result of checkResults) {
+    console.log(`  ${result.ok ? '✔' : '✖'} ${result.name}`);
+    if (result.detail) console.log(`    → ${result.detail}`);
+    if (!result.ok && result.fix) console.log(`    → ${result.fix}`);
   }
 
   console.log('');
@@ -293,4 +357,5 @@ export async function doctor(options: GlobalOptions): Promise<void> {
   } else {
     log.warn('Some checks failed. See suggestions above.');
   }
+  return report;
 }

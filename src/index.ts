@@ -184,10 +184,13 @@ program
 program
   .command('doctor')
   .description('Diagnose configuration issues')
-  .action(async () => {
+  .option('--json', 'Output a machine-readable diagnostic report')
+  .action(async (cmdOpts) => {
     const globalOpts = program.opts() as GlobalOptions;
     const { doctor } = await import('./doctor.js');
-    await doctor(globalOpts);
+    if (cmdOpts.json) setSilent(true);
+    const report = await doctor({ ...globalOpts, json: !!cmdOpts.json });
+    if (!report.ok) process.exitCode = 1;
   });
 
 // ─── Roles subcommand ─────────────────────────────────────

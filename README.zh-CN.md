@@ -18,7 +18,7 @@
 
 一个人也能用，团队用更强。
 
-> 这个 Fork 是 Autocode 资源仓库锁定使用的 TeamAI Core。它以 upstream v0.20.0 为基线，增加严格的跨宿主 Agent 渲染和基于清单的资源生命周期保护；`0.20.0-autocode.2` 增加显式启用的 WorkBuddy/DeepSeek Harness 静态资源适配、持久化 host root 漂移保护以及 DSH `0.1.1-rc.1` 合同诊断。安装来源是不可变提交压缩包，不从 npm 获取。
+> 这个 Fork 是 Autocode 资源仓库锁定使用的 TeamAI Core。它以 upstream v0.20.0 为基线，增加严格的跨宿主 Agent 渲染和基于清单的资源生命周期保护；`0.20.0-autocode.4` 增加显式启用的 WorkBuddy/DeepSeek Harness 静态资源适配、持久化 host root 漂移保护、带可靠退出码的机器可读诊断，以及 macOS/Windows WorkBuddy 版本发现。安装来源是不可变提交压缩包，不从 npm 获取。
 
 ## 快速开始
 
@@ -225,7 +225,7 @@ teamai codebase --lint                      # 健康检查
 | `teamai remove <type> <name>` | 删除资源并创建 MR |
 | `teamai session save` | 将脱敏后的 session 摘要记录到月度日志（`--push` 可喂给 `digest`） |
 | `teamai digest` | 生成团队周报 |
-| `teamai doctor` | 诊断配置问题 |
+| `teamai doctor [--json]` | 诊断配置问题；JSON 模式适合自动化，失败时返回非零退出码 |
 | `teamai uninstall` | 移除所有 teamai 资源和 hooks |
 
 全局选项：`--dry-run` / `--plan`（生命周期零副作用预览）、`--verbose`

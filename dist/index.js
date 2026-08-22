@@ -5998,12 +5998,12 @@ var init_dashboard_collector = __esm({
 
 // src/agent-version.ts
 import { execFile } from "child_process";
-import { readFile } from "fs/promises";
+import { access, readFile } from "fs/promises";
 import os7 from "os";
 import path20 from "path";
-async function execVersion(bin, args = ["--version"]) {
+async function execVersion(bin, args = ["--version"], options = {}) {
   return new Promise((resolve) => {
-    execFile(bin, args, { timeout: 5e3 }, (err, stdout) => {
+    execFile(bin, args, { timeout: 5e3, encoding: "utf8", env: options.env }, (err, stdout) => {
       if (err) {
         resolve("");
         return;
@@ -6011,6 +6011,21 @@ async function execVersion(bin, args = ["--version"]) {
       resolve(stdout.trim());
     });
   });
+}
+async function fileExists(candidate) {
+  try {
+    await access(candidate);
+    return true;
+  } catch {
+    return false;
+  }
+}
+function normalizeDetectedVersion(raw) {
+  const match = raw.match(/\d+(?:[.,]\d+){1,3}/);
+  if (!match) return raw.trim();
+  const parts = match[0].split(/[.,]/);
+  while (parts.length > 3 && parts.at(-1) === "0") parts.pop();
+  return parts.join(".");
 }
 async function readPlistVersion(appPath) {
   const plistPath = path20.join(appPath, "Contents", "Info.plist");
@@ -6043,7 +6058,48 @@ async function detectCodebuddyIdeVersion() {
   }
   return "";
 }
+function workbuddyWindowsExePaths(env = process.env) {
+  const candidates = [];
+  const localAppData = env.LOCALAPPDATA?.trim();
+  if (localAppData) {
+    candidates.push(
+      path20.win32.join(localAppData, "Programs", "WorkBuddy", "WorkBuddy.exe"),
+      path20.win32.join(localAppData, "WorkBuddy", "WorkBuddy.exe")
+    );
+  }
+  for (const value of [env.ProgramFiles, env["ProgramFiles(x86)"], env.ProgramW6432]) {
+    const root = value?.trim();
+    if (root) candidates.push(path20.win32.join(root, "WorkBuddy", "WorkBuddy.exe"));
+  }
+  return [...new Set(candidates)];
+}
+async function queryPowerShell(command, env = process.env) {
+  for (const executable of ["powershell.exe", "pwsh.exe"]) {
+    const output = await execVersion(
+      executable,
+      ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command],
+      { env }
+    );
+    if (output) return output;
+  }
+  return "";
+}
+async function detectWorkbuddyWindowsVersion() {
+  for (const candidate of workbuddyWindowsExePaths()) {
+    if (!await fileExists(candidate)) continue;
+    const output = await queryPowerShell(
+      "(Get-Item -LiteralPath $env:TEAMAI_WORKBUDDY_EXE).VersionInfo.ProductVersion",
+      { ...process.env, TEAMAI_WORKBUDDY_EXE: candidate }
+    );
+    if (output) return normalizeDetectedVersion(output);
+  }
+  const appxVersion = await queryPowerShell(
+    "Get-AppxPackage -Name '*WorkBuddy*' | Select-Object -First 1 -ExpandProperty Version"
+  );
+  return normalizeDetectedVersion(appxVersion);
+}
 async function detectWorkbuddyVersion() {
+  if (process.platform === "win32") return detectWorkbuddyWindowsVersion();
   for (const appPath of WORKBUDDY_APP_PATHS) {
     const ver = await readPlistVersion(appPath);
     if (ver) return ver;
@@ -18360,16 +18416,32 @@ async function filesMatch(left, right) {
   const [leftText, rightText] = await Promise.all([readFileSafe(left), readFileSafe(right)]);
   return leftText !== null && leftText === rightText;
 }
-async function buildSpecialHostDiagnostics(localConfig, teamConfig) {
+async function buildSpecialHostReports(localConfig) {
+  const scope = localConfig?.scope ?? "user";
+  const build = async (host) => {
+    const selected = Boolean(localConfig && isHostSelected(localConfig, host));
+    const root = selected ? localConfig?.hostRoots?.[host] ?? resolveHostRoot(host, scope, localConfig?.projectRoot) ?? null : null;
+    const detectedVersion = selected ? await getAgentVersion(host) || null : null;
+    return {
+      selected,
+      root,
+      detectedVersion,
+      expectedVersion: host === "dsh" ? DSH_EXACT_VERSION : WORKBUDDY_VALIDATED_VERSION,
+      managedResources: host === "dsh" && scope === "user" ? ["skills", "instructions"] : ["skills"],
+      runtimeSmoke: host === "dsh" ? "opt-in-read-only" : "manual"
+    };
+  };
+  const [workbuddy, dsh] = await Promise.all([build("workbuddy"), build("dsh")]);
+  return { workbuddy, dsh };
+}
+async function buildSpecialHostDiagnostics(localConfig, teamConfig, hosts) {
   const diagnostics = { checks: [], notices: [] };
   if (!localConfig) return diagnostics;
-  const selectedHosts = ["workbuddy", "dsh"].filter((host) => isHostSelected(localConfig, host));
+  const selectedHosts = ["workbuddy", "dsh"].filter((host) => hosts[host].selected);
   if (selectedHosts.length === 0) return diagnostics;
   const skillNames = await canonicalSkillNames(localConfig.repo.localPath);
   for (const host of selectedHosts) {
-    const root = localConfig.hostRoots?.[host] ?? resolveHostRoot(host, localConfig.scope, localConfig.projectRoot);
-    const version2 = await getAgentVersion(host);
-    const expectedVersion = host === "dsh" ? DSH_EXACT_VERSION : WORKBUDDY_VALIDATED_VERSION;
+    const { root, detectedVersion: version2, expectedVersion } = hosts[host];
     const displayName = host === "dsh" ? "DSH" : "WorkBuddy";
     diagnostics.notices.push(
       `${displayName} support evidence: synchronized entrypoints are checked here; runtime loading is a separate host smoke check`
@@ -18381,7 +18453,7 @@ async function buildSpecialHostDiagnostics(localConfig, teamConfig) {
         fix: `Run targeted uninstall, then re-run \`teamai init --agent ${host}\` to bind the current host root`
       },
       {
-        name: `${displayName} version matches ${expectedVersion} (detected: ${version2 || "unavailable"})`,
+        name: `${displayName} version matches ${expectedVersion} (detected: ${version2 ?? "unavailable"})`,
         check: async () => version2 === expectedVersion,
         fix: host === "dsh" ? `Install DSH ${expectedVersion} before syncing` : `Use WorkBuddy ${expectedVersion}, or revalidate the new version before treating it as supported`
       },
@@ -18439,23 +18511,10 @@ async function buildHookChecks(toolPaths, baseDir) {
   return checks;
 }
 async function doctor(options) {
-  log.info("Running diagnostics...\n");
   const projectConfig = await detectProjectConfig();
   const localConfig = projectConfig ?? await loadLocalConfig();
   const scope = localConfig?.scope ?? "user";
   const configPathLabel = projectConfig ? `${projectConfig.projectRoot}/.teamai/config.yaml` : "~/.teamai/config.yaml";
-  console.log(`  Scope: ${scope}${scope === "project" && localConfig?.projectRoot ? ` (${localConfig.projectRoot})` : ""}
-`);
-  const dshSelected = Boolean(localConfig && isHostSelected(localConfig, "dsh"));
-  const workbuddySelected = Boolean(localConfig && isHostSelected(localConfig, "workbuddy"));
-  const dshRoot = dshSelected ? localConfig?.hostRoots?.dsh ?? resolveHostRoot("dsh", scope, localConfig?.projectRoot) : void 0;
-  const workbuddyRoot = workbuddySelected ? localConfig?.hostRoots?.workbuddy ?? resolveHostRoot("workbuddy", scope, localConfig?.projectRoot) : void 0;
-  console.log(`  DSH: ${dshSelected ? `selected (${dshRoot})` : "not selected"}`);
-  console.log(`  WorkBuddy: ${workbuddySelected ? `selected (${workbuddyRoot})` : "not selected"}`);
-  if (dshSelected) {
-    console.log(`  DSH shared Agents root: ${process.env.DSH_AGENTS_HOME?.trim() || "~/.agents"} (read-only compatibility path; TeamAI does not manage it as DSH)`);
-  }
-  console.log("");
   let teamConfig = null;
   if (localConfig) {
     teamConfig = await loadTeamConfig(localConfig.repo.localPath);
@@ -18463,10 +18522,9 @@ async function doctor(options) {
   const toolPaths = teamConfig?.toolPaths ?? TeamaiConfigSchema.shape.toolPaths.parse(void 0);
   const providerName = teamConfig?.provider ?? "tgit";
   const baseDir = localConfig ? resolveBaseDir(localConfig) : homeDir();
+  const hosts = await buildSpecialHostReports(localConfig);
   const checks = [];
-  const specialHostDiagnostics = await buildSpecialHostDiagnostics(localConfig, teamConfig);
-  for (const notice of specialHostDiagnostics.notices) console.log(`  \u26A0 ${notice}`);
-  if (specialHostDiagnostics.notices.length > 0) console.log("");
+  const specialHostDiagnostics = await buildSpecialHostDiagnostics(localConfig, teamConfig, hosts);
   if (providerName === "tgit") {
     const { isGfInstalled: isGfInstalled2, gfIsAuthenticated: gfIsAuthenticated2 } = await Promise.resolve().then(() => (init_tgit(), tgit_exports));
     checks.push(
@@ -18512,11 +18570,7 @@ async function doctor(options) {
     },
     {
       name: "Team config (teamai.yaml) is valid",
-      check: async () => {
-        if (!localConfig) return false;
-        const config = await loadTeamConfig(localConfig.repo.localPath);
-        return config !== null;
-      },
+      check: async () => localConfig !== null && teamConfig !== null,
       fix: "Check teamai.yaml in team repo for syntax errors"
     },
     ...await buildHookChecks(toolPaths, baseDir),
@@ -18540,16 +18594,50 @@ async function doctor(options) {
     },
     ...specialHostDiagnostics.checks
   );
-  let allPassed = true;
+  const checkResults = [];
   for (const { name, check, fix } of checks) {
-    const ok = await check();
-    if (ok) {
-      console.log(`  \u2714 ${name}`);
-    } else {
-      console.log(`  \u2716 ${name}`);
-      if (fix) console.log(`    \u2192 ${fix}`);
-      allPassed = false;
+    try {
+      const ok = await check();
+      checkResults.push({ name, ok, ...!ok && fix ? { fix } : {} });
+    } catch (error) {
+      checkResults.push({
+        name,
+        ok: false,
+        ...fix ? { fix } : {},
+        detail: error instanceof Error ? error.message : String(error)
+      });
     }
+  }
+  const allPassed = checkResults.every((result) => result.ok);
+  const report = {
+    schemaVersion: 1,
+    ok: allPassed,
+    scope,
+    projectRoot: localConfig?.projectRoot ?? null,
+    provider: providerName,
+    hosts,
+    notices: specialHostDiagnostics.notices,
+    checks: checkResults
+  };
+  if (options.json) {
+    console.log(JSON.stringify(report, null, 2));
+    return report;
+  }
+  log.info("Running diagnostics...\n");
+  console.log(`  Scope: ${scope}${scope === "project" && localConfig?.projectRoot ? ` (${localConfig.projectRoot})` : ""}
+`);
+  console.log(`  DSH: ${hosts.dsh.selected ? `selected (${hosts.dsh.root})` : "not selected"}`);
+  console.log(`  WorkBuddy: ${hosts.workbuddy.selected ? `selected (${hosts.workbuddy.root})` : "not selected"}`);
+  if (hosts.dsh.selected) {
+    console.log(`  DSH shared Agents root: ${process.env.DSH_AGENTS_HOME?.trim() || "~/.agents"} (read-only compatibility path; TeamAI does not manage it as DSH)`);
+  }
+  console.log("");
+  for (const notice of specialHostDiagnostics.notices) console.log(`  \u26A0 ${notice}`);
+  if (specialHostDiagnostics.notices.length > 0) console.log("");
+  for (const result of checkResults) {
+    console.log(`  ${result.ok ? "\u2714" : "\u2716"} ${result.name}`);
+    if (result.detail) console.log(`    \u2192 ${result.detail}`);
+    if (!result.ok && result.fix) console.log(`    \u2192 ${result.fix}`);
   }
   console.log("");
   if (allPassed) {
@@ -18557,6 +18645,7 @@ async function doctor(options) {
   } else {
     log.warn("Some checks failed. See suggestions above.");
   }
+  return report;
 }
 var init_doctor = __esm({
   "src/doctor.ts"() {
@@ -33173,10 +33262,12 @@ program.command("remove <type> <names...>").description("Remove resource(s) from
   const { remove: remove3 } = await Promise.resolve().then(() => (init_remove(), remove_exports));
   await remove3(type, names, globalOpts);
 });
-program.command("doctor").description("Diagnose configuration issues").action(async () => {
+program.command("doctor").description("Diagnose configuration issues").option("--json", "Output a machine-readable diagnostic report").action(async (cmdOpts) => {
   const globalOpts = program.opts();
   const { doctor: doctor2 } = await Promise.resolve().then(() => (init_doctor(), doctor_exports));
-  await doctor2(globalOpts);
+  if (cmdOpts.json) setSilent(true);
+  const report = await doctor2({ ...globalOpts, json: !!cmdOpts.json });
+  if (!report.ok) process.exitCode = 1;
 });
 var rolesCmd = program.command("roles").description("Manage team roles and resource namespaces").action(async () => {
   const globalOpts = program.opts();

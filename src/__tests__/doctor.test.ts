@@ -245,6 +245,30 @@ describe('doctor — explicit host checks', () => {
         expect(allCalls.some((msg: string) => msg.includes('✖ DSH version matches 0.1.1-rc.1'))).toBe(true);
         expect(allCalls.some((msg: string) => msg.includes('Install DSH 0.1.1-rc.1'))).toBe(true);
     });
+
+    it('does not infer duplicate DSH runtime loading from identical instruction files', async () => {
+        mockedLoadLocalConfig.mockResolvedValue({
+            ...mockLocalConfig,
+            scope: 'user',
+            enabledAgents: ['dsh'],
+            hostRoots: { dsh: '/tmp/dsh' },
+        });
+        mockedLoadTeamConfig.mockResolvedValue({
+            ...mockTeamConfig,
+            sharing: { instructions: { source: 'AGENTS.md' } },
+        });
+        mockedGetAgentVersion.mockResolvedValue('0.1.1-rc.1');
+        mockedReadFileSafe.mockImplementation(async (filePath: string) => (
+            filePath.includes('settings.json') ? buildFullHooksContent() : 'same instructions'
+        ));
+
+        const report = await doctor({ json: true });
+
+        expect(report.notices).toContain(
+            'Identical user-level and project-level AGENTS.md files exist in this workspace; TeamAI does not infer duplicate DSH runtime loading from file presence alone',
+        );
+        expect(report.notices.some((notice) => notice.includes('DSH is loading identical'))).toBe(false);
+    });
 });
 
 describe('doctor — JSON report', () => {
@@ -266,6 +290,9 @@ describe('doctor — JSON report', () => {
                 dsh: { selected: false, runtimeSmoke: 'opt-in-read-only' },
             },
         });
+        const checkIds = report.checks.map((check) => check.id);
+        expect(checkIds.every((id) => typeof id === 'string' && id.length > 0)).toBe(true);
+        expect(new Set(checkIds).size).toBe(checkIds.length);
         expect(consoleSpy).toHaveBeenCalledTimes(1);
         expect(JSON.parse(consoleSpy.mock.calls[0][0])).toEqual(report);
     });
@@ -277,6 +304,7 @@ describe('doctor — JSON report', () => {
 
         expect(report.ok).toBe(false);
         expect(report.checks).toContainEqual(expect.objectContaining({
+            id: 'config.team',
             name: 'Team config (teamai.yaml) is valid',
             ok: false,
         }));

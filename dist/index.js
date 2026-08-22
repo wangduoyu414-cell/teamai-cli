@@ -18448,16 +18448,19 @@ async function buildSpecialHostDiagnostics(localConfig, teamConfig, hosts) {
     );
     diagnostics.checks.push(
       {
+        id: `host.${host}.root`,
         name: `${displayName} host root is available (${root ?? "unresolved"})`,
         check: async () => Boolean(root && await pathExists(root)),
         fix: `Run targeted uninstall, then re-run \`teamai init --agent ${host}\` to bind the current host root`
       },
       {
+        id: `host.${host}.version`,
         name: `${displayName} version matches ${expectedVersion} (detected: ${version2 ?? "unavailable"})`,
         check: async () => version2 === expectedVersion,
         fix: host === "dsh" ? `Install DSH ${expectedVersion} before syncing` : `Use WorkBuddy ${expectedVersion}, or revalidate the new version before treating it as supported`
       },
       {
+        id: `host.${host}.skills`,
         name: `${displayName} has all ${skillNames.length} canonical Skill entrypoints`,
         check: async () => {
           if (!root || skillNames.length === 0) return false;
@@ -18473,6 +18476,7 @@ async function buildSpecialHostDiagnostics(localConfig, teamConfig, hosts) {
       const source = teamConfig?.sharing?.instructions?.source;
       const target = resolveHostResourcePath("dsh", "instructions", localConfig);
       diagnostics.checks.push({
+        id: "host.dsh.instructions",
         name: "DSH managed AGENTS.md matches the canonical instruction source",
         check: async () => Boolean(source && target && await filesMatch(path56.join(localConfig.repo.localPath, source), target)),
         fix: "Run `teamai pull` to restore the managed DSH instruction file"
@@ -18480,7 +18484,7 @@ async function buildSpecialHostDiagnostics(localConfig, teamConfig, hosts) {
       const projectInstructions = path56.join(process.cwd(), "AGENTS.md");
       if (localConfig.scope === "user" && target && await pathExists(projectInstructions) && await filesMatch(projectInstructions, target)) {
         diagnostics.notices.push(
-          "DSH is loading identical user-level and project-level AGENTS.md content in this workspace; this is safe but duplicates context"
+          "Identical user-level and project-level AGENTS.md files exist in this workspace; TeamAI does not infer duplicate DSH runtime loading from file presence alone"
         );
       }
     }
@@ -18495,6 +18499,7 @@ async function buildHookChecks(toolPaths, baseDir) {
     const parentDir = path56.dirname(settingsPath);
     if (!await pathExists(parentDir)) continue;
     checks.push({
+      id: `hooks.${tool}`,
       name: `teamai hooks in ${tool} settings`,
       check: async () => {
         if (!await pathExists(settingsPath)) return false;
@@ -18529,11 +18534,13 @@ async function doctor(options) {
     const { isGfInstalled: isGfInstalled2, gfIsAuthenticated: gfIsAuthenticated2 } = await Promise.resolve().then(() => (init_tgit(), tgit_exports));
     checks.push(
       {
+        id: "provider.tgit.installed",
         name: "gf CLI is installed",
         check: async () => isGfInstalled2(),
         fix: "Run `teamai init` to install gf CLI automatically"
       },
       {
+        id: "provider.tgit.authenticated",
         name: "gf CLI is authenticated",
         check: async () => gfIsAuthenticated2(),
         fix: "Run `teamai init` to authenticate via gf auth login"
@@ -18543,11 +18550,13 @@ async function doctor(options) {
     const { isGhInstalled: isGhInstalled2, ghIsAuthenticated: ghIsAuthenticated2 } = await Promise.resolve().then(() => (init_github(), github_exports));
     checks.push(
       {
+        id: "provider.github.installed",
         name: "gh CLI is installed",
         check: async () => isGhInstalled2(),
         fix: "Install from https://cli.github.com/ or run `brew install gh`"
       },
       {
+        id: "provider.github.authenticated",
         name: "gh CLI is authenticated",
         check: async () => ghIsAuthenticated2(),
         fix: "Run `gh auth login` to authenticate"
@@ -18556,11 +18565,13 @@ async function doctor(options) {
   }
   checks.push(
     {
+      id: "config.local",
       name: `Local config exists (${configPathLabel})`,
       check: async () => localConfig !== null,
       fix: "Run `teamai init` to initialize"
     },
     {
+      id: "config.team-repo",
       name: "Team repo exists locally",
       check: async () => {
         if (!localConfig) return false;
@@ -18569,12 +18580,14 @@ async function doctor(options) {
       fix: "Run `teamai init` to clone the team repo"
     },
     {
+      id: "config.team",
       name: "Team config (teamai.yaml) is valid",
       check: async () => localConfig !== null && teamConfig !== null,
       fix: "Check teamai.yaml in team repo for syntax errors"
     },
     ...await buildHookChecks(toolPaths, baseDir),
     {
+      id: "environment.shell-profile",
       name: teamConfig?.sharing?.env?.injectShellProfile === false ? "Env variables are not injected (disabled by team policy)" : "Env variables injected in shell profile",
       check: async () => {
         if (teamConfig?.sharing?.env?.injectShellProfile === false) return true;
@@ -18595,12 +18608,13 @@ async function doctor(options) {
     ...specialHostDiagnostics.checks
   );
   const checkResults = [];
-  for (const { name, check, fix } of checks) {
+  for (const { id, name, check, fix } of checks) {
     try {
       const ok = await check();
-      checkResults.push({ name, ok, ...!ok && fix ? { fix } : {} });
+      checkResults.push({ id, name, ok, ...!ok && fix ? { fix } : {} });
     } catch (error) {
       checkResults.push({
+        id,
         name,
         ok: false,
         ...fix ? { fix } : {},

@@ -6,6 +6,7 @@ All notable changes to this project will be documented in this file. See [standa
 
 ### Added
 
+- **Autocode Core 0.20.0-autocode.5**: doctor JSON checks now expose stable IDs so focused host validation can ignore unrelated provider failures; identical DSH instruction files are reported as file evidence rather than inferred runtime loading.
 - **Autocode Core 0.20.0-autocode.4**: `teamai doctor --json` now returns a stable schema and the command exits nonzero when checks fail. WorkBuddy version discovery now covers common Windows executable locations and Appx metadata without changing system state.
 - **Autocode Core 0.20.0-autocode.3**: `teamai doctor` verifies selected WorkBuddy/DSH versions, bound roots, Skill entrypoints, and DSH instructions; macOS WorkBuddy discovery covers both system and user Applications directories.
 - **Autocode Core 0.20.0-autocode.2**: explicit-only WorkBuddy and DeepSeek Harness static-resource adapters. DSH uses its configured home for user Skills and `AGENTS.md`; both hosts persist and verify their bound roots before writes. Existing managed targets for unselected hosts retain their ownership records and backups.

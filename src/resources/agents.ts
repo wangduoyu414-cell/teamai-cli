@@ -3,7 +3,7 @@ import { ResourceHandler } from './base.js';
 import type { ResourceItem, ResourceItemStatus, TeamaiConfig, LocalConfig } from '../types.js';
 import { listFiles, pathExists, copyFile, ensureDir, remove, fileContentEqual, getFileMtime, writeFile, readFileSafe } from '../utils/fs.js';
 import { log } from '../utils/logger.js';
-import { resolveBaseDir, isAgentDisabled, isSelfMode } from '../types.js';
+import { resolveBaseDir, isSelfMode } from '../types.js';
 import { BUILTIN_AGENT_NAMES } from '../builtin-agents.js';
 import {
   parseAgentYaml,
@@ -22,10 +22,12 @@ import type { AgentSpec, ToolName, ReverseResult, ParseResult } from './agent-fo
 import { loadModelPolicy, resolveModelRef } from '../model-policy.js';
 import {
   managedManifestUnchangedTargetPaths,
+  loadManagedResourceManifest,
   reconcileManagedResources,
   type DesiredManagedResource,
 } from '../managed-resources.js';
 import { getTeamaiHome } from '../types.js';
+import { isHostSelected, supportsStaticResource } from '../host-adapters.js';
 
 /**
  * Extended ResourceItem for agents — carries merged spec or skip reason
@@ -51,6 +53,24 @@ export interface AgentResourceItem extends ResourceItem {
  */
 export class AgentsHandler extends ResourceHandler {
   readonly type = 'agents' as const;
+
+  private async resourceWithRetainedTargets(
+    name: string,
+    targets: DesiredManagedResource['targets'],
+    localConfig: LocalConfig,
+  ): Promise<DesiredManagedResource> {
+    const id = `agents:${name}`;
+    const manifest = await loadManagedResourceManifest(getTeamaiHome(localConfig.scope, localConfig.projectRoot));
+    const retainTargetPaths = (manifest.resources[id]?.targets ?? [])
+      .filter((target) => !target.tool || !isHostSelected(localConfig, target.tool))
+      .map((target) => target.path);
+    return {
+      id,
+      type: 'agents',
+      targets,
+      ...(retainTargetPaths.length > 0 ? { retainTargetPaths } : {}),
+    };
+  }
 
   /**
    * Scan local AI tool agents/ directories for files that are new or modified
@@ -110,7 +130,7 @@ export class AgentsHandler extends ResourceHandler {
     const grouped = new Map<string, Map<string, string>>(); // stem → (tool → filePath)
 
     for (const [tool, toolPath] of Object.entries(teamConfig.toolPaths)) {
-      if (!toolPath.agents) continue;
+      if (!toolPath.agents || !isHostSelected(localConfig, tool) || !supportsStaticResource(tool, 'agents', localConfig.scope)) continue;
       const agentsDir = path.join(baseDir, toolPath.agents);
       if (!await pathExists(agentsDir)) continue;
 
@@ -337,11 +357,11 @@ export class AgentsHandler extends ResourceHandler {
     if (isLegacy) {
       const legacyTools = new Set(['claude', 'claude-internal', 'tclaude', 'codebuddy']);
       for (const [tool, toolPath] of Object.entries(teamConfig.toolPaths)) {
-        if (!legacyTools.has(tool) || !toolPath.agents || isAgentDisabled(localConfig, tool)) continue;
+        if (!legacyTools.has(tool) || !toolPath.agents || !isHostSelected(localConfig, tool) || !supportsStaticResource(tool, 'agents', localConfig.scope)) continue;
         if (!await ResourceHandler.isToolInstalled(toolPath.agents, baseDir, toolPath.probe)) continue;
         targets.push({ path: path.join(baseDir, toolPath.agents, `${item.name}.md`), kind: 'file', tool, sourcePath: item.sourcePath });
       }
-      return { id: `agents:${item.name}`, type: 'agents', targets };
+      return this.resourceWithRetainedTargets(item.name, targets, localConfig);
     }
 
     const content = await readFileSafe(item.sourcePath);
@@ -370,7 +390,7 @@ export class AgentsHandler extends ResourceHandler {
         log.debug(`Skipping agent sync for ${tool}: tool not installed`);
         continue;
       }
-      if (isAgentDisabled(localConfig, tool)) continue;
+      if (!isHostSelected(localConfig, tool) || !supportsStaticResource(tool, 'agents', localConfig.scope)) continue;
 
       const renderSpec = await resolveAgentModel(spec, tool, localConfig.repo.localPath, teamConfig.modelPolicy);
       const rendered = renderForTool(renderSpec, tool);
@@ -383,7 +403,7 @@ export class AgentsHandler extends ResourceHandler {
         content: rendered.content,
       });
     }
-    return { id: `agents:${item.name}`, type: 'agents', targets };
+    return this.resourceWithRetainedTargets(item.name, targets, localConfig);
   }
 
   /**
@@ -408,7 +428,7 @@ export class AgentsHandler extends ResourceHandler {
     await this.addTombstone(name, localConfig);
 
     for (const [tool, toolPath] of Object.entries(teamConfig.toolPaths)) {
-      if (!toolPath.agents) continue;
+      if (!toolPath.agents || !isHostSelected(localConfig, tool) || !supportsStaticResource(tool, 'agents', localConfig.scope)) continue;
       // Try removing both .md and .toml variants
       for (const ext of ['.md', '.toml'] as const) {
         const filePath = path.join(baseDir, toolPath.agents, `${name}${ext}`);
@@ -446,7 +466,7 @@ export class AgentsHandler extends ResourceHandler {
         log.debug(`Skipping legacy agent sync for ${tool}: tool not installed`);
         continue;
       }
-      if (isAgentDisabled(localConfig, tool)) continue;
+      if (!isHostSelected(localConfig, tool) || !supportsStaticResource(tool, 'agents', localConfig.scope)) continue;
 
       const destDir = path.join(baseDir, toolPath.agents);
       try {

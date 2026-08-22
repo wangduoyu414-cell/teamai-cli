@@ -1,6 +1,7 @@
 import fse from 'fs-extra';
 import crypto from 'node:crypto';
 import path from 'node:path';
+import os from 'node:os';
 import { log } from './logger.js';
 
 const IGNORED_NAMES = new Set([
@@ -20,7 +21,7 @@ function isIgnored(name: string): boolean {
  */
 export function expandHome(p: string): string {
   if (p.startsWith('~/') || p === '~') {
-    return path.join(process.env.HOME ?? '', p.slice(1));
+    return path.join(os.homedir(), p.slice(1));
   }
   return p;
 }

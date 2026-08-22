@@ -39,6 +39,7 @@ import {
 import { log } from './utils/logger.js';
 import { askConfirmation } from './utils/prompt.js';
 import { managedManifestTargetPaths, uninstallManagedResources } from './managed-resources.js';
+import { EXPLICIT_ONLY_HOSTS, homeDir, normalizeHostId, resolveHostResourcePath, supportsStaticResource } from './host-adapters.js';
 
 // ─── Types ─────────────────────────────────────────────
 
@@ -111,8 +112,7 @@ const CLAUDEMD_MARKER_PAIRS: Array<[string, string]> = [
 ];
 
 function detectShellProfile(): string | null {
-  const home = process.env.HOME;
-  if (!home) return null;
+  const home = homeDir();
   const shell = process.env.SHELL ?? '';
   if (shell.includes('zsh')) {
     return path.join(home, '.zshrc');
@@ -176,7 +176,7 @@ function isEmptyHooksResidue(parsed: Record<string, unknown> | null): boolean {
 async function discoverToolResources(
   tool: string,
   toolPath: TeamaiConfig['toolPaths'][string],
-  baseDir: string,
+  localConfig: LocalConfig,
   teamSkillNames: Set<string>,
   teamRuleNames: Set<string>,
   managedHooksPath: string,
@@ -185,6 +185,23 @@ async function discoverToolResources(
     hookFiles: [], openclawHookDirs: [], claudeMdFiles: [],
     skillDirs: [], ruleFiles: [], agentFiles: [],
   };
+  const baseDir = resolveBaseDir(localConfig);
+
+  // Special hosts have product-owned roots and a deliberately narrow contract.
+  // Legacy name-based cleanup may inspect only their supported Skills path;
+  // settings, hooks, rules, agents, MCP, and instruction files stay untouched
+  // unless the ownership ledger has an exact record for them.
+  if (EXPLICIT_ONLY_HOSTS.has(normalizeHostId(tool))) {
+    if (toolPath.skills && supportsStaticResource(tool, 'skills', localConfig.scope)) {
+      const skillsDir = resolveHostResourcePath(tool, 'skills', localConfig);
+      if (skillsDir && await pathExists(skillsDir)) {
+        for (const dir of await listDirs(skillsDir)) {
+          if (teamSkillNames.has(dir)) res.skillDirs.push(path.join(skillsDir, dir));
+        }
+      }
+    }
+    return res;
+  }
 
   // (a) Hooks — settings.json / hooks.json
   if (toolPath.settings) {
@@ -284,7 +301,7 @@ async function buildRemovalPlan(
 
   // Also include resources installed by local-agent (HTTP distribution)
   const localAgentManifestPath = path.join(
-    process.env.HOME ?? '', '.teamai', 'local-agent', 'manifest.json',
+    homeDir(), '.teamai', 'local-agent', 'manifest.json',
   );
   if (await pathExists(localAgentManifestPath)) {
     try {
@@ -305,7 +322,7 @@ async function buildRemovalPlan(
   for (const [tool, toolPath] of Object.entries(teamConfig.toolPaths)) {
     perTool.set(
       tool,
-      await discoverToolResources(tool, toolPath, baseDir, teamSkillNames, teamRuleNames, managedHooksPath),
+      await discoverToolResources(tool, toolPath, localConfig, teamSkillNames, teamRuleNames, managedHooksPath),
     );
   }
 
@@ -678,7 +695,8 @@ export async function uninstall(opts: UninstallOptions): Promise<void> {
     let agentKey: string | undefined = opts.agent;
     if (opts.agent) {
       const tools = Object.keys(teamConfig.toolPaths);
-      const matched = tools.find((t) => t.toLowerCase() === opts.agent!.toLowerCase());
+      const requested = normalizeHostId(opts.agent);
+      const matched = tools.find((t) => normalizeHostId(t) === requested);
       if (!matched) {
         log.error(`Unknown tool "${opts.agent}". Available tools: ${tools.join(', ')}`);
         process.exitCode = 2;
@@ -686,6 +704,7 @@ export async function uninstall(opts: UninstallOptions): Promise<void> {
       }
       agentKey = matched; // normalize to canonical toolPaths key
     }
+    const configAgentKey = agentKey ? normalizeHostId(agentKey) : undefined;
     const lifecycleHome = getTeamaiHome(localConfig.scope, localConfig.projectRoot);
     const lifecyclePlan = await uninstallManagedResources(lifecycleHome, { tool: agentKey, plan: true });
     const managedPaths = await managedManifestTargetPaths(lifecycleHome);
@@ -696,7 +715,11 @@ export async function uninstall(opts: UninstallOptions): Promise<void> {
     plan.agentFiles = plan.agentFiles.filter((entry) => !managedPaths.has(entry));
     plan.claudeMdFiles = plan.claudeMdFiles.filter((entry) => !managedPaths.has(entry));
 
-    if (isPlanEmpty(plan) && lifecyclePlan.planned.length === 0 && lifecyclePlan.conflicts.length === 0) {
+    const hasTargetConfigState = configAgentKey !== undefined && (
+      localConfig.hostRoots?.[configAgentKey] !== undefined
+      || localConfig.enabledAgents?.some((tool) => normalizeHostId(tool) === configAgentKey) === true
+    );
+    if (isPlanEmpty(plan) && lifecyclePlan.planned.length === 0 && lifecyclePlan.conflicts.length === 0 && !hasTargetConfigState) {
       log.info('没有需要卸载的内容');
       return;
     }
@@ -753,7 +776,7 @@ export async function uninstall(opts: UninstallOptions): Promise<void> {
     // hook) does not resurrect this tool's resources. Only meaningful when the
     // shared ~/.teamai home survives (non-last-tool uninstall); on a last-tool
     // uninstall the home is deleted and there is nothing to persist.
-    if (agentKey && !plan.includeShared) {
+    if (agentKey && configAgentKey && !plan.includeShared) {
       const cfg = localConfig!;
       // Only prune an existing whitelist. Leaving `enabledAgents` undefined
       // (meaning "all tools") as-is is important: collapsing it to [] would be
@@ -761,10 +784,14 @@ export async function uninstall(opts: UninstallOptions): Promise<void> {
       // remaining tools too. The disabledAgents exclusion below is what actually
       // keeps the uninstalled tool out on the next pull.
       if (cfg.enabledAgents) {
-        cfg.enabledAgents = cfg.enabledAgents.filter((t) => t !== agentKey);
+        cfg.enabledAgents = cfg.enabledAgents.filter((t) => normalizeHostId(t) !== configAgentKey);
       }
       const prevDisabled = cfg.disabledAgents ?? [];
-      cfg.disabledAgents = [...new Set([...prevDisabled, agentKey])];
+      cfg.disabledAgents = [...new Set([...prevDisabled.map(normalizeHostId), configAgentKey])];
+      if (lifecycleResult.conflicts.length === 0 && cfg.hostRoots?.[configAgentKey]) {
+        const { [configAgentKey]: _removed, ...remainingRoots } = cfg.hostRoots;
+        cfg.hostRoots = Object.keys(remainingRoots).length > 0 ? remainingRoots : undefined;
+      }
       if (cfg.scope === 'project') {
         await saveLocalConfigForScope(cfg, cfg.scope, cfg.projectRoot);
       } else {
@@ -780,12 +807,7 @@ export async function uninstall(opts: UninstallOptions): Promise<void> {
       process.exitCode = 2;
       return;
     }
-    const homeDir = process.env.HOME;
-    if (!homeDir) {
-      log.error('无法确定用户主目录（HOME 环境变量未设置）');
-      return;
-    }
-    const home = path.join(homeDir, '.teamai');
+    const home = path.join(homeDir(), '.teamai');
     if (!await pathExists(home)) {
       log.info('没有需要卸载的内容');
       return;

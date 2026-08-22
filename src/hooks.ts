@@ -7,15 +7,15 @@ import { builtinHookDefs, applyBuiltinOverride, ensureWrapperIfShellAvailable, S
 import { isBuiltinEnabled } from './types.js';
 import type { BuiltinHookOverride } from './builtin-hooks.js';
 import { resolveTeamHooks } from './resources/hooks.js';
+import { EXPLICIT_ONLY_HOSTS, normalizeHostId } from './host-adapters.js';
 
 /**
  * Lobster-family agents (OpenClaw engine) that use HOOK.md + handler.ts instead
  * of settings.json (issue #1, 方案二 §四).
  *
- * WorkBuddy is intentionally NOT here: it reads Claude-format hooks from
- * ~/.workbuddy/settings.json (verified on 5.2.0), so it routes through the
- * settings-based injection path like codebuddy. The remaining claw variants
- * stay on the OpenClaw HOOK.md path pending real-device confirmation.
+ * WorkBuddy's low-level Claude-format adapter remains for backward-compatible
+ * cleanup/tests, but fleet reconciliation excludes explicit-only static hosts
+ * and therefore never writes its settings file.
  */
 export const OPENCLAW_TOOLS = new Set(['openclaw', 'qclaw', 'easyclaw', 'autoclaw']);
 
@@ -728,7 +728,9 @@ export async function hasTeamaiHooks(
  */
 export async function injectHooksToAllTools(toolPaths: Record<string, { settings?: string }>, baseDir?: string, filterAgents?: string[]): Promise<void> {
   const resolvedBaseDir = baseDir ?? (process.env.HOME ?? '');
-  const tools = Object.keys(toolPaths).filter(t => !filterAgents || filterAgents.includes(t));
+  const tools = Object.keys(toolPaths)
+    .filter((tool) => !EXPLICIT_ONLY_HOSTS.has(normalizeHostId(tool)))
+    .filter((tool) => !filterAgents || filterAgents.includes(tool));
   let shellAvailable = true;
   if (tools.some(t => SHELL_DEPENDENT_TOOLS.has(t))) {
     shellAvailable = ensureWrapperIfShellAvailable();
@@ -740,6 +742,7 @@ export async function injectHooksToAllTools(toolPaths: Record<string, { settings
     }
   }
   for (const [tool, paths] of Object.entries(toolPaths)) {
+    if (EXPLICIT_ONLY_HOSTS.has(normalizeHostId(tool))) continue;
     if (filterAgents && !filterAgents.includes(tool)) continue;
     if (!shellAvailable && SHELL_DEPENDENT_TOOLS.has(tool)) continue;
     if (paths.settings) {
@@ -784,7 +787,9 @@ export async function reconcileHooksToAllTools(
   manifestPath: string,
   opts: { removeAll?: boolean; builtinOverride?: BuiltinHookOverride; filterAgents?: string[] } = {},
 ): Promise<void> {
-  const activeTools = Object.keys(toolPaths).filter(t => !opts.filterAgents || opts.filterAgents.includes(t));
+  const activeTools = Object.keys(toolPaths)
+    .filter((tool) => !EXPLICIT_ONLY_HOSTS.has(normalizeHostId(tool)))
+    .filter((tool) => !opts.filterAgents || opts.filterAgents.includes(tool));
   let shellAvailable = true;
   if (activeTools.some(t => SHELL_DEPENDENT_TOOLS.has(t))) {
     shellAvailable = ensureWrapperIfShellAvailable();
@@ -796,6 +801,7 @@ export async function reconcileHooksToAllTools(
     }
   }
   for (const [tool, paths] of Object.entries(toolPaths)) {
+    if (EXPLICIT_ONLY_HOSTS.has(normalizeHostId(tool))) continue;
     if (opts.filterAgents && !opts.filterAgents.includes(tool)) continue;
     if (!shellAvailable && SHELL_DEPENDENT_TOOLS.has(tool)) continue;
     // Hermes uses config.yaml (YAML) + a script dir + allowlist instead of a

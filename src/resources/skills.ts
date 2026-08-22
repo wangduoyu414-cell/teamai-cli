@@ -1,14 +1,15 @@
 import path from 'node:path';
 import { ResourceHandler } from './base.js';
 import type { ResourceItem, ResourceItemStatus, TeamaiConfig, LocalConfig } from '../types.js';
-import { resolveBaseDir, getPushignorePath, isAgentDisabled } from '../types.js';
+import { resolveBaseDir, getPushignorePath } from '../types.js';
 import { listDirs, pathExists, copyDir, remove, dirTeamSubsetEqual, getDirLatestMtime, readFileSafe, writeFile } from '../utils/fs.js';
 import { log } from '../utils/logger.js';
 import { BUILTIN_SKILL_NAMES } from '../builtin-skills.js';
 import { resolveOpenclawWorkspaceDir } from '../openclaw-hooks.js';
 import { loadRolesManifest, resolveRoleResourceNamespaces } from '../roles.js';
-import { reconcileManagedResources, type DesiredManagedResource } from '../managed-resources.js';
+import { loadManagedResourceManifest, reconcileManagedResources, type DesiredManagedResource } from '../managed-resources.js';
 import { getTeamaiHome } from '../types.js';
+import { assertHostRootsStable, isHostSelected, resolveHostResourcePath, resolveHostRoot, supportsStaticResource } from '../host-adapters.js';
 
 /** File name used to track who has contributed (pushed) a skill. */
 const CONTRIBUTORS_FILE = 'CONTRIBUTORS';
@@ -303,9 +304,10 @@ export class SkillsHandler extends ResourceHandler {
     const candidates = new Map<string, { sourcePath: string; mtime: number; status: ResourceItemStatus; namespace?: string }>();
 
     // Scan each tool's skills directory
-    for (const [_tool, toolPath] of Object.entries(teamConfig.toolPaths)) {
-      if (!toolPath.skills) continue;
-      const skillsDir = path.join(resolveBaseDir(localConfig), toolPath.skills);
+    for (const [tool, toolPath] of Object.entries(teamConfig.toolPaths)) {
+      if (!toolPath.skills || !isHostSelected(localConfig, tool) || !supportsStaticResource(tool, 'skills', localConfig.scope)) continue;
+      const skillsDir = resolveHostResourcePath(tool, 'skills', localConfig)
+        ?? path.join(resolveBaseDir(localConfig), toolPath.skills);
       if (!await pathExists(skillsDir)) continue;
 
       // Use recursive scanning to find all skills at any depth
@@ -443,11 +445,13 @@ export class SkillsHandler extends ResourceHandler {
     teamConfig: TeamaiConfig,
     localConfig: LocalConfig,
   ): Promise<DesiredManagedResource> {
+    assertHostRootsStable(localConfig);
     const baseDir = resolveBaseDir(localConfig);
     const targets: DesiredManagedResource['targets'] = [];
     for (const [tool, toolPath] of Object.entries(teamConfig.toolPaths)) {
-      if (isAgentDisabled(localConfig, tool) || !toolPath.skills) continue;
+      if (!isHostSelected(localConfig, tool) || !supportsStaticResource(tool, 'skills', localConfig.scope) || !toolPath.skills) continue;
       let dest: string | null = null;
+      const specialSkillsDir = resolveHostResourcePath(tool, 'skills', localConfig);
       if (tool === 'openclaw') {
         const wsDir = await resolveOpenclawWorkspaceDir();
         if (!wsDir) {
@@ -456,17 +460,19 @@ export class SkillsHandler extends ResourceHandler {
         }
         dest = path.join(wsDir, 'skills', item.name);
       } else {
-        if (!await ResourceHandler.isToolInstalled(toolPath.skills, baseDir, toolPath.probe)) {
+        const specialRoot = resolveHostRoot(tool, localConfig.scope, localConfig.projectRoot);
+        if (!await ResourceHandler.isToolInstalled(toolPath.skills, baseDir, toolPath.probe, specialRoot)) {
           log.debug(`Skipping skill sync for ${tool}: tool not installed`);
           continue;
         }
-        dest = path.join(baseDir, toolPath.skills, item.name);
+        dest = path.join(specialSkillsDir ?? path.join(baseDir, toolPath.skills), item.name);
       }
       if (dest) {
         targets.push({
           path: dest,
           kind: 'directory',
           tool,
+          ...(specialSkillsDir ? { hostRoot: path.dirname(specialSkillsDir) } : {}),
           sourcePath: item.sourcePath,
           // Preserve pull's historic destination-only frontmatter repair without
           // mutating the team checkout that supplied the resource.
@@ -474,7 +480,20 @@ export class SkillsHandler extends ResourceHandler {
         });
       }
     }
-    return { id: `skills:${item.name}`, type: 'skills', targets };
+    const home = getTeamaiHome(localConfig.scope, localConfig.projectRoot);
+    const manifest = await loadManagedResourceManifest(home);
+    const priorTargets = manifest.resources[`skills:${item.name}`]?.targets ?? [];
+    // An allowlist controls new materialization; it must never silently discard
+    // ownership/backups for an unselected host. Explicit uninstall is the removal path.
+    const retainTargetPaths = priorTargets
+      .filter((target) => !target.tool || !isHostSelected(localConfig, target.tool))
+      .map((target) => target.path);
+    return {
+      id: `skills:${item.name}`,
+      type: 'skills',
+      targets,
+      ...(retainTargetPaths.length > 0 ? { retainTargetPaths } : {}),
+    };
   }
 
   /**
@@ -507,14 +526,14 @@ export class SkillsHandler extends ResourceHandler {
 
     // Remove from each tool's skills directory
     for (const [tool, toolPath] of Object.entries(teamConfig.toolPaths)) {
-      if (!toolPath.skills) continue;
+      if (!toolPath.skills || !isHostSelected(localConfig, tool) || !supportsStaticResource(tool, 'skills', localConfig.scope)) continue;
       let skillDir: string;
       if (tool === 'openclaw') {
         const wsDir = await resolveOpenclawWorkspaceDir();
         if (!wsDir) continue;
         skillDir = path.join(wsDir, 'skills', name);
       } else {
-        skillDir = path.join(baseDir, toolPath.skills, name);
+        skillDir = path.join(resolveHostResourcePath(tool, 'skills', localConfig) ?? path.join(baseDir, toolPath.skills), name);
       }
       if (await pathExists(skillDir)) {
         await remove(skillDir);

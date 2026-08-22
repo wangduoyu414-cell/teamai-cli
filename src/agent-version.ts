@@ -9,6 +9,7 @@
 
 import { execFile } from 'node:child_process';
 import { readFile } from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 import { log } from './utils/logger.js';
 
@@ -72,6 +73,7 @@ async function detectCodebuddyIdeVersion(): Promise<string> {
 }
 
 const WORKBUDDY_APP_PATHS = [
+  path.join(os.homedir(), 'Applications', 'WorkBuddy.app'),
   '/Applications/WorkBuddy.app',
 ];
 
@@ -81,6 +83,11 @@ async function detectWorkbuddyVersion(): Promise<string> {
     if (ver) return ver;
   }
   return '';
+}
+
+async function detectDshVersion(): Promise<string> {
+  const raw = await execVersion('dsh');
+  return raw.split(/\s+/)[0]?.trim() ?? '';
 }
 
 async function detectHermesVersion(): Promise<string> {
@@ -106,6 +113,7 @@ const DETECTORS: Record<string, VersionDetector> = {
   codebuddy: detectCodebuddyCliVersion,
   'codebuddy-ide': detectCodebuddyIdeVersion,
   workbuddy: detectWorkbuddyVersion,
+  dsh: detectDshVersion,
   hermes: detectHermesVersion,
   openclaw: detectOpenclawVersion,
 };
@@ -137,5 +145,8 @@ export function clearVersionCache(): void {
   VERSION_CACHE.clear();
 }
 
-/** Exposed for testing: the plist-reading utility. */
-export { readPlistVersion as _readPlistVersion };
+/** Exposed for testing: plist lookup and WorkBuddy's supported macOS locations. */
+export {
+  readPlistVersion as _readPlistVersion,
+  WORKBUDDY_APP_PATHS as _workbuddyAppPaths,
+};

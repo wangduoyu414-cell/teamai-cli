@@ -18,7 +18,7 @@ Git-native management of skills, rules, and docs across Claude Code / Codex / Co
 
 For you or your whole team.
 
-> This fork is the pinned TeamAI Core used by the Autocode resource repository. It keeps upstream v0.20.0 behavior while adding strict host-aware Agent rendering and manifest-backed resource lifecycle safety. It is installed from an immutable commit archive, not from npm.
+> This fork is the pinned TeamAI Core used by the Autocode resource repository. It keeps upstream v0.20.0 behavior while adding strict host-aware Agent rendering and manifest-backed resource lifecycle safety. Version `0.20.0-autocode.2` adds explicit-only WorkBuddy/DeepSeek Harness static-resource adapters, persisted host-root drift protection, and DSH `0.1.1-rc.1` contract diagnostics. It is installed from an immutable commit archive, not from npm.
 
 ## Quick Start
 

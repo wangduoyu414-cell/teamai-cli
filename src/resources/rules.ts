@@ -3,8 +3,9 @@ import { ResourceHandler } from './base.js';
 import type { ResourceItem, ResourceItemStatus, TeamaiConfig, LocalConfig } from '../types.js';
 import { listFilesRecursive, pathExists, copyFile, ensureDir, remove, fileContentEqual, getFileMtime, listDirs, readFileSafe, writeFile } from '../utils/fs.js';
 import { log } from '../utils/logger.js';
-import { TEAMAI_RULES_START, TEAMAI_RULES_END, resolveBaseDir, isAgentDisabled } from '../types.js';
+import { TEAMAI_RULES_START, TEAMAI_RULES_END, resolveBaseDir } from '../types.js';
 import { EXCLUDED_RULE_NAMES } from '../builtin-rules.js';
+import { isHostSelected, supportsStaticResource } from '../host-adapters.js';
 
 export class RulesHandler extends ResourceHandler {
   readonly type = 'rules' as const;
@@ -31,7 +32,8 @@ export class RulesHandler extends ResourceHandler {
     const candidates = new Map<string, { sourcePath: string; mtime: number; status: ResourceItemStatus }>();
 
     // Scan each tool's rules/ directory (recursively)
-    for (const [_tool, toolPath] of Object.entries(teamConfig.toolPaths)) {
+    for (const [tool, toolPath] of Object.entries(teamConfig.toolPaths)) {
+      if (!isHostSelected(localConfig, tool) || !supportsStaticResource(tool, 'rules', localConfig.scope)) continue;
       const rulesPath = toolPath.rules;
       if (!rulesPath) continue;
       const rulesDir = path.join(resolveBaseDir(localConfig), rulesPath);
@@ -120,7 +122,7 @@ export class RulesHandler extends ResourceHandler {
   async pullItem(item: ResourceItem, teamConfig: TeamaiConfig, localConfig: LocalConfig): Promise<void> {
     const baseDir = resolveBaseDir(localConfig);
     for (const [tool, toolPath] of Object.entries(teamConfig.toolPaths)) {
-      if (isAgentDisabled(localConfig, tool)) continue;
+      if (!isHostSelected(localConfig, tool) || !supportsStaticResource(tool, 'rules', localConfig.scope)) continue;
       if (!toolPath.rules) continue;
 
       // Skip tools that are not installed
@@ -161,7 +163,7 @@ export class RulesHandler extends ResourceHandler {
 
     // Remove from each tool's rules directory
     for (const [tool, toolPath] of Object.entries(teamConfig.toolPaths)) {
-      if (!toolPath.rules) continue;
+      if (!toolPath.rules || !isHostSelected(localConfig, tool) || !supportsStaticResource(tool, 'rules', localConfig.scope)) continue;
       const filePath = path.join(baseDir, toolPath.rules, fileName);
       if (await pathExists(filePath)) {
         await remove(filePath);
@@ -190,7 +192,7 @@ export class RulesHandler extends ResourceHandler {
     // Hermes: inline all team rules into a teamai-managed block in SOUL.md
     // (user-level standing instructions). Only when Hermes is actually
     // installed — never create ~/.hermes for users who don't use it.
-    if (!isAgentDisabled(localConfig, 'hermes')) {
+    if (isHostSelected(localConfig, 'hermes')) {
       const { getHermesHome } = await import('../hermes-home.js');
       if (await pathExists(getHermesHome())) {
         const bodies: string[] = [];
@@ -214,7 +216,7 @@ export class RulesHandler extends ResourceHandler {
     const teamRuleFiles = new Set(rules.map((r) => `${r.name}.md`));
     const baseDir = resolveBaseDir(localConfig);
     for (const [tool, toolPath] of Object.entries(teamConfig.toolPaths)) {
-      if (!toolPath.rules) continue;
+      if (!toolPath.rules || !isHostSelected(localConfig, tool) || !supportsStaticResource(tool, 'rules', localConfig.scope)) continue;
       if (!await ResourceHandler.isToolInstalled(toolPath.rules, baseDir)) continue;
 
       const destDir = path.join(baseDir, toolPath.rules);
@@ -238,7 +240,8 @@ export class RulesHandler extends ResourceHandler {
     }
 
     // 2. Remove legacy rules section from CLAUDE.md (no longer injected)
-    for (const [, toolPath] of Object.entries(teamConfig.toolPaths)) {
+    for (const [tool, toolPath] of Object.entries(teamConfig.toolPaths)) {
+      if (!isHostSelected(localConfig, tool) || !supportsStaticResource(tool, 'rules', localConfig.scope)) continue;
       if (!toolPath.claudemd) continue;
       const claudeMdPath = path.join(baseDir, toolPath.claudemd);
       try {

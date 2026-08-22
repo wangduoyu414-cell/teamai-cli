@@ -1,8 +1,9 @@
 import path from 'node:path';
+import { readdir } from 'node:fs/promises';
 import { detectProjectConfig, loadLocalConfig, loadTeamConfig } from './config.js';
 import { pathExists, readFileSafe } from './utils/fs.js';
 import { log } from './utils/logger.js';
-import type { GlobalOptions, Scope } from './types.js';
+import type { GlobalOptions, LocalConfig, Scope } from './types.js';
 import {
   TeamaiConfigSchema,
   TEAMAI_ENV_START,
@@ -10,11 +11,113 @@ import {
   type TeamaiConfig,
 } from './types.js';
 import { TEAMAI_HOOK_SUBCOMMANDS } from './hooks.js';
+import {
+  DSH_EXACT_VERSION,
+  WORKBUDDY_VALIDATED_VERSION,
+  homeDir,
+  isHostSelected,
+  resolveHostResourcePath,
+  resolveHostRoot,
+} from './host-adapters.js';
+import { getAgentVersion } from './agent-version.js';
 
 interface Check {
   name: string;
   check: () => Promise<boolean>;
   fix?: string;
+}
+
+interface SpecialHostDiagnostics {
+  checks: Check[];
+  notices: string[];
+}
+
+async function canonicalSkillNames(repoRoot: string): Promise<string[]> {
+  const skillsRoot = path.join(repoRoot, 'skills');
+  try {
+    const entries = await readdir(skillsRoot, { withFileTypes: true });
+    const names: string[] = [];
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      if (await pathExists(path.join(skillsRoot, entry.name, 'SKILL.md'))) names.push(entry.name);
+    }
+    return names.sort();
+  } catch {
+    return [];
+  }
+}
+
+async function filesMatch(left: string, right: string): Promise<boolean> {
+  const [leftText, rightText] = await Promise.all([readFileSafe(left), readFileSafe(right)]);
+  return leftText !== null && leftText === rightText;
+}
+
+async function buildSpecialHostDiagnostics(
+  localConfig: LocalConfig | null,
+  teamConfig: TeamaiConfig | null,
+): Promise<SpecialHostDiagnostics> {
+  const diagnostics: SpecialHostDiagnostics = { checks: [], notices: [] };
+  if (!localConfig) return diagnostics;
+
+  const selectedHosts = ['workbuddy', 'dsh'].filter((host) => isHostSelected(localConfig, host));
+  if (selectedHosts.length === 0) return diagnostics;
+
+  const skillNames = await canonicalSkillNames(localConfig.repo.localPath);
+  for (const host of selectedHosts) {
+    const root = localConfig.hostRoots?.[host]
+      ?? resolveHostRoot(host, localConfig.scope, localConfig.projectRoot);
+    const version = await getAgentVersion(host);
+    const expectedVersion = host === 'dsh' ? DSH_EXACT_VERSION : WORKBUDDY_VALIDATED_VERSION;
+    const displayName = host === 'dsh' ? 'DSH' : 'WorkBuddy';
+
+    diagnostics.notices.push(
+      `${displayName} support evidence: synchronized entrypoints are checked here; runtime loading is a separate host smoke check`,
+    );
+    diagnostics.checks.push(
+      {
+        name: `${displayName} host root is available (${root ?? 'unresolved'})`,
+        check: async () => Boolean(root && await pathExists(root)),
+        fix: `Run targeted uninstall, then re-run \`teamai init --agent ${host}\` to bind the current host root`,
+      },
+      {
+        name: `${displayName} version matches ${expectedVersion} (detected: ${version || 'unavailable'})`,
+        check: async () => version === expectedVersion,
+        fix: host === 'dsh'
+          ? `Install DSH ${expectedVersion} before syncing`
+          : `Use WorkBuddy ${expectedVersion}, or revalidate the new version before treating it as supported`,
+      },
+      {
+        name: `${displayName} has all ${skillNames.length} canonical Skill entrypoints`,
+        check: async () => {
+          if (!root || skillNames.length === 0) return false;
+          const results = await Promise.all(
+            skillNames.map((name) => pathExists(path.join(root, 'skills', name, 'SKILL.md'))),
+          );
+          return results.every(Boolean);
+        },
+        fix: 'Run `teamai pull` to restore missing managed Skill entrypoints',
+      },
+    );
+
+    if (host === 'dsh') {
+      const source = teamConfig?.sharing?.instructions?.source;
+      const target = resolveHostResourcePath('dsh', 'instructions', localConfig);
+      diagnostics.checks.push({
+        name: 'DSH managed AGENTS.md matches the canonical instruction source',
+        check: async () => Boolean(source && target && await filesMatch(path.join(localConfig.repo.localPath, source), target)),
+        fix: 'Run `teamai pull` to restore the managed DSH instruction file',
+      });
+
+      const projectInstructions = path.join(process.cwd(), 'AGENTS.md');
+      if (localConfig.scope === 'user' && target && await pathExists(projectInstructions)
+        && await filesMatch(projectInstructions, target)) {
+        diagnostics.notices.push(
+          'DSH is loading identical user-level and project-level AGENTS.md content in this workspace; this is safe but duplicates context',
+        );
+      }
+    }
+  }
+  return diagnostics;
 }
 
 /**
@@ -56,6 +159,20 @@ export async function doctor(options: GlobalOptions): Promise<void> {
     : '~/.teamai/config.yaml';
 
   console.log(`  Scope: ${scope}${scope === 'project' && localConfig?.projectRoot ? ` (${localConfig.projectRoot})` : ''}\n`);
+  const dshSelected = Boolean(localConfig && isHostSelected(localConfig, 'dsh'));
+  const workbuddySelected = Boolean(localConfig && isHostSelected(localConfig, 'workbuddy'));
+  const dshRoot = dshSelected
+    ? localConfig?.hostRoots?.dsh ?? resolveHostRoot('dsh', scope, localConfig?.projectRoot)
+    : undefined;
+  const workbuddyRoot = workbuddySelected
+    ? localConfig?.hostRoots?.workbuddy ?? resolveHostRoot('workbuddy', scope, localConfig?.projectRoot)
+    : undefined;
+  console.log(`  DSH: ${dshSelected ? `selected (${dshRoot})` : 'not selected'}`);
+  console.log(`  WorkBuddy: ${workbuddySelected ? `selected (${workbuddyRoot})` : 'not selected'}`);
+  if (dshSelected) {
+    console.log(`  DSH shared Agents root: ${process.env.DSH_AGENTS_HOME?.trim() || '~/.agents'} (read-only compatibility path; TeamAI does not manage it as DSH)`);
+  }
+  console.log('');
 
   // Try to load team config for dynamic tool paths and provider
   let teamConfig: TeamaiConfig | null = null;
@@ -65,9 +182,12 @@ export async function doctor(options: GlobalOptions): Promise<void> {
   // Fall back to schema defaults if team config is unavailable
   const toolPaths = teamConfig?.toolPaths ?? TeamaiConfigSchema.shape.toolPaths.parse(undefined);
   const providerName = teamConfig?.provider ?? 'tgit';
-  const baseDir = localConfig ? resolveBaseDir(localConfig) : (process.env.HOME ?? '');
+  const baseDir = localConfig ? resolveBaseDir(localConfig) : homeDir();
 
   const checks: Check[] = [];
+  const specialHostDiagnostics = await buildSpecialHostDiagnostics(localConfig, teamConfig);
+  for (const notice of specialHostDiagnostics.notices) console.log(`  ⚠ ${notice}`);
+  if (specialHostDiagnostics.notices.length > 0) console.log('');
 
   // Provider-specific checks: gf CLI only needed for TGit, gh CLI for GitHub
   if (providerName === 'tgit') {
@@ -127,7 +247,9 @@ export async function doctor(options: GlobalOptions): Promise<void> {
     },
     ...await buildHookChecks(toolPaths, baseDir),
     {
-      name: 'Env variables injected in shell profile',
+      name: teamConfig?.sharing?.env?.injectShellProfile === false
+        ? 'Env variables are not injected (disabled by team policy)'
+        : 'Env variables injected in shell profile',
       check: async () => {
         if (teamConfig?.sharing?.env?.injectShellProfile === false) return true;
 
@@ -135,7 +257,7 @@ export async function doctor(options: GlobalOptions): Promise<void> {
         const envYamlPath = path.join(localConfig.repo.localPath, 'env', 'env.yaml');
         if (!await pathExists(envYamlPath)) return true;
 
-        const home = process.env.HOME ?? '';
+        const home = homeDir();
 
         const envShPath = path.join(home, '.teamai', 'env.sh');
         if (!await pathExists(envShPath)) return false;
@@ -150,6 +272,7 @@ export async function doctor(options: GlobalOptions): Promise<void> {
       },
       fix: 'Run `teamai pull` to inject env variables into shell profile',
     },
+    ...specialHostDiagnostics.checks,
   );
 
   let allPassed = true;

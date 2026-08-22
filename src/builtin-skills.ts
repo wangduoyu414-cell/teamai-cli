@@ -5,7 +5,8 @@ import fse from 'fs-extra';
 import { pathExists } from './utils/fs.js';
 import { log } from './utils/logger.js';
 import type { TeamaiConfig, LocalConfig } from './types.js';
-import { resolveBaseDir, isAgentDisabled, isBuiltinEnabled } from './types.js';
+import { resolveBaseDir, isBuiltinEnabled } from './types.js';
+import { homeDir, isHostSelected, resolveHostResourcePath, resolveHostRoot, supportsStaticResource } from './host-adapters.js';
 import { ResourceHandler } from './resources/base.js';
 import { ensureSkillFrontmatter } from './resources/skills.js';
 
@@ -97,20 +98,22 @@ export async function deployBuiltinSkills(teamConfig: TeamaiConfig, localConfig?
 
   if (skillNames.length === 0) return 0;
 
-  const baseDir = localConfig ? resolveBaseDir(localConfig) : (process.env.HOME ?? '');
+  const baseDir = localConfig ? resolveBaseDir(localConfig) : homeDir();
   let deployed = 0;
 
   for (const [tool, toolPath] of Object.entries(teamConfig.toolPaths)) {
     if (!toolPath.skills) continue;
 
     // Skip tools that are not installed
-    if (!await ResourceHandler.isToolInstalled(toolPath.skills, baseDir, toolPath.probe)) {
+    if (!await ResourceHandler.isToolInstalled(toolPath.skills, baseDir, toolPath.probe, localConfig ? resolveHostRoot(tool, localConfig.scope, localConfig.projectRoot) : undefined)) {
       log.debug(`Skipping built-in skill deployment for ${tool}: tool not installed`);
       continue;
     }
-    if (localConfig && isAgentDisabled(localConfig, tool)) continue;
+    if (localConfig && (!isHostSelected(localConfig, tool) || !supportsStaticResource(tool, 'skills', localConfig.scope))) continue;
 
-    const targetSkillsDir = path.join(baseDir, toolPath.skills);
+    const targetSkillsDir = localConfig
+      ? (resolveHostResourcePath(tool, 'skills', localConfig) ?? path.join(baseDir, toolPath.skills))
+      : path.join(baseDir, toolPath.skills);
 
     for (const skillName of skillNames) {
       if (!isBuiltinEnabled(teamConfig, 'skills', skillName)) continue;

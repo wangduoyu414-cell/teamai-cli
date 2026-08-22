@@ -1,7 +1,8 @@
 import path from 'node:path';
 import { pathExists, ensureDir } from './utils/fs.js';
-import { resolveBaseDir, isAgentDisabled } from './types.js';
+import { resolveBaseDir } from './types.js';
 import type { LocalConfig, TeamaiConfig } from './types.js';
+import { homeDir, isHostSelected, normalizeHostId, resolveHostResourcePath, resolveHostRoot } from './host-adapters.js';
 
 /**
  * Single-repo mode: the AI tools offered when `teamai init .` asks which tool
@@ -9,7 +10,7 @@ import type { LocalConfig, TeamaiConfig } from './types.js';
  * against the user's HOME in non-interactive contexts. Order is the display order.
  * Kept small on purpose — the common coding agents, not the full KNOWN_AGENTS list.
  */
-export const SELF_MODE_AGENT_CHOICES = ['claude', 'codex', 'cursor', 'codebuddy', 'workbuddy'] as const;
+export const SELF_MODE_AGENT_CHOICES = ['claude', 'codex', 'cursor', 'codebuddy'] as const;
 
 /**
  * Normalize the `--agent` option into a deduplicated id list.
@@ -27,7 +28,7 @@ export function normalizeAgentList(agent?: string | string[]): string[] {
   const seen = new Set<string>();
   for (const part of raw) {
     for (const piece of String(part).split(',')) {
-      const id = piece.trim();
+      const id = normalizeHostId(piece);
       if (id && !seen.has(id)) {
         seen.add(id);
         out.push(id);
@@ -77,6 +78,7 @@ export const KNOWN_AGENTS: KnownAgent[] = [
   { id: 'tcodex', displayName: 'TCodex', category: 'coding', skillsPath: '.tcodex/skills' },
   { id: 'cursor', displayName: 'Cursor', category: 'coding', skillsPath: '.cursor/skills' },
   { id: 'codebuddy', displayName: 'CodeBuddy', category: 'coding', skillsPath: '.codebuddy/skills' },
+  { id: 'dsh', displayName: 'DeepSeek Harness', category: 'coding', skillsPath: '.dsh/skills', probePath: '.dsh' },
 
   // Additional coding agents from skills-manage
   { id: 'gemini', displayName: 'Gemini CLI', category: 'coding', skillsPath: '.gemini/skills' },
@@ -148,16 +150,17 @@ export async function seedSelfModeToolDirs(
   const baseDir = resolveBaseDir(localConfig);
   const configured = teamConfig.toolPaths ?? {};
 
-  let targets = localConfig.enabledAgents ?? [];
+  let targets = (localConfig.enabledAgents ?? []).map(normalizeHostId);
   // Never seed an explicitly disabled agent.
-  targets = targets.filter((id) => !isAgentDisabled(localConfig, id));
+  targets = targets.filter((id) => isHostSelected(localConfig, id));
 
   const seeded: string[] = [];
   for (const id of targets) {
     const skillsPath = configured[id]?.skills
       ?? KNOWN_AGENTS.find((a) => a.id === id)?.skillsPath;
     if (!skillsPath) continue;
-    await ensureDir(path.join(baseDir, skillsPath));
+    const specialDestination = resolveHostResourcePath(id, 'skills', localConfig);
+    await ensureDir(specialDestination ?? path.join(baseDir, skillsPath));
     seeded.push(id);
   }
   return seeded;
@@ -178,17 +181,17 @@ export async function seedSelfModeToolDirs(
 export async function detectHomeInstalledAgents(
   candidateIds: readonly string[] = SELF_MODE_AGENT_CHOICES,
 ): Promise<string[]> {
-  const home = process.env.HOME;
-  if (!home) return [];
+  const home = homeDir();
 
   const found: string[] = [];
   for (const id of candidateIds) {
     const known = KNOWN_AGENTS.find((a) => a.id === id);
     const skillsPath = known?.probePath ?? known?.skillsPath;
     if (!skillsPath) continue;
+    const specialRoot = resolveHostRoot(id, 'user');
     const rootSegment = skillsPath.split('/')[0]; // e.g. ".claude"
     if (!rootSegment) continue;
-    if (await pathExists(path.join(home, rootSegment))) {
+    if (await pathExists(specialRoot ?? path.join(home, rootSegment))) {
       found.push(id);
     }
   }

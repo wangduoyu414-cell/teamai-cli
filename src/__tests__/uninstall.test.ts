@@ -762,6 +762,35 @@ describe('uninstall', () => {
     expect(savedCfg.disabledAgents).toContain('claude');
   });
 
+  it('allows an explicit DSH binding to be removed before the first pull', async () => {
+    const homeDir = path.join(tmpDir, 'empty-special-home');
+    const repoPath = path.join(tmpDir, 'empty-special-repo');
+    const dshRoot = path.join(tmpDir, 'custom dsh root');
+    await Promise.all([
+      fse.ensureDir(path.join(homeDir, '.teamai')),
+      fse.ensureDir(repoPath),
+      fse.ensureDir(dshRoot),
+    ]);
+    vi.stubEnv('HOME', homeDir);
+    const teamConfig = makeTeamConfig({
+      toolPaths: { dsh: { probe: '.dsh', skills: '.dsh/skills', instruction: '.dsh/AGENTS.md' } },
+    });
+    const localConfig = makeLocalConfig(homeDir, repoPath, {
+      enabledAgents: ['deepseek-harness'],
+      hostRoots: { dsh: dshRoot },
+    });
+    mockAutoDetectInit.mockResolvedValue({ localConfig, teamConfig });
+
+    await uninstall({ force: true, agent: 'deepseek-harness' });
+
+    expect(mockSaveLocalConfig).toHaveBeenCalledTimes(1);
+    const savedCfg = mockSaveLocalConfig.mock.calls[0][0] as LocalConfig;
+    expect(savedCfg.enabledAgents).toEqual([]);
+    expect(savedCfg.disabledAgents).toContain('dsh');
+    expect(savedCfg.hostRoots).toBeUndefined();
+    expect(await fse.pathExists(dshRoot)).toBe(true);
+  });
+
   it('--agent unknown → 报错不删', async () => {
     const { homeDir, repoPath, teamaiHome } = await setupFixture(tmpDir);
     vi.stubEnv('HOME', homeDir);

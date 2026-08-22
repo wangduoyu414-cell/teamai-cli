@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import path from 'node:path';
+import os from 'node:os';
 
 // ─── Tool path config ───────────────────────────────────
 
@@ -184,7 +185,7 @@ export interface SourceInstallManifest {
 /** TTL for source repo pull: don't re-pull within this duration (ms). */
 export const SOURCE_PULL_TTL_MS = 24 * 60 * 60 * 1000;
 
-export const TEAMAI_SOURCES_DIR = `${process.env.HOME}/.teamai/sources`;
+export const TEAMAI_SOURCES_DIR = path.join(os.homedir(), '.teamai', 'sources');
 
 export const TeamaiConfigSchema = z.object({
   team: z.string(),
@@ -240,7 +241,12 @@ export const TeamaiConfigSchema = z.object({
     codebuddy: { skills: '.codebuddy/skills', rules: '.codebuddy/rules', settings: '.codebuddy/settings.json', claudemd: '.codebuddy/CODEBUDDY.md', agents: '.codebuddy/agents', mcp: '.codebuddy/mcp.json', mcpProject: '.codebuddy/mcp.json' },
     openclaw: { skills: '.openclaw/skills', rules: '.openclaw/rules', claudemd: '.openclaw/workspace/AGENTS.md' },
     hermes: { skills: '.hermes/skills', claudemd: 'AGENTS.md' },
-    workbuddy: { skills: '.workbuddy/skills', rules: '.workbuddy/rules', settings: '.workbuddy/settings.json', claudemd: 'AGENTS.md', mcp: '.workbuddy/mcp.json', mcpProject: '.workbuddy/mcp.json' },
+    // WorkBuddy static sync is deliberately Skills-only. Hooks retain their own
+    // independently verified settings adapter and are not implied by this entry.
+    workbuddy: { probe: '.workbuddy', skills: '.workbuddy/skills' },
+    // DSH user paths are resolved by the narrow host adapter so DSH_HOME is
+    // honored; these relative values retain a safe default for older Cores.
+    dsh: { probe: '.dsh', skills: '.dsh/skills', instruction: '.dsh/AGENTS.md' },
     qwen: { probe: '.qwen', skills: '.qwen/skills', rules: '.qwen/rules', instruction: '.qwen/QWEN.md', agents: '.qwen/agents' },
   }),
 });
@@ -306,6 +312,8 @@ export const LocalConfigSchema = z.object({
   enabledAgents: z.array(z.string()).optional(),
   /** Tools explicitly excluded from all teamai sync (set by `uninstall --agent`). Removed again by `init --agent`. */
   disabledAgents: z.array(z.string()).optional(),
+  /** Canonical machine-local roots for hosts whose product configuration may move. */
+  hostRoots: z.record(z.string(), z.string()).optional(),
 });
 
 export type LocalConfig = z.infer<typeof LocalConfigSchema>;
@@ -469,11 +477,11 @@ export interface GlobalOptions {
 
 // ─── Constants ──────────────────────────────────────────
 
-export const TEAMAI_HOME = `${process.env.HOME}/.teamai`;
-export const TEAMAI_CONFIG_PATH = `${TEAMAI_HOME}/config.yaml`;
-export const TEAMAI_STATE_PATH = `${TEAMAI_HOME}/state.json`;
-export const TEAMAI_TOKEN_PATH = `${TEAMAI_HOME}/token`;
-export const TEAMAI_UPDATE_LOCK_PATH = `${TEAMAI_HOME}/.update-lock`;
+export const TEAMAI_HOME = path.join(os.homedir(), '.teamai');
+export const TEAMAI_CONFIG_PATH = path.join(TEAMAI_HOME, 'config.yaml');
+export const TEAMAI_STATE_PATH = path.join(TEAMAI_HOME, 'state.json');
+export const TEAMAI_TOKEN_PATH = path.join(TEAMAI_HOME, 'token');
+export const TEAMAI_UPDATE_LOCK_PATH = path.join(TEAMAI_HOME, '.update-lock');
 
 export const RESOURCE_TYPES: ResourceType[] = ['skills', 'rules', 'docs', 'env', 'agents', 'hooks', 'mcp'];
 
@@ -1047,7 +1055,7 @@ export type CultureFrontmatter = z.infer<typeof CultureFrontmatterSchema>;
 
 /**
  * Resolve the base directory for resource installation based on scope.
- * - user scope  → process.env.HOME (e.g. /Users/xxx)
+ * - user scope  → os.homedir() (e.g. /Users/xxx)
  * - project scope → localConfig.projectRoot (e.g. /Users/xxx/my-project)
  */
 export function resolveBaseDir(localConfig: LocalConfig): string {
@@ -1060,7 +1068,7 @@ export function resolveBaseDir(localConfig: LocalConfig): string {
     }
     return localConfig.projectRoot;
   }
-  return process.env.HOME!;
+  return os.homedir();
 }
 
 /** True when `tool` is in localConfig.disabledAgents (excluded from teamai sync). */
@@ -1125,7 +1133,7 @@ export function getTeamaiHome(scope: Scope, projectRoot?: string): string {
     }
     return path.join(projectRoot, '.teamai');
   }
-  return path.join(process.env.HOME ?? '', '.teamai');
+  return path.join(os.homedir(), '.teamai');
 }
 
 /**
@@ -1171,7 +1179,7 @@ export function getManagedHooksPath(scope: Scope, projectRoot?: string): string 
  * Get the user-level pushignore path.
  */
 export function getPushignorePath(): string {
-  return path.join(process.env.HOME ?? '', '.teamai', 'pushignore');
+  return path.join(os.homedir(), '.teamai', 'pushignore');
 }
 
 /**

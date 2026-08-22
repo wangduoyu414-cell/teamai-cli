@@ -3,7 +3,8 @@ import path from 'node:path';
 import { ensureDir, pathExists, copyFile } from './utils/fs.js';
 import { log } from './utils/logger.js';
 import type { TeamaiConfig, LocalConfig } from './types.js';
-import { resolveBaseDir, isAgentDisabled, isBuiltinEnabled } from './types.js';
+import { resolveBaseDir, isBuiltinEnabled } from './types.js';
+import { homeDir, isHostSelected, supportsStaticResource } from './host-adapters.js';
 import { ResourceHandler } from './resources/base.js';
 
 // ─── Built-in agents deployment ──────────────────────────
@@ -75,7 +76,7 @@ export async function deployBuiltinAgents(
     .filter((f) => !(options?.skipRecall && f === 'teamai-recall.md'));
   if (agentFiles.length === 0) return 0;
 
-  const baseDir = localConfig ? resolveBaseDir(localConfig) : (process.env.HOME ?? '');
+  const baseDir = localConfig ? resolveBaseDir(localConfig) : homeDir();
   let deployed = 0;
 
   for (const [tool, toolPath] of Object.entries(teamConfig.toolPaths)) {
@@ -87,7 +88,7 @@ export async function deployBuiltinAgents(
       log.debug(`Skipping built-in agent deployment for ${tool}: tool not installed`);
       continue;
     }
-    if (localConfig && isAgentDisabled(localConfig, tool)) continue;
+    if (localConfig && (!isHostSelected(localConfig, tool) || !supportsStaticResource(tool, 'agents', localConfig.scope))) continue;
 
     const targetAgentsDir = path.join(baseDir, toolPath.agents);
     try {

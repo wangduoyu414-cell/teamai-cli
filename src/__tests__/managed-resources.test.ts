@@ -391,6 +391,221 @@ describe('managed resource lifecycle', () => {
     expect(await fse.pathExists(home)).toBe(false);
   });
 
+  it('upgrades a legacy v1 backup hash from its backup payload only when a normal reconcile commits', async () => {
+    const { root, home } = await fixture();
+    const target = path.join(root, 'agent.md');
+    const backupPath = path.join(home, 'managed-resource-backups', 'legacy-agent');
+    await fse.writeFile(target, 'team version');
+    await fse.outputFile(backupPath, 'user original');
+    await fse.ensureDir(home);
+    await fse.writeJson(path.join(home, 'managed-resources.json'), {
+      version: 1,
+      resources: {
+        'agents:a': {
+          id: 'agents:a', type: 'agents', targets: [{
+            path: target, kind: 'file', hash: crypto.createHash('sha256').update('team version').digest('hex'),
+            ownership: 'replaced-with-backup', backupPath,
+          }],
+        },
+      },
+    });
+    const beforePlan = await fse.readFile(path.join(home, 'managed-resources.json'), 'utf8');
+
+    await reconcileManagedResources(home, [file('agents:a', target, 'team version')], { plan: true });
+    expect(await fse.readFile(path.join(home, 'managed-resources.json'), 'utf8')).toBe(beforePlan);
+
+    await reconcileManagedResources(home, [file('agents:a', target, 'team version')], { pruneTypes: ['agents'] });
+    const persisted = await fse.readJson(path.join(home, 'managed-resources.json'));
+    expect(persisted.resources['agents:a'].targets[0].backupHash)
+      .toBe(crypto.createHash('sha256').update('user original').digest('hex'));
+
+    await uninstallManagedResources(home);
+    expect(await fse.readFile(target, 'utf8')).toBe('user original');
+  });
+
+  it('upgrades legacy section ownership to preserve the pre-existing instruction file', async () => {
+    const { root, home } = await fixture();
+    const target = path.join(root, 'AGENTS.md');
+    const section = { start: '<!-- [teamai:instructions:start] -->', end: '<!-- [teamai:instructions:end] -->' };
+    const block = `${section.start}\nTeam rules\n${section.end}`;
+    await fse.writeFile(target, `# Local rules\n\n${block}\n`);
+    await fse.ensureDir(home);
+    await fse.writeJson(path.join(home, 'managed-resources.json'), {
+      version: 1,
+      resources: {
+        'instructions:project-agents': {
+          id: 'instructions:project-agents', type: 'instructions', targets: [{
+            path: target, kind: 'file', section,
+            hash: crypto.createHash('sha256').update(block).digest('hex'), ownership: 'adopted',
+          }],
+        },
+      },
+    });
+    const desired: DesiredManagedResource = {
+      id: 'instructions:project-agents', type: 'instructions',
+      targets: [{ path: target, kind: 'file', section, content: block }],
+    };
+
+    await reconcileManagedResources(home, [desired], { pruneTypes: ['instructions'] });
+    const persisted = await fse.readJson(path.join(home, 'managed-resources.json'));
+    expect(persisted.resources['instructions:project-agents'].targets[0].sectionFileExisted).toBe(true);
+
+    await uninstallManagedResources(home);
+    expect(await fse.readFile(target, 'utf8')).toBe('# Local rules\n');
+  });
+
+  it('recovers a legacy journal only after deriving its rollback metadata from the previous payload', async () => {
+    const { root, home } = await fixture();
+    const target = path.join(root, 'agent.md');
+    const rollbackRoot = path.join(root, '.teamai-rollback-legacy-journal-a');
+    const previous = path.join(rollbackRoot, 'previous');
+    await fse.outputFile(previous, 'old');
+    await fse.writeFile(target, 'new');
+    await fse.ensureDir(home);
+    await fse.writeJson(path.join(home, 'managed-resources.journal.json'), {
+      version: 1, transactionId: 'legacy-journal', status: 'applying', resourceIds: ['agents:a'],
+      operations: [{ target, previous, rollbackRoot, hadPrevious: true, phase: 'applied' }],
+      stagedRoots: [], createdBackups: [], backupCleanup: [], updatedAt: new Date().toISOString(),
+    });
+
+    await recoverManagedResourceTransaction(home);
+    expect(await fse.readFile(target, 'utf8')).toBe('old');
+    const persisted = await fse.readJson(path.join(home, 'managed-resources.journal.json'));
+    expect(persisted.status).toBe('rolled-back');
+    expect(persisted.operations[0]).toMatchObject({
+      previousKind: 'file', previousHash: crypto.createHash('sha256').update('old').digest('hex'),
+    });
+  });
+
+  it('fails closed when an interrupted rollback payload was modified', async () => {
+    const { root, home } = await fixture();
+    const target = path.join(root, 'agent.md');
+    const rollbackRoot = path.join(root, '.teamai-rollback-corrupt-rollback-a');
+    const previous = path.join(rollbackRoot, 'previous');
+    await fse.outputFile(previous, 'tampered');
+    await fse.writeFile(target, 'new');
+    await fse.ensureDir(home);
+    await fse.writeJson(path.join(home, 'managed-resources.journal.json'), {
+      version: 1, transactionId: 'corrupt-rollback', status: 'applying', resourceIds: ['agents:a'],
+      operations: [{
+        target, previous, rollbackRoot, hadPrevious: true,
+        previousKind: 'file', previousHash: crypto.createHash('sha256').update('old').digest('hex'),
+        phase: 'applied',
+      }],
+      stagedRoots: [], createdBackups: [], backupCleanup: [], updatedAt: new Date().toISOString(),
+    });
+
+    await expect(recoverManagedResourceTransaction(home)).rejects.toThrow('rollback incomplete');
+    expect(await fse.readFile(target, 'utf8')).toBe('new');
+    expect(await fse.readFile(previous, 'utf8')).toBe('tampered');
+    expect((await fse.readJson(path.join(home, 'managed-resources.journal.json'))).status).toBe('applying');
+  });
+
+  it('recovers a legacy external OpenClaw journal by proving the target is inside its skills root', async () => {
+    const { root, home } = await fixture();
+    const externalRoot = await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-openclaw-legacy-'));
+    tempDirs.push(externalRoot);
+    const stateDir = path.join(externalRoot, 'state');
+    const workspace = path.join(externalRoot, 'workspace');
+    const target = path.join(workspace, 'skills', 'legacy-skill');
+    const rollbackRoot = path.join(workspace, 'skills', '.teamai-rollback-legacy-openclaw-a');
+    const previous = path.join(rollbackRoot, 'previous');
+    await fse.outputFile(path.join(previous, 'SKILL.md'), 'old');
+    await fse.outputFile(path.join(target, 'SKILL.md'), 'new');
+    await fse.outputJson(path.join(stateDir, 'openclaw.json'), { agents: { defaults: { workspace } } });
+    await fse.ensureDir(home);
+    const previousStateDir = process.env.OPENCLAW_STATE_DIR;
+    process.env.OPENCLAW_STATE_DIR = stateDir;
+    try {
+      await fse.writeJson(path.join(home, 'managed-resources.journal.json'), {
+        version: 1, transactionId: 'legacy-openclaw', status: 'applying', resourceIds: ['skills:legacy-skill'],
+        operations: [{ target, previous, rollbackRoot, hadPrevious: true, phase: 'applied' }],
+        stagedRoots: [], createdBackups: [], backupCleanup: [], updatedAt: new Date().toISOString(),
+      });
+
+      await recoverManagedResourceTransaction(home);
+      expect(await fse.readFile(path.join(target, 'SKILL.md'), 'utf8')).toBe('old');
+      const persisted = await fse.readJson(path.join(home, 'managed-resources.journal.json'));
+      expect(persisted.operations[0]).toMatchObject({ tool: 'openclaw', resourceType: 'skills' });
+    } finally {
+      if (previousStateDir === undefined) delete process.env.OPENCLAW_STATE_DIR;
+      else process.env.OPENCLAW_STATE_DIR = previousStateDir;
+    }
+  });
+
+  it('rejects an unrelated external staged root before recovery can delete it', async () => {
+    const { home } = await fixture();
+    const dshRoot = await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-dsh-journal-'));
+    tempDirs.push(dshRoot);
+    const target = path.join(dshRoot, 'skills', 'example');
+    const rollbackRoot = path.join(dshRoot, 'skills', '.teamai-rollback-unsafe-stage-a');
+    const credentials = path.join(dshRoot, 'credentials');
+    await fse.outputFile(path.join(target, 'SKILL.md'), 'keep target');
+    await fse.outputFile(path.join(credentials, 'token'), 'keep credential');
+    await fse.ensureDir(home);
+    await fse.writeJson(path.join(home, 'managed-resources.journal.json'), {
+      version: 1, transactionId: 'unsafe-stage', status: 'applying', resourceIds: ['skills:example'],
+      operations: [{
+        target,
+        previous: path.join(rollbackRoot, 'previous'),
+        rollbackRoot,
+        hostRoot: dshRoot,
+        tool: 'dsh',
+        resourceType: 'skills',
+        hadPrevious: false,
+        phase: 'applied',
+      }],
+      stagedRoots: [credentials], createdBackups: [], backupCleanup: [], updatedAt: new Date().toISOString(),
+    });
+
+    await expect(recoverManagedResourceTransaction(home)).rejects.toThrow('journal is invalid');
+    expect(await fse.readFile(path.join(target, 'SKILL.md'), 'utf8')).toBe('keep target');
+    expect(await fse.readFile(path.join(credentials, 'token'), 'utf8')).toBe('keep credential');
+  });
+
+  it('recovers a DSH transaction interrupted after external staging but before apply', async () => {
+    const { home } = await fixture();
+    const dshRoot = await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-dsh-staging-'));
+    tempDirs.push(dshRoot);
+    const target = path.join(dshRoot, 'skills', 'example');
+    const stageRoot = path.join(dshRoot, 'skills', '.teamai-stage-dsh-staging-0-safe');
+    await fse.outputFile(path.join(stageRoot, 'payload', 'SKILL.md'), 'staged');
+    await fse.ensureDir(home);
+    await fse.writeJson(path.join(home, 'managed-resources.journal.json'), {
+      version: 1, transactionId: 'dsh-staging', status: 'staging', resourceIds: ['skills:example'],
+      operations: [],
+      stagedRoots: [stageRoot],
+      stagedTargets: [{ root: stageRoot, target, hostRoot: dshRoot, tool: 'dsh', resourceType: 'skills' }],
+      createdBackups: [], backupCleanup: [], updatedAt: new Date().toISOString(),
+    });
+
+    await recoverManagedResourceTransaction(home);
+    expect(await fse.pathExists(stageRoot)).toBe(false);
+    expect((await fse.readJson(path.join(home, 'managed-resources.journal.json'))).status).toBe('rolled-back');
+  });
+
+  it('recovers external backup-restore staging before its prune operation is recorded', async () => {
+    const { home } = await fixture();
+    const dshRoot = await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-dsh-restore-'));
+    tempDirs.push(dshRoot);
+    const target = path.join(dshRoot, 'AGENTS.md');
+    const stageRoot = path.join(dshRoot, '.teamai-stage-dsh-restore-restore-safe');
+    const backup = path.join(home, 'managed-resource-backups', 'a'.repeat(20));
+    await fse.outputFile(path.join(stageRoot, 'payload'), '# Personal DSH instructions\n');
+    await fse.outputFile(backup, '# Personal DSH instructions\n');
+    await fse.writeJson(path.join(home, 'managed-resources.journal.json'), {
+      version: 1, transactionId: 'dsh-restore', status: 'applying', resourceIds: ['instructions:dsh'],
+      operations: [],
+      stagedRoots: [stageRoot],
+      stagedTargets: [{ root: stageRoot, target, hostRoot: dshRoot, tool: 'dsh', resourceType: 'instructions' }],
+      createdBackups: [], backupCleanup: [backup], updatedAt: new Date().toISOString(),
+    });
+
+    await recoverManagedResourceTransaction(home);
+    expect(await fse.pathExists(stageRoot)).toBe(false);
+    expect(await fse.readFile(backup, 'utf8')).toBe('# Personal DSH instructions\n');
+  });
+
   it('rejects a corrupt manifest instead of rebuilding it', async () => {
     const { root, home } = await fixture();
     await fse.ensureDir(home);

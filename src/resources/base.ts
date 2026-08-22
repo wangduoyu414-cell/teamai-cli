@@ -1,4 +1,5 @@
 import path from 'node:path';
+import os from 'node:os';
 import type { ResourceType, ResourceItem, ResourceDiff, TeamaiConfig, LocalConfig } from '../types.js';
 import { readFileSafe, writeFile, ensureDir, pathExists } from '../utils/fs.js';
 
@@ -63,9 +64,14 @@ export abstract class ResourceHandler {
    * This prevents creating directories for tools the user hasn't installed.
    * @param baseDir - Override base directory (defaults to HOME). Used for project scope.
    */
-  static async isToolInstalled(toolPath: string, baseDir?: string, probePath?: string): Promise<boolean> {
-    const base = baseDir ?? process.env.HOME ?? '';
-    const toolRoot = path.join(base, (probePath ?? toolPath).split('/')[0]);
+  static async isToolInstalled(
+    toolPath: string,
+    baseDir?: string,
+    probePath?: string,
+    rootOverride?: string,
+  ): Promise<boolean> {
+    const base = baseDir ?? os.homedir();
+    const toolRoot = rootOverride ?? path.join(base, (probePath ?? toolPath).split('/')[0]);
     return pathExists(toolRoot);
   }
 

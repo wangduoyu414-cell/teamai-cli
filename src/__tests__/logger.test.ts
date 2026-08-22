@@ -86,6 +86,24 @@ describe('file transport', () => {
     spy.mockRestore();
     expect(fs.existsSync(logFile)).toBe(false);
   });
+
+  it('uses the operating-system home when HOME is absent', () => {
+    const nativeHome = path.join(tmpDir, 'native-home');
+    fs.mkdirSync(nativeHome);
+    const originalHome = process.env.HOME;
+    delete process.env.HOME;
+    const homedir = vi.spyOn(os, 'homedir').mockReturnValue(nativeHome);
+    _resetState();
+
+    try {
+      log.debug('native home');
+      expect(fs.readFileSync(path.join(nativeHome, '.teamai', 'debug.log'), 'utf-8')).toContain('native home');
+    } finally {
+      homedir.mockRestore();
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+    }
+  });
 });
 
 describe('console', () => {

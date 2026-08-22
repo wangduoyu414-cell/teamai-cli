@@ -23,6 +23,7 @@ vi.mock('../utils/git.js', () => ({
 }));
 
 vi.mock('../utils/logger.js', () => ({
+  setFileLogging: vi.fn(),
   log: {
     info: vi.fn(),
     success: vi.fn(),
@@ -84,7 +85,7 @@ import {
 } from '../config.js';
 import { getHeadRev } from '../utils/git.js';
 import { pullSources } from '../source.js';
-import { log } from '../utils/logger.js';
+import { log, setFileLogging } from '../utils/logger.js';
 import { reconcileTeamHooksForConfig } from '../hooks.js';
 import { reconcileMcpForConfig } from '../mcp-reconcile.js';
 import { reportUsageToTeam } from '../team-push.js';
@@ -267,6 +268,26 @@ describe('pull scope isolation (issue #73)', () => {
     expect(log.info).not.toHaveBeenCalledWith(SKIP_MSG);
     expect(pullSources).toHaveBeenCalledTimes(1);
     expect(vi.mocked(pullSources).mock.calls[0][0]).toMatchObject({ scope: 'user' });
+  });
+
+  it('host-root preflight failure disables durable logging before reporting the error', async () => {
+    const oldDsh = path.join(tmpDir, 'dsh-old');
+    const movedDsh = path.join(tmpDir, 'dsh-moved');
+    await Promise.all([fse.ensureDir(oldDsh), fse.ensureDir(movedDsh)]);
+    vi.stubEnv('DSH_HOME', movedDsh);
+    vi.mocked(detectProjectConfig).mockResolvedValue(null);
+    vi.mocked(loadLocalConfigForScope).mockResolvedValue({
+      ...userConfig,
+      enabledAgents: ['dsh'],
+      hostRoots: { dsh: fse.realpathSync.native(oldDsh) },
+    });
+
+    await pull({ silent: true });
+
+    expect(setFileLogging).toHaveBeenCalledWith(false);
+    expect(log.error).toHaveBeenCalledWith(expect.stringContaining('Pull preflight failed: dsh host root changed'));
+    expect(pullSources).not.toHaveBeenCalled();
+    process.exitCode = undefined;
   });
 
   it('user mode self-repo: reportUsageToTeam receives selfConfig so business repo is never reset', async () => {

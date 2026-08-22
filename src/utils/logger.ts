@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import chalk from 'chalk';
 import ora, { type Ora } from 'ora';
@@ -33,7 +34,7 @@ let _writing = false;
 
 function getLogFilePath(): string {
   if (!_logFilePath) {
-    _logFilePath = path.join(process.env.HOME ?? '/tmp', '.teamai', 'debug.log');
+    _logFilePath = path.join(os.homedir(), '.teamai', 'debug.log');
   }
   return _logFilePath;
 }

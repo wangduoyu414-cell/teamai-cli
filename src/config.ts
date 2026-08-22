@@ -17,6 +17,7 @@ import {
 import { readFileSafe, readJson, writeFile, writeJson, expandHome, pathExists } from './utils/fs.js';
 import { log } from './utils/logger.js';
 import { loadRolesManifest } from './roles.js';
+import { normalizeHostRoots } from './host-adapters.js';
 
 async function migrateLegacyRoleConfig(config: LocalConfig, configPath: string): Promise<LocalConfig> {
   if (config.primaryRole) {
@@ -86,7 +87,7 @@ export async function loadLocalConfig(options: { readOnly?: boolean } = {}): Pro
  * Save the local config
  */
 export async function saveLocalConfig(config: LocalConfig): Promise<void> {
-  await writeFile(expandHome(TEAMAI_CONFIG_PATH), YAML.stringify(config));
+  await writeFile(expandHome(TEAMAI_CONFIG_PATH), YAML.stringify(normalizeHostRoots(config)));
 }
 
 /**
@@ -162,7 +163,7 @@ export async function saveLocalConfigForScope(
   projectRoot?: string,
 ): Promise<void> {
   const configPath = getConfigPath(scope, projectRoot);
-  await writeFile(expandHome(configPath), YAML.stringify(config));
+  await writeFile(expandHome(configPath), YAML.stringify(normalizeHostRoots(config)));
 }
 
 /**

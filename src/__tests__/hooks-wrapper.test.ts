@@ -46,86 +46,40 @@ describe('reconcileHooksToAllTools — wrapper creation on main inject path', ()
     }
   });
 
-  for (const tool of ['workbuddy', 'codebuddy']) {
-    it(`creates wrapper when ${tool} is in toolPaths`, async () => {
-      const settingsFile = `.${tool}/settings.json`;
-      const toolRoot = path.join(tmp, `.${tool}`);
-      await fse.ensureDir(toolRoot);
+  it('creates a wrapper when codebuddy is in toolPaths', async () => {
+    const settingsFile = '.codebuddy/settings.json';
+    await fse.ensureDir(path.join(tmp, '.codebuddy'));
 
-      const toolPaths: Record<string, { settings?: string }> = {
-        [tool]: { settings: settingsFile },
-      };
+    await reconcileHooksToAllTools(
+      { codebuddy: { settings: settingsFile } },
+      tmp,
+      [],
+      path.join(tmp, 'managed-hooks.json'),
+      {},
+    );
 
-      await reconcileHooksToAllTools(toolPaths, tmp, [], path.join(tmp, 'managed-hooks.json'), {});
+    const wrapperPath = path.join(tmp, '.teamai', 'bin', 'teamai');
+    expect(await fse.pathExists(wrapperPath)).toBe(true);
 
-      const wrapperPath = path.join(tmp, '.teamai', 'bin', 'teamai');
-      expect(await fse.pathExists(wrapperPath)).toBe(true);
-
-      const wrapperContent = await fse.readFile(wrapperPath, 'utf-8');
-      expect(wrapperContent).toContain('exec');
-      expect(wrapperContent).toContain('index.js');
-    });
-  }
-
-  it('does not throw when neither workbuddy nor codebuddy is present', async () => {
-    const toolPaths: Record<string, { settings?: string }> = {
-      claude: { settings: '.claude/settings.json' },
-    };
-    await fse.ensureDir(path.join(tmp, '.claude'));
-
-    await expect(
-      reconcileHooksToAllTools(toolPaths, tmp, [], path.join(tmp, 'managed-hooks.json'), {}),
-    ).resolves.not.toThrow();
-  });
-});
-
-describe('reconcileHooksToAllTools — wrapper creation on main inject path', () => {
-  let tmp: string;
-  let origHome: string | undefined;
-  let stubCreated = false;
-
-  beforeEach(async () => {
-    tmp = await fse.mkdtemp(path.join(os.tmpdir(), 'hooks-wrapper-'));
-    origHome = process.env.HOME;
-    process.env.HOME = tmp;
-
-    // Create stub index.js so resolveTeamaiEntryScript() succeeds in test env
-    if (!await fse.pathExists(stubIndexJs)) {
-      await fse.writeFile(stubIndexJs, '// test stub\n');
-      stubCreated = true;
-    }
+    const wrapperContent = await fse.readFile(wrapperPath, 'utf-8');
+    expect(wrapperContent).toContain('exec');
+    expect(wrapperContent).toContain('index.js');
   });
 
-  afterEach(async () => {
-    if (origHome !== undefined) process.env.HOME = origHome;
-    else delete process.env.HOME;
-    await fse.remove(tmp);
-    if (stubCreated) {
-      await fse.remove(stubIndexJs);
-      stubCreated = false;
-    }
+  it('does not create a hook wrapper for explicit-only WorkBuddy static sync', async () => {
+    await fse.ensureDir(path.join(tmp, '.workbuddy'));
+
+    await reconcileHooksToAllTools(
+      { workbuddy: { settings: '.workbuddy/settings.json' } },
+      tmp,
+      [],
+      path.join(tmp, 'managed-hooks.json'),
+      {},
+    );
+
+    expect(await fse.pathExists(path.join(tmp, '.teamai', 'bin', 'teamai'))).toBe(false);
+    expect(await fse.pathExists(path.join(tmp, '.workbuddy', 'settings.json'))).toBe(false);
   });
-
-  for (const tool of ['workbuddy', 'codebuddy']) {
-    it(`creates wrapper when ${tool} is in toolPaths`, async () => {
-      const settingsFile = `.${tool}/settings.json`;
-      const toolRoot = path.join(tmp, `.${tool}`);
-      await fse.ensureDir(toolRoot);
-
-      const toolPaths: Record<string, { settings?: string }> = {
-        [tool]: { settings: settingsFile },
-      };
-
-      await reconcileHooksToAllTools(toolPaths, tmp, [], path.join(tmp, 'managed-hooks.json'), {});
-
-      const wrapperPath = path.join(tmp, '.teamai', 'bin', 'teamai');
-      expect(await fse.pathExists(wrapperPath)).toBe(true);
-
-      const wrapperContent = await fse.readFile(wrapperPath, 'utf-8');
-      expect(wrapperContent).toContain('exec');
-      expect(wrapperContent).toContain('index.js');
-    });
-  }
 
   it('does not throw when neither workbuddy nor codebuddy is present', async () => {
     const toolPaths: Record<string, { settings?: string }> = {

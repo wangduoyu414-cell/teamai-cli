@@ -186,6 +186,34 @@ describe('source', () => {
       expect(manifest.installedSkills).toContain('cool-skill');
     });
 
+    it('keeps direct-copy source skills out of WorkBuddy and DSH roots', async () => {
+      teamConfig.sources = [{ name: 'platform', repo: 'git@git.woa.com:platform/repo.git' }];
+      const workbuddyRoot = path.join(tmpDir, 'external workbuddy');
+      const dshRoot = path.join(tmpDir, 'external dsh');
+      await Promise.all([fse.ensureDir(workbuddyRoot), fse.ensureDir(dshRoot)]);
+      teamConfig.toolPaths = {
+        ...teamConfig.toolPaths,
+        workbuddy: { probe: '.workbuddy', skills: '.workbuddy/skills' },
+        dsh: { probe: '.dsh', skills: '.dsh/skills', instruction: '.dsh/AGENTS.md' },
+      };
+      localConfig.enabledAgents = ['claude', 'workbuddy', 'dsh'];
+      localConfig.hostRoots = { workbuddy: workbuddyRoot, dsh: dshRoot };
+
+      const YAML = (await import('yaml')).default;
+      await fse.writeFile(path.join(localConfig.repo.localPath, 'teamai.yaml'), YAML.stringify(teamConfig));
+      const sourceRepoDir = path.join(sourcesDir, 'platform', 'repo');
+      await fse.outputFile(path.join(sourceRepoDir, 'skills', 'cool-skill', 'SKILL.md'), '# Source');
+      await fse.writeFile(path.join(sourceRepoDir, 'teamai.yaml'), YAML.stringify({
+        team: 'platform', repo: 'git@git.woa.com:platform/repo.git', publicSkills: ['cool-skill'],
+      }));
+
+      await pullSources(localConfig, {});
+
+      expect(await fse.pathExists(path.join(homeDir, '.claude', 'skills', 'cool-skill', 'SKILL.md'))).toBe(true);
+      expect(await fse.pathExists(path.join(workbuddyRoot, 'skills', 'cool-skill'))).toBe(false);
+      expect(await fse.pathExists(path.join(dshRoot, 'skills', 'cool-skill'))).toBe(false);
+    });
+
     it('should not deploy source skill that conflicts with local team skill', async () => {
       teamConfig.sources = [{ name: 'platform', repo: 'git@git.woa.com:platform/repo.git' }];
 

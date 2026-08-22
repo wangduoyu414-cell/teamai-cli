@@ -23,6 +23,10 @@ vi.mock('../utils/logger.js', () => ({
     },
 }));
 
+vi.mock('../agent-version.js', () => ({
+    getAgentVersion: vi.fn(),
+}));
+
 // Mock the tgit provider to avoid side effects
 vi.mock('../providers/tgit/index.js', () => ({
     isGfInstalled: vi.fn().mockResolvedValue(true),
@@ -34,12 +38,14 @@ vi.mock('../providers/tgit/index.js', () => ({
 import { loadLocalConfig, loadTeamConfig } from '../config.js';
 import { pathExists, readFileSafe } from '../utils/fs.js';
 import { TEAMAI_HOOK_SUBCOMMANDS } from '../hooks.js';
+import { getAgentVersion } from '../agent-version.js';
 import { doctor } from '../doctor.js';
 
 const mockedLoadLocalConfig = loadLocalConfig as Mock;
 const mockedLoadTeamConfig = loadTeamConfig as Mock;
 const mockedPathExists = pathExists as Mock;
 const mockedReadFileSafe = readFileSafe as Mock;
+const mockedGetAgentVersion = getAgentVersion as Mock;
 
 const mockLocalConfig = {
     repo: { localPath: '/tmp/repo', remote: 'https://git.woa.com/team/repo.git' },
@@ -84,6 +90,7 @@ beforeEach(() => {
     mockedLoadTeamConfig.mockResolvedValue(mockTeamConfig);
     mockedPathExists.mockResolvedValue(true);
     mockedReadFileSafe.mockResolvedValue(buildFullHooksContent());
+    mockedGetAgentVersion.mockResolvedValue('');
 });
 
 // ── Tests ────────────────────────────────────────────────
@@ -155,7 +162,7 @@ describe('doctor — hook checks', () => {
         await doctor({});
 
         const allCalls = consoleSpy.mock.calls.map((c) => c[0]);
-        const envLine = allCalls.find((msg: string) => msg.includes('Env variables'));
+        const envLine = allCalls.find((msg: string) => msg.includes('Env variables injected'));
         expect(envLine).toContain('✔');
     });
 
@@ -176,7 +183,7 @@ describe('doctor — hook checks', () => {
         await doctor({});
 
         const allCalls = consoleSpy.mock.calls.map((c) => c[0]);
-        const envLine = allCalls.find((msg: string) => msg.includes('Env variables'));
+        const envLine = allCalls.find((msg: string) => msg.includes('Env variables are not injected'));
         expect(envLine).toContain('✔');
     });
 
@@ -202,5 +209,40 @@ describe('doctor — hook checks', () => {
         expect(allCalls.some((msg: string) => msg.includes('codex-internal'))).toBe(false);
         // Should still show claude check
         expect(allCalls.some((msg: string) => msg.includes('claude'))).toBe(true);
+    });
+});
+
+describe('doctor — explicit host checks', () => {
+    it('reports the validated WorkBuddy version for an explicitly selected host', async () => {
+        mockedLoadLocalConfig.mockResolvedValue({
+            ...mockLocalConfig,
+            scope: 'user',
+            enabledAgents: ['workbuddy'],
+            hostRoots: { workbuddy: '/tmp/workbuddy' },
+        });
+        mockedGetAgentVersion.mockResolvedValue('5.3.13');
+
+        await doctor({});
+
+        const allCalls = consoleSpy.mock.calls.map((c) => c[0]);
+        expect(allCalls.some((msg: string) => msg.includes('WorkBuddy: selected'))).toBe(true);
+        expect(allCalls.some((msg: string) => msg.includes('✔ WorkBuddy version matches 5.3.13'))).toBe(true);
+        expect(allCalls.some((msg: string) => msg.includes('runtime loading is a separate host smoke check'))).toBe(true);
+    });
+
+    it('fails DSH diagnostics when the installed version differs from the exact gate', async () => {
+        mockedLoadLocalConfig.mockResolvedValue({
+            ...mockLocalConfig,
+            scope: 'user',
+            enabledAgents: ['dsh'],
+            hostRoots: { dsh: '/tmp/dsh' },
+        });
+        mockedGetAgentVersion.mockResolvedValue('0.1.2');
+
+        await doctor({});
+
+        const allCalls = consoleSpy.mock.calls.map((c) => c[0]);
+        expect(allCalls.some((msg: string) => msg.includes('✖ DSH version matches 0.1.1-rc.1'))).toBe(true);
+        expect(allCalls.some((msg: string) => msg.includes('Install DSH 0.1.1-rc.1'))).toBe(true);
     });
 });

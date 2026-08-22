@@ -1,6 +1,13 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { execFile } from 'node:child_process';
-import { getAgentVersion, clearVersionCache, _readPlistVersion } from '../agent-version.js';
+import os from 'node:os';
+import path from 'node:path';
+import {
+  getAgentVersion,
+  clearVersionCache,
+  _readPlistVersion,
+  _workbuddyAppPaths,
+} from '../agent-version.js';
 
 beforeEach(() => {
   clearVersionCache();
@@ -40,6 +47,18 @@ describe('getAgentVersion', () => {
     const ver = await getAgentVersion('workbuddy');
     if (ver) {
       expect(ver).toMatch(/^\d+\.\d+/);
+    }
+  });
+
+  it('checks both user-level and system-level WorkBuddy applications', () => {
+    expect(_workbuddyAppPaths).toContain(path.join(os.homedir(), 'Applications', 'WorkBuddy.app'));
+    expect(_workbuddyAppPaths).toContain('/Applications/WorkBuddy.app');
+  });
+
+  it('detects dsh version from its CLI', async () => {
+    const ver = await getAgentVersion('dsh');
+    if (ver) {
+      expect(ver).toMatch(/^\d+\.\d+\.\d+/);
     }
   });
 

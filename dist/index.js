@@ -5999,6 +5999,7 @@ var init_dashboard_collector = __esm({
 // src/agent-version.ts
 import { execFile } from "child_process";
 import { readFile } from "fs/promises";
+import os7 from "os";
 import path20 from "path";
 async function execVersion(bin, args = ["--version"]) {
   return new Promise((resolve) => {
@@ -6049,6 +6050,10 @@ async function detectWorkbuddyVersion() {
   }
   return "";
 }
+async function detectDshVersion() {
+  const raw = await execVersion("dsh");
+  return raw.split(/\s+/)[0]?.trim() ?? "";
+}
 async function detectHermesVersion() {
   const raw = await execVersion("hermes");
   const match = raw.match(/^\(?(\d+(?:\.\d+)*)\)?/);
@@ -6084,6 +6089,7 @@ var init_agent_version = __esm({
       "/Applications/CodeBuddy CN.app"
     ];
     WORKBUDDY_APP_PATHS = [
+      path20.join(os7.homedir(), "Applications", "WorkBuddy.app"),
       "/Applications/WorkBuddy.app"
     ];
     DETECTORS = {
@@ -6092,6 +6098,7 @@ var init_agent_version = __esm({
       codebuddy: detectCodebuddyCliVersion,
       "codebuddy-ide": detectCodebuddyIdeVersion,
       workbuddy: detectWorkbuddyVersion,
+      dsh: detectDshVersion,
       hermes: detectHermesVersion,
       openclaw: detectOpenclawVersion
     };
@@ -6102,7 +6109,7 @@ var init_agent_version = __esm({
 import crypto3 from "crypto";
 import fs9 from "fs";
 import { execFileSync as execFileSync2 } from "child_process";
-import os7 from "os";
+import os8 from "os";
 function getMachineId() {
   if (cachedMachineId !== null) return cachedMachineId;
   cachedMachineId = detectMachineId();
@@ -6124,7 +6131,7 @@ function detectMachineId(platform = process.platform) {
     }
   } catch {
   }
-  return id || os7.hostname() || "";
+  return id || os8.hostname() || "";
 }
 function readDarwinMachineId() {
   const out = execFileSync2("ioreg", ["-rd1", "-c", "IOPlatformExpertDevice"], {
@@ -6169,7 +6176,7 @@ var init_machine_id = __esm({
 });
 
 // src/utils/path-safety.ts
-import os8 from "os";
+import os9 from "os";
 import path21 from "path";
 import fs10 from "fs";
 function assertSafePath(target, allowedRoots) {
@@ -6185,7 +6192,7 @@ function assertSafePath(target, allowedRoots) {
   );
 }
 function resolveReal(p) {
-  const expanded = p.startsWith("~") ? path21.join(os8.homedir(), p.slice(1)) : p;
+  const expanded = p.startsWith("~") ? path21.join(os9.homedir(), p.slice(1)) : p;
   const abs = path21.resolve(expanded);
   try {
     return fs10.realpathSync(abs);
@@ -6194,7 +6201,7 @@ function resolveReal(p) {
   }
 }
 function defaultAllowedRoots() {
-  return [process.cwd(), os8.homedir()];
+  return [process.cwd(), os9.homedir()];
 }
 function assertSafeResourceName(name) {
   if (name.includes("\0")) {
@@ -6573,7 +6580,7 @@ __export(local_agent_exports, {
   writeTokenFile: () => writeTokenFile
 });
 import fs11 from "fs";
-import os9 from "os";
+import os10 from "os";
 import path22 from "path";
 import readline3 from "readline";
 import { execFile as execFile2 } from "child_process";
@@ -6798,7 +6805,7 @@ function createResourceLocalConfig(config, scope, repoPath, workspacePath) {
   const projectScope = scope === "project";
   return {
     repo: { localPath: repoPath, remote: config.endpoint },
-    username: os9.userInfo().username,
+    username: os10.userInfo().username,
     scope: projectScope ? "project" : "user",
     projectRoot: projectScope ? workspacePath : void 0,
     additionalRoles: []
@@ -7108,7 +7115,7 @@ async function bindWorkspaceToProject(workspacePath, projectId) {
 async function ensureWorkspaceBinding(config, workspacePath, sessionId) {
   if (config.workspaceBindings[workspacePath]) return;
   const markerKey = sessionId || `ppid-${process.ppid}`;
-  const hintMarker = path22.join(os9.tmpdir(), `teamai-bind-session-${markerKey}`);
+  const hintMarker = path22.join(os10.tmpdir(), `teamai-bind-session-${markerKey}`);
   if (fs11.existsSync(hintMarker)) return;
   try {
     fs11.writeFileSync(hintMarker, "");
@@ -7156,7 +7163,7 @@ function isBindPromptEnabled() {
 async function emitBindingHint(config, workspacePath, sessionId) {
   if (config.workspaceBindings[workspacePath]) return;
   const markerKey = sessionId || `ppid-${process.ppid}`;
-  const hintMarker = path22.join(os9.tmpdir(), `teamai-bind-hint-${markerKey}`);
+  const hintMarker = path22.join(os10.tmpdir(), `teamai-bind-hint-${markerKey}`);
   if (fs11.existsSync(hintMarker)) return;
   try {
     fs11.writeFileSync(hintMarker, "");
@@ -7317,8 +7324,8 @@ async function buildReportPayload(config, context) {
     agent_type: normalizeAgentType(tool),
     agent_version: await getAgentVersion(tool),
     local_agent_id: resolveLocalAgentId(context),
-    host_name: os9.hostname(),
-    os: os9.platform(),
+    host_name: os10.hostname(),
+    os: os10.platform(),
     started_at: config.createdAt,
     last_status: context.status ?? "running",
     // Instance-level skills/rules are a phase-1 legacy concept. They are
@@ -7429,7 +7436,7 @@ function assertHttpUrl(rawUrl) {
   return parsed;
 }
 async function downloadResource(downloadUrl) {
-  const tmpDir = await fs11.promises.mkdtemp(path22.join(os9.tmpdir(), "teamai-local-agent-"));
+  const tmpDir = await fs11.promises.mkdtemp(path22.join(os10.tmpdir(), "teamai-local-agent-"));
   const filePath = path22.join(tmpDir, "resource");
   let current = assertHttpUrl(downloadUrl);
   let response;
@@ -11329,8 +11336,8 @@ async function pushCore(localConfig, teamConfig, options) {
       process.exitCode = 2;
       return;
     }
-    const os13 = await import("os");
-    const skillPath = options.skill.startsWith("~") ? path35.join(os13.homedir(), options.skill.slice(1)) : path35.resolve(options.skill);
+    const os14 = await import("os");
+    const skillPath = options.skill.startsWith("~") ? path35.join(os14.homedir(), options.skill.slice(1)) : path35.resolve(options.skill);
     let matchedItem;
     for (const item of allItems) {
       if (item.type !== "skills") continue;
@@ -11342,7 +11349,7 @@ async function pushCore(localConfig, teamConfig, options) {
         matchedItem = item;
         break;
       }
-      const skillInput = options.skill.replace(/^~/, os13.homedir());
+      const skillInput = options.skill.replace(/^~/, os14.homedir());
       if (item.sourcePath.endsWith(skillInput) || item.sourcePath.includes(path35.sep + skillInput)) {
         matchedItem = item;
         break;
@@ -18334,6 +18341,80 @@ __export(doctor_exports, {
   doctor: () => doctor
 });
 import path56 from "path";
+import { readdir } from "fs/promises";
+async function canonicalSkillNames(repoRoot) {
+  const skillsRoot = path56.join(repoRoot, "skills");
+  try {
+    const entries = await readdir(skillsRoot, { withFileTypes: true });
+    const names = [];
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      if (await pathExists(path56.join(skillsRoot, entry.name, "SKILL.md"))) names.push(entry.name);
+    }
+    return names.sort();
+  } catch {
+    return [];
+  }
+}
+async function filesMatch(left, right) {
+  const [leftText, rightText] = await Promise.all([readFileSafe(left), readFileSafe(right)]);
+  return leftText !== null && leftText === rightText;
+}
+async function buildSpecialHostDiagnostics(localConfig, teamConfig) {
+  const diagnostics = { checks: [], notices: [] };
+  if (!localConfig) return diagnostics;
+  const selectedHosts = ["workbuddy", "dsh"].filter((host) => isHostSelected(localConfig, host));
+  if (selectedHosts.length === 0) return diagnostics;
+  const skillNames = await canonicalSkillNames(localConfig.repo.localPath);
+  for (const host of selectedHosts) {
+    const root = localConfig.hostRoots?.[host] ?? resolveHostRoot(host, localConfig.scope, localConfig.projectRoot);
+    const version2 = await getAgentVersion(host);
+    const expectedVersion = host === "dsh" ? DSH_EXACT_VERSION : WORKBUDDY_VALIDATED_VERSION;
+    const displayName = host === "dsh" ? "DSH" : "WorkBuddy";
+    diagnostics.notices.push(
+      `${displayName} support evidence: synchronized entrypoints are checked here; runtime loading is a separate host smoke check`
+    );
+    diagnostics.checks.push(
+      {
+        name: `${displayName} host root is available (${root ?? "unresolved"})`,
+        check: async () => Boolean(root && await pathExists(root)),
+        fix: `Run targeted uninstall, then re-run \`teamai init --agent ${host}\` to bind the current host root`
+      },
+      {
+        name: `${displayName} version matches ${expectedVersion} (detected: ${version2 || "unavailable"})`,
+        check: async () => version2 === expectedVersion,
+        fix: host === "dsh" ? `Install DSH ${expectedVersion} before syncing` : `Use WorkBuddy ${expectedVersion}, or revalidate the new version before treating it as supported`
+      },
+      {
+        name: `${displayName} has all ${skillNames.length} canonical Skill entrypoints`,
+        check: async () => {
+          if (!root || skillNames.length === 0) return false;
+          const results = await Promise.all(
+            skillNames.map((name) => pathExists(path56.join(root, "skills", name, "SKILL.md")))
+          );
+          return results.every(Boolean);
+        },
+        fix: "Run `teamai pull` to restore missing managed Skill entrypoints"
+      }
+    );
+    if (host === "dsh") {
+      const source = teamConfig?.sharing?.instructions?.source;
+      const target = resolveHostResourcePath("dsh", "instructions", localConfig);
+      diagnostics.checks.push({
+        name: "DSH managed AGENTS.md matches the canonical instruction source",
+        check: async () => Boolean(source && target && await filesMatch(path56.join(localConfig.repo.localPath, source), target)),
+        fix: "Run `teamai pull` to restore the managed DSH instruction file"
+      });
+      const projectInstructions = path56.join(process.cwd(), "AGENTS.md");
+      if (localConfig.scope === "user" && target && await pathExists(projectInstructions) && await filesMatch(projectInstructions, target)) {
+        diagnostics.notices.push(
+          "DSH is loading identical user-level and project-level AGENTS.md content in this workspace; this is safe but duplicates context"
+        );
+      }
+    }
+  }
+  return diagnostics;
+}
 async function buildHookChecks(toolPaths, baseDir) {
   const checks = [];
   for (const [tool, paths] of Object.entries(toolPaths)) {
@@ -18365,12 +18446,16 @@ async function doctor(options) {
   const configPathLabel = projectConfig ? `${projectConfig.projectRoot}/.teamai/config.yaml` : "~/.teamai/config.yaml";
   console.log(`  Scope: ${scope}${scope === "project" && localConfig?.projectRoot ? ` (${localConfig.projectRoot})` : ""}
 `);
-  const dshRoot = localConfig?.hostRoots?.dsh ?? resolveHostRoot("dsh", scope, localConfig?.projectRoot);
-  const workbuddyRoot = localConfig?.hostRoots?.workbuddy ?? resolveHostRoot("workbuddy", scope, localConfig?.projectRoot);
-  console.log(`  DSH root: ${dshRoot ?? "not applicable"} (exact supported version: ${DSH_EXACT_VERSION})`);
-  console.log(`  WorkBuddy root: ${workbuddyRoot ?? "not applicable"} (validated baseline: ${WORKBUDDY_VALIDATED_VERSION}; unknown versions require verification)`);
-  console.log(`  DSH shared Agents root: ${process.env.DSH_AGENTS_HOME?.trim() || "~/.agents"} (read-only compatibility path; TeamAI does not manage it as DSH)
-`);
+  const dshSelected = Boolean(localConfig && isHostSelected(localConfig, "dsh"));
+  const workbuddySelected = Boolean(localConfig && isHostSelected(localConfig, "workbuddy"));
+  const dshRoot = dshSelected ? localConfig?.hostRoots?.dsh ?? resolveHostRoot("dsh", scope, localConfig?.projectRoot) : void 0;
+  const workbuddyRoot = workbuddySelected ? localConfig?.hostRoots?.workbuddy ?? resolveHostRoot("workbuddy", scope, localConfig?.projectRoot) : void 0;
+  console.log(`  DSH: ${dshSelected ? `selected (${dshRoot})` : "not selected"}`);
+  console.log(`  WorkBuddy: ${workbuddySelected ? `selected (${workbuddyRoot})` : "not selected"}`);
+  if (dshSelected) {
+    console.log(`  DSH shared Agents root: ${process.env.DSH_AGENTS_HOME?.trim() || "~/.agents"} (read-only compatibility path; TeamAI does not manage it as DSH)`);
+  }
+  console.log("");
   let teamConfig = null;
   if (localConfig) {
     teamConfig = await loadTeamConfig(localConfig.repo.localPath);
@@ -18379,6 +18464,9 @@ async function doctor(options) {
   const providerName = teamConfig?.provider ?? "tgit";
   const baseDir = localConfig ? resolveBaseDir(localConfig) : homeDir();
   const checks = [];
+  const specialHostDiagnostics = await buildSpecialHostDiagnostics(localConfig, teamConfig);
+  for (const notice of specialHostDiagnostics.notices) console.log(`  \u26A0 ${notice}`);
+  if (specialHostDiagnostics.notices.length > 0) console.log("");
   if (providerName === "tgit") {
     const { isGfInstalled: isGfInstalled2, gfIsAuthenticated: gfIsAuthenticated2 } = await Promise.resolve().then(() => (init_tgit(), tgit_exports));
     checks.push(
@@ -18433,7 +18521,7 @@ async function doctor(options) {
     },
     ...await buildHookChecks(toolPaths, baseDir),
     {
-      name: "Env variables injected in shell profile",
+      name: teamConfig?.sharing?.env?.injectShellProfile === false ? "Env variables are not injected (disabled by team policy)" : "Env variables injected in shell profile",
       check: async () => {
         if (teamConfig?.sharing?.env?.injectShellProfile === false) return true;
         if (!localConfig) return true;
@@ -18449,7 +18537,8 @@ async function doctor(options) {
         return content?.includes(TEAMAI_ENV_START) ?? false;
       },
       fix: "Run `teamai pull` to inject env variables into shell profile"
-    }
+    },
+    ...specialHostDiagnostics.checks
   );
   let allPassed = true;
   for (const { name, check, fix } of checks) {
@@ -18478,6 +18567,7 @@ var init_doctor = __esm({
     init_types();
     init_hooks2();
     init_host_adapters();
+    init_agent_version();
   }
 });
 
@@ -23050,7 +23140,7 @@ var init_graph_index_schema = __esm({
 });
 
 // src/code-knowledge-recall.ts
-import { readFile as readFile3, readdir } from "fs/promises";
+import { readFile as readFile3, readdir as readdir2 } from "fs/promises";
 import path75 from "path";
 import matter5 from "gray-matter";
 function countOccurrences(text, token2) {
@@ -23205,7 +23295,7 @@ async function loadWikiPages(wikiRoot, depth) {
   const evidenceDir = path75.join(wikiRoot, "evidence", "code");
   let projectDirs;
   try {
-    const entries = await readdir(evidenceDir, { withFileTypes: true });
+    const entries = await readdir2(evidenceDir, { withFileTypes: true });
     projectDirs = entries.filter((e) => e.isDirectory()).map((e) => e.name);
   } catch {
     return pages;
@@ -23280,7 +23370,7 @@ function extractSourceDescriptions(sources, pageContent) {
 }
 async function loadPagesRecursive(dir, relativePath, pages, depth, currentDepth = 0) {
   if (currentDepth >= MAX_RECURSION_DEPTH) return;
-  const entries = await readdir(dir, { withFileTypes: true }).catch(() => []);
+  const entries = await readdir2(dir, { withFileTypes: true }).catch(() => []);
   for (const entry of entries) {
     const fullPath = path75.join(dir, entry.name);
     if (entry.isDirectory()) {
@@ -23894,10 +23984,10 @@ var init_recall_toggle = __esm({
 
 // src/utils/cache-index.ts
 import path78 from "path";
-import os10 from "os";
+import os11 from "os";
 import fs26 from "fs-extra";
 function getCacheRoot() {
-  return process.env.TEAMAI_CACHE_DIR ?? path78.join(os10.homedir(), ".teamai", "cache", "repos");
+  return process.env.TEAMAI_CACHE_DIR ?? path78.join(os11.homedir(), ".teamai", "cache", "repos");
 }
 function buildKey(provider, owner, repo) {
   return `${provider}/${owner}/${repo}`;
@@ -25135,11 +25225,11 @@ async function reconcileIwikiWithCodebase(documents, teamwikiRoot) {
   const evidenceDir = path80.join(teamwikiRoot, "evidence", "code");
   const codePageContents = /* @__PURE__ */ new Map();
   if (await pathExists(evidenceDir)) {
-    const { readdir: readdir9 } = await import("fs/promises");
-    const projects = await readdir9(evidenceDir);
+    const { readdir: readdir10 } = await import("fs/promises");
+    const projects = await readdir10(evidenceDir);
     for (const project of projects) {
       const projectDir = path80.join(evidenceDir, project);
-      const files = await readdir9(projectDir).catch(() => []);
+      const files = await readdir10(projectDir).catch(() => []);
       for (const file of files) {
         if (!file.endsWith(".md")) continue;
         const content = await readFile4(path80.join(projectDir, file), "utf-8").catch(() => "");
@@ -26042,7 +26132,7 @@ var init_codebase = __esm({
 // src/wiki-engine/code-knowledge/code-collector.ts
 import { createHash as createHash2 } from "crypto";
 import { execFile as execFile4 } from "child_process";
-import { readFile as readFile5, readdir as readdir2, stat } from "fs/promises";
+import { readFile as readFile5, readdir as readdir3, stat } from "fs/promises";
 import path84 from "path";
 import { promisify as promisify3 } from "util";
 function isKeyFile(relativePath, language) {
@@ -26104,7 +26194,7 @@ async function walk(directory, results, includeTests) {
   if (safeIgnore(directory)) {
     return;
   }
-  for (const entry of await readdir2(directory, { withFileTypes: true })) {
+  for (const entry of await readdir3(directory, { withFileTypes: true })) {
     const fullPath = path84.join(directory, entry.name);
     if (safeIgnore(fullPath) || !includeTests && isTestPath(fullPath)) {
       continue;
@@ -27310,14 +27400,14 @@ var init_reconciler_v2_types = __esm({
 });
 
 // src/wiki-engine/knowledge-reconciler.ts
-import { readFile as readFile7, readdir as readdir3, stat as stat3 } from "fs/promises";
+import { readFile as readFile7, readdir as readdir4, stat as stat3 } from "fs/promises";
 import path88 from "path";
 async function exists2(p) {
   return stat3(p).then(() => true).catch(() => false);
 }
 async function readPages(dirPath) {
   if (!await exists2(dirPath)) return [];
-  const entries = await readdir3(dirPath, { withFileTypes: true });
+  const entries = await readdir4(dirPath, { withFileTypes: true });
   const pages = [];
   for (const entry of entries) {
     const full = path88.join(dirPath, entry.name);
@@ -28786,10 +28876,10 @@ __export(repo_cache_exports, {
   writeLastSync: () => writeLastSync
 });
 import path91 from "path";
-import os11 from "os";
+import os12 from "os";
 import fs32 from "fs-extra";
 function getCacheRoot2() {
-  return process.env.TEAMAI_CACHE_DIR ?? path91.join(os11.homedir(), ".teamai", "cache", "repos");
+  return process.env.TEAMAI_CACHE_DIR ?? path91.join(os12.homedir(), ".teamai", "cache", "repos");
 }
 function getRepoCacheDir(provider, owner, repo) {
   return path91.join(getCacheRoot2(), provider, owner, repo);
@@ -28836,7 +28926,7 @@ var deep_enrich_exports = {};
 __export(deep_enrich_exports, {
   deepEnrich: () => deepEnrich
 });
-import { readFile as readFile9, writeFile as writeFile10, readdir as readdir4, mkdir as mkdir7 } from "fs/promises";
+import { readFile as readFile9, writeFile as writeFile10, readdir as readdir5, mkdir as mkdir7 } from "fs/promises";
 import path92 from "path";
 async function readFileSafe4(filePath) {
   try {
@@ -28862,7 +28952,7 @@ async function loadContext(evidenceDir) {
   const moduleDocs = /* @__PURE__ */ new Map();
   if (await pathExists(modulesDir)) {
     try {
-      const entries = await readdir4(modulesDir);
+      const entries = await readdir5(modulesDir);
       await Promise.all(
         entries.filter((e) => e.endsWith(".md")).map(async (e) => {
           const content = await readFileSafe4(path92.join(modulesDir, e));
@@ -29393,7 +29483,7 @@ async function deepEnrich(opts) {
     const progressStale = manifestTime && progress.startedAt < manifestTime;
     let docsEmpty = true;
     if (await pathExists(docsDir)) {
-      const entries = await readdir4(docsDir).catch(() => []);
+      const entries = await readdir5(docsDir).catch(() => []);
       docsEmpty = entries.filter((e) => e.endsWith(".md")).length === 0;
     }
     if (docsEmpty || progressStale) {
@@ -29463,7 +29553,7 @@ __export(graph_aggregate_exports, {
   aggregateGlobalGraph: () => aggregateGlobalGraph
 });
 import path93 from "path";
-import { readdir as readdir5 } from "fs/promises";
+import { readdir as readdir6 } from "fs/promises";
 import fs33 from "fs-extra";
 async function aggregateGlobalGraph(teamwikiRoot) {
   const evidenceBase = path93.join(teamwikiRoot, "evidence", "code");
@@ -29471,7 +29561,7 @@ async function aggregateGlobalGraph(teamwikiRoot) {
   const { mergeGraphs: mergeGraphs2 } = await Promise.resolve().then(() => (init_adapters(), adapters_exports));
   const { detectCrossRepoEdges: detectCrossRepoEdges2 } = await Promise.resolve().then(() => (init_import_repo(), import_repo_exports));
   let globalGraph = null;
-  const projectDirs = await readdir5(evidenceBase, { withFileTypes: true });
+  const projectDirs = await readdir6(evidenceBase, { withFileTypes: true });
   for (const dir of projectDirs) {
     if (!dir.isDirectory()) continue;
     const graphPath = path93.join(evidenceBase, dir.name, ".indices", "graph-index.json");
@@ -30110,7 +30200,7 @@ var rebuild_wiki_index_exports = {};
 __export(rebuild_wiki_index_exports, {
   rebuildWikiIndex: () => rebuildWikiIndex
 });
-import { readFile as readFile10, readdir as readdir6, stat as stat4, writeFile as writeFile11 } from "fs/promises";
+import { readFile as readFile10, readdir as readdir7, stat as stat4, writeFile as writeFile11 } from "fs/promises";
 import path96 from "path";
 async function rebuildWikiIndex(teamwikiRoot) {
   const evidenceCodeDir = path96.join(teamwikiRoot, "evidence", "code");
@@ -30119,7 +30209,7 @@ async function rebuildWikiIndex(teamwikiRoot) {
   let totalFacts = 0, totalNodes = 0, totalEdges = 0;
   const allInterfaces = {};
   let totalCallChains = 0;
-  const dirs = await readdir6(evidenceCodeDir);
+  const dirs = await readdir7(evidenceCodeDir);
   for (const dir of dirs) {
     const dirPath = path96.join(evidenceCodeDir, dir);
     const dirStat = await stat4(dirPath).catch(() => null);
@@ -30844,7 +30934,7 @@ __export(import_exports, {
   importCmd: () => importCmd
 });
 import path101 from "path";
-import os12 from "os";
+import os13 from "os";
 import fs39 from "fs-extra";
 import { Listr, PRESET_TIMER } from "listr2";
 async function importCmd(opts) {
@@ -31038,7 +31128,7 @@ async function importCmd(opts) {
         log.success(`Local directory ${slug} import complete (dry-run)`);
         return;
       }
-      const tmpExtractDir = await fs39.mkdtemp(path101.join(os12.tmpdir(), "teamai-extract-"));
+      const tmpExtractDir = await fs39.mkdtemp(path101.join(os13.tmpdir(), "teamai-extract-"));
       try {
         const { extractCodebase: extractCodebase2 } = await Promise.resolve().then(() => (init_codebase_extract(), codebase_extract_exports));
         await extractCodebase2({
@@ -31130,7 +31220,7 @@ var codebase_upgrade_wiki_exports = {};
 __export(codebase_upgrade_wiki_exports, {
   upgradeCodebaseWiki: () => upgradeCodebaseWiki
 });
-import { readdir as readdir7, readFile as readFile11 } from "fs/promises";
+import { readdir as readdir8, readFile as readFile11 } from "fs/promises";
 import path102 from "path";
 import chalk5 from "chalk";
 import matter9 from "gray-matter";
@@ -31144,7 +31234,7 @@ async function upgradeCodebaseWiki(opts) {
     }
     return;
   }
-  const files = await readdir7(teamCodebaseDir);
+  const files = await readdir8(teamCodebaseDir);
   const mdFiles = files.filter((f) => f.endsWith(".md"));
   if (mdFiles.length === 0) {
     if (opts.json) {
@@ -31229,7 +31319,7 @@ __export(codebase_wiki_lint_exports, {
   formatWikiLintReport: () => formatWikiLintReport,
   lintTeamwiki: () => lintTeamwiki
 });
-import { readFile as readFile12, readdir as readdir8, stat as stat5 } from "fs/promises";
+import { readFile as readFile12, readdir as readdir9, stat as stat5 } from "fs/promises";
 import path103 from "path";
 import chalk6 from "chalk";
 async function lintTeamwiki(opts) {
@@ -31274,7 +31364,7 @@ async function lintTeamwiki(opts) {
       message: "evidence \u76EE\u5F55\u4E0D\u5B58\u5728\uFF0C\u65E0\u4EE3\u7801\u4E8B\u5B9E\u9875"
     });
   } else {
-    const projects = await readdir8(evidenceDir);
+    const projects = await readdir9(evidenceDir);
     if (projects.length === 0) {
       addIssue({
         severity: "medium",
@@ -31292,7 +31382,7 @@ async function lintTeamwiki(opts) {
         }
         continue;
       }
-      const files = await readdir8(projectDir);
+      const files = await readdir9(projectDir);
       if (!files.includes("index.md")) {
         addIssue({
           severity: "low",

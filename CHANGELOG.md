@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file. See [standa
 
 ## [Unreleased]
 
+### Fixed
+
+- **Autocode Core 0.20.0-autocode.6**: Codex roles with nested host settings (for example `tool_extras.agents.enabled: false`) now keep `developer_instructions` at the TOML root. Scalar-only role output keeps its existing byte format. This fixes rendering; the host still determines actual tool availability and inherited permissions.
+
 ### Added
 
 - **Autocode Core 0.20.0-autocode.5**: doctor JSON checks now expose stable IDs so focused host validation can ignore unrelated provider failures; identical DSH instruction files are reported as file evidence rather than inferred runtime loading.

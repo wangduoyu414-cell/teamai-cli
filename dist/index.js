@@ -9858,6 +9858,9 @@ function renderTomlAgent(spec, extras) {
       tomlData[key] = value;
     }
   }
+  if (Object.values(tomlData).some((value) => value !== null && typeof value === "object")) {
+    return stringifyToml({ ...tomlData, developer_instructions: spec.instructions.replace(/\n*$/, "") });
+  }
   const prefix = stringifyToml(tomlData).trimEnd();
   const instructions = spec.instructions.replace(/\n*$/, "").replaceAll('"""', '\\"\\"\\"');
   return `${prefix}

@@ -1,3 +1,9 @@
+## 0.20.0-autocode.7
+
+- Detect GitHub CLI directly on Windows/macOS; cloning uses gh with a repository-local credential helper, never a token-bearing remote URL. GitHub synchronization now requires gh; token environment variables remain supported through gh.
+- Preserve explicit local Skill runtime and Cookie Bridge secret paths across source updates. Reject remote payloads at those paths; retain packages with local data on uninstall/rename. Ignore disposable Python bytecode in source conflict detection.
+- Reuse existing resource transactions and backups; add preservation, rollback, source-conflict and portable authentication regression tests.
+
 # Changelog
 
 All notable changes to this project will be documented in this file. See [standard-version](https://github.com/conventional-changelog/standard-version) for commit guidelines.

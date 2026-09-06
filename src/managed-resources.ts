@@ -26,6 +26,8 @@ export interface ManagedResourceTarget {
   prepareStaged?: (payloadPath: string) => Promise<void>;
   /** A project instruction owns this block only, never the surrounding file. */
   section?: ManagedSection;
+  /** Explicit local-only Skill paths: never supplied by the remote source. */
+  preservePaths?: string[];
 }
 
 export interface DesiredManagedResource {
@@ -42,6 +44,8 @@ interface ManagedTargetRecord {
   tool?: string;
   hostRoot?: string;
   section?: ManagedSection;
+  /** Explicit local-only Skill paths: never supplied by the remote source. */
+  preservePaths?: string[];
   hash: string;
   ownership: ManagedOwnership;
   backupPath?: string;
@@ -139,6 +143,7 @@ const ManagedTargetRecordShapeSchema = z.object({
   tool: z.string().min(1).optional(),
   hostRoot: z.string().min(1).optional(),
   section: ManagedSectionSchema.optional(),
+  preservePaths: z.array(z.enum([".runtime", "assets/douyin-cookie-bridge/bridge-secret.local.json"])).optional(),
   hash: z.string().regex(HASH_PATTERN),
   ownership: z.enum(['created', 'adopted', 'replaced-with-backup']),
   backupPath: z.string().min(1).optional(),
@@ -308,6 +313,7 @@ async function validateManifestSemantics(home: string, manifest: ManagedResource
   for (const [id, resource] of Object.entries(manifest.resources)) {
     if (resource.id !== id) throw new Error(`Managed resource key/id mismatch: ${id}`);
     for (const target of resource.targets) {
+      if (target.preservePaths && (resource.type !== 'skills' || target.kind !== 'directory')) throw new Error('Local-only paths require a Skill directory');
       const external = !path.isAbsolute(target.path) || !isWithin(scopeRoot, target.path);
       if (external && !(resource.type === 'skills' && target.tool === 'openclaw')
         && !isNarrowHostTarget(resource.type, target.tool, target.path, target.hostRoot)) {
@@ -514,7 +520,7 @@ function removeSection(content: string, section: ManagedSection): string {
   return `${before}${after}`.trimEnd() + (before || after ? '\n' : '');
 }
 
-async function hashPath(target: string, kind: ManagedPathKind, section?: ManagedSection): Promise<string | null> {
+async function hashPath(target: string, kind: ManagedPathKind, section?: ManagedSection, preservePaths: string[] = []): Promise<string | null> {
   try {
     const stat = await fse.lstat(target);
     if ((stat.isDirectory() ? 'directory' : 'file') !== kind) return `kind:${stat.isDirectory() ? 'directory' : 'file'}`;
@@ -525,7 +531,7 @@ async function hashPath(target: string, kind: ManagedPathKind, section?: Managed
     if (kind === 'file') return digest(await fse.readFile(target));
     const hash = crypto.createHash('sha256');
     hash.update('directory\0');
-    await hashDirectory(target, '', hash);
+    await hashDirectory(target, '', hash, preservePaths);
     return hash.digest('hex');
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
@@ -610,7 +616,7 @@ export async function managedManifestUnchangedTargetPaths(
   for (const resource of Object.values(manifest.resources)) {
     if (resource.type !== type) continue;
     for (const target of resource.targets) {
-      if (await hashPath(target.path, target.kind, target.section) === target.hash) {
+      if (await hashPath(target.path, target.kind, target.section, target.preservePaths) === target.hash) {
         unchanged.add(path.resolve(target.path));
       }
     }
@@ -618,15 +624,18 @@ export async function managedManifestUnchangedTargetPaths(
   return unchanged;
 }
 
-async function hashDirectory(root: string, relative: string, hash: crypto.Hash): Promise<void> {
+async function hashDirectory(root: string, relative: string, hash: crypto.Hash, preservePaths: string[] = []): Promise<void> {
   const entries = await fse.readdir(path.join(root, relative), { withFileTypes: true });
   entries.sort((a, b) => a.name.localeCompare(b.name));
   for (const entry of entries) {
     const rel = relative ? path.join(relative, entry.name) : entry.name;
+    // Python bytecode is disposable runtime output, not a source edit.
+    if (preservePaths.length && entry.name === "__pycache__" && entry.isDirectory()) continue;
+    if (preservePaths.includes(rel.split(path.sep).join("/"))) continue;
     const fullPath = path.join(root, rel);
     if (entry.isDirectory()) {
       hash.update(`d:${rel}\0`);
-      await hashDirectory(root, rel, hash);
+      await hashDirectory(root, rel, hash, preservePaths);
     } else if (entry.isFile()) {
       hash.update(`f:${rel}\0`);
       hash.update(await fse.readFile(fullPath));
@@ -689,8 +698,14 @@ async function stageTarget(target: ManagedResourceTarget, transactionId: string,
       if ((source.isDirectory() ? 'directory' : 'file') !== target.kind) throw new Error(`Managed source kind does not match ${target.path}`);
       await fse.copy(target.sourcePath!, payload, { overwrite: true });
     }
+    for (const local of target.preservePaths ?? []) {
+      const localPath = path.join(payload, local);
+      const present = await fse.lstat(localPath).then(() => true, (e: NodeJS.ErrnoException) => { if (e.code === 'ENOENT') return false; throw e; });
+      if (present) throw new Error(`Remote source contains local-only path: ${local}`);
+      await assertAbsoluteWithin([payload], localPath, 'Local-only staged path');
+    }
     if (target.prepareStaged) await target.prepareStaged(payload);
-    const hash = target.section ? digest(target.content!) : await hashPath(payload, target.kind);
+    const hash = target.section ? digest(target.content!) : await hashPath(payload, target.kind, undefined, target.preservePaths);
     if (!hash) throw new Error(`Could not stage ${target.path}`);
     return { target, root, payload, hash };
   } catch (error) {
@@ -900,6 +915,12 @@ export async function reconcileManagedResources(
   desiredResources: DesiredManagedResource[],
   options: ManagedReconcileOptions = {},
 ): Promise<ManagedReconcileResult> {
+  for (const resource of desiredResources) for (const target of resource.targets) {
+    if (target.preservePaths && (resource.type !== 'skills' || target.kind !== 'directory'
+      || target.preservePaths.some(p => !['.runtime', 'assets/douyin-cookie-bridge/bridge-secret.local.json'].includes(p)))) {
+      throw new Error('Invalid local-only Skill paths');
+    }
+  }
   if (options.plan) {
     const pending = await readJournal(home);
     if (pending && pending.status !== 'completed' && pending.status !== 'rolled-back') {
@@ -945,7 +966,7 @@ export async function reconcileManagedResources(
     for (const target of resource.targets) {
       const prior = findRecordByPath(manifest, target.path);
       if (!prior) continue;
-      const currentHash = await hashPath(target.path, prior.kind, prior.section);
+      const currentHash = await hashPath(target.path, prior.kind, prior.section, prior.preservePaths);
       if (currentHash !== null && currentHash !== prior.hash) {
         conflictIds.add(resource.id);
         result.conflicts.push(`${resource.id}: ${target.path} was modified locally`);
@@ -1000,7 +1021,7 @@ export async function reconcileManagedResources(
         const entry = staged.get(`${resource.id}\0${target.path}`)!;
         const prior = findRecordByPath(manifest, target.path);
         const targetExisted = await fse.pathExists(target.path);
-        const currentHash = await hashPath(target.path, target.kind, target.section);
+        const currentHash = await hashPath(target.path, target.kind, target.section, target.preservePaths);
         let ownership: ManagedOwnership;
         let backupPath: string | undefined;
         let backupHash: string | undefined;
@@ -1022,6 +1043,18 @@ export async function reconcileManagedResources(
           backupHash = backup.hash;
         }
         if (currentHash !== entry.hash) {
+          // Copy local data only when source changes. Unchanged pulls neither
+          // traverse nor copy the virtual environment. The existing transaction
+          // captures the complete old directory for rollback.
+          for (const local of target.preservePaths ?? []) {
+            const from = path.join(target.path, local);
+            if (await fse.pathExists(from)) {
+              const resolved = await fse.realpath(from);
+              const base = await fse.realpath(target.path);
+              if (!isWithin(base, resolved) || (await fse.lstat(from)).isSymbolicLink()) throw new Error(`Local-only path escapes Skill: ${local}`);
+              await fse.copy(from, path.join(entry.payload, local), { dereference: false });
+            }
+          }
           await recordOperation(home, journal, target.path, entry.payload, entry.root, target.hostRoot, target.tool, resource.type);
           result.applied.push(target.path);
           appliedCount++;
@@ -1033,6 +1066,7 @@ export async function reconcileManagedResources(
           tool: target.tool,
           hostRoot: target.hostRoot,
           section: target.section,
+          preservePaths: target.preservePaths,
           hash: entry.hash,
           ownership,
           backupPath,
@@ -1062,7 +1096,11 @@ export async function reconcileManagedResources(
       const wanted = new Set([...(desired?.targets.map((target) => target.path) ?? []), ...(desired?.retainTargetPaths ?? [])]);
       for (const oldTarget of oldResource.targets) {
         if (wanted.has(oldTarget.path) || desiredPaths.has(oldTarget.path)) continue;
-        const currentHash = await hashPath(oldTarget.path, oldTarget.kind, oldTarget.section);
+        if ((await Promise.all((oldTarget.preservePaths ?? []).map(local => fse.pathExists(path.join(oldTarget.path, local))))).some(Boolean)) {
+          result.conflicts.push(`${id}: local runtime/data retained at ${oldTarget.path}; move it outside the Skill before uninstall or rename`);
+          continue;
+        }
+        const currentHash = await hashPath(oldTarget.path, oldTarget.kind, oldTarget.section, oldTarget.preservePaths);
         if (currentHash !== null && currentHash !== oldTarget.hash) {
           result.conflicts.push(`${id}: ${oldTarget.path} was modified locally`);
           continue;

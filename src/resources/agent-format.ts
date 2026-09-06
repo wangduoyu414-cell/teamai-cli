@@ -327,6 +327,12 @@ function renderTomlAgent(spec: AgentSpec, extras?: Record<string, unknown>): str
       tomlData[key] = value;
     }
   }
+  // A table header changes the scope of every later key. Let the serializer
+  // place root instructions before tables (agents, mcp_servers, permissions).
+  // Preserve the existing byte format for scalar-only configurations.
+  if (Object.values(tomlData).some((value) => value !== null && typeof value === 'object')) {
+    return stringifyToml({ ...tomlData, developer_instructions: spec.instructions.replace(/\n*$/, '') });
+  }
   const prefix = stringifyToml(tomlData).trimEnd();
   const instructions = spec.instructions.replace(/\n*$/, '').replaceAll('"""', '\\"\\"\\"');
   return `${prefix}\ndeveloper_instructions = """\n${instructions}\n"""\n`;

@@ -98,7 +98,7 @@ jobs:
         run: npm run typecheck
 
       - name: Verify special host root lifecycle
-        run: npx vitest run src/__tests__/special-hosts.test.ts
+        run: npx vitest run src/__tests__/special-hosts.test.ts src/__tests__/gh-portable-sync.test.ts src/__tests__/managed-resources.test.ts
 
   e2e:
     name: E2E (GitHub provider, full surface)

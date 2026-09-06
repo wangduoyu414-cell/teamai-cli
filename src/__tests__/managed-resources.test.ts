@@ -752,3 +752,55 @@ describe('managed resource lifecycle', () => {
       .rejects.toThrow('requires recovery before plan');
   });
 });
+
+describe('local-only Skill data', () => {
+  async function setup() {
+    const {root, home} = await fixture();
+    const source = path.join(root, 'source');
+    const target = path.join(root, 'skills', 'archive');
+    await fse.outputFile(path.join(source, 'SKILL.md'), 'v1');
+    await fse.ensureDir(path.join(source, 'assets', 'douyin-cookie-bridge'));
+    const resource: DesiredManagedResource = {id:'skills:archive', type:'skills', targets:[{
+      path:target, kind:'directory', sourcePath:source,
+      preservePaths:['.runtime','assets/douyin-cookie-bridge/bridge-secret.local.json'],
+    }]};
+    return {root,home,source,target,resource};
+  }
+  it('adopts manual installs, preserves runtime/secret on updates, and leaves no-op pulls unchanged', async () => {
+    const {home,source,target,resource} = await setup();
+    await fse.copy(source,target);
+    await fse.outputFile(path.join(target,'.runtime','python'),'local-runtime');
+    const secret=path.join(target,'assets/douyin-cookie-bridge/bridge-secret.local.json');
+    await fse.outputFile(secret,'local-secret');
+    expect((await reconcileManagedResources(home,[resource])).applied).toEqual([]);
+    await fse.outputFile(path.join(target,'.runtime','package'),'installed-later');
+    await fse.outputFile(path.join(target,'assets','douyin-cookie-bridge','__pycache__','test.pyc'),'cache');
+    await fse.writeFile(path.join(source,'SKILL.md'),'v2');
+    expect((await reconcileManagedResources(home,[resource])).conflicts).toEqual([]);
+    expect(await fse.readFile(secret,'utf8')).toBe('local-secret');
+    expect(await fse.readFile(path.join(target,'.runtime','package'),'utf8')).toBe('installed-later');
+    expect(await fse.readFile(path.join(target,'SKILL.md'),'utf8')).toBe('v2');
+    expect((await reconcileManagedResources(home,[resource])).applied).toEqual([]);
+    expect((await uninstallManagedResources(home)).conflicts.length).toBe(1);
+    expect(await fse.pathExists(secret)).toBe(true);
+  });
+  it('retains actual source conflicts and rolls back both source and local data on failure', async () => {
+    const {home,source,target,resource}=await setup();
+    await reconcileManagedResources(home,[resource]);
+    await fse.outputFile(path.join(target,'.runtime','keep'),'keep');
+    await fse.writeFile(path.join(source,'SKILL.md'),'v2');
+    await expect(reconcileManagedResources(home,[resource],{failAfterApply:1})).rejects.toThrow('Injected');
+    expect(await fse.readFile(path.join(target,'SKILL.md'),'utf8')).toBe('v1');
+    expect(await fse.readFile(path.join(target,'.runtime','keep'),'utf8')).toBe('keep');
+    await fse.writeFile(path.join(target,'SKILL.md'),'user edit');
+    expect((await reconcileManagedResources(home,[resource])).conflicts.length).toBe(1);
+    expect(await fse.readFile(path.join(target,'SKILL.md'),'utf8')).toBe('user edit');
+  });
+  it('rejects remote runtime payloads and unapproved preservation paths', async () => {
+    const {home,source,resource}=await setup();
+    await fse.outputFile(path.join(source,'.runtime','bad'),'bad');
+    await expect(reconcileManagedResources(home,[resource])).rejects.toThrow('local-only');
+    resource.targets[0].preservePaths=['../escape'];
+    await expect(reconcileManagedResources(home,[resource])).rejects.toThrow('Invalid');
+  });
+});

@@ -474,6 +474,7 @@ export class SkillsHandler extends ResourceHandler {
           tool,
           ...(specialSkillsDir ? { hostRoot: path.dirname(specialSkillsDir) } : {}),
           sourcePath: item.sourcePath,
+          preservePaths: [".runtime", "assets/douyin-cookie-bridge/bridge-secret.local.json"],
           // Preserve pull's historic destination-only frontmatter repair without
           // mutating the team checkout that supplied the resource.
           prepareStaged: async (payload) => { await ensureSkillFrontmatter(payload, item.name); },

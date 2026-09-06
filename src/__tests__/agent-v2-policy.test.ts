@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { parseAgentYaml, renderForTool, agentFilename } from '../resources/agent-format.js';
 import { resolveModelRef } from '../model-policy.js';
+import { parse as parseToml } from 'smol-toml';
 
 describe('Agent Schema v2 host-first policy', () => {
   const yaml = `schema_version: 2
@@ -61,5 +62,16 @@ hosts:
     expect(resolveModelRef(policy, 'codex', 'host_mappings.codex.bounded_implementer')).toEqual({ model: 'gpt-5.6-terra', effort: 'xhigh' });
     expect(resolveModelRef(policy, 'qwen', 'host_mappings.qwen.agent_variants.bounded_implementer')).toEqual({ model: 'qwen-max', effort: 'high' });
     expect(() => resolveModelRef(policy, 'codex', 'host_mappings.codex.missing')).toThrow();
+  });
+
+  it('keeps instructions at the root when a Codex role disables delegation', () => {
+    const result = parseAgentYaml(yaml.replace('    sandbox_mode: workspace-write',
+      '    sandbox_mode: workspace-write\n    tool_extras:\n      agents:\n        enabled: false'), 'bounded_implementer.yaml');
+    if (!result.ok) throw new Error(result.reason);
+    const parsed = parseToml(renderForTool(result.spec, 'codex').content);
+    expect(parsed.developer_instructions).toBe('Implement the requested change.');
+    expect(parsed.agents).toEqual({ enabled: false });
+    expect(parsed.sandbox_mode).toBe('workspace-write');
+    expect(parsed.model_reasoning_effort).toBe('xhigh');
   });
 });

@@ -2107,15 +2107,11 @@ var init_tgit = __esm({
 });
 
 // src/providers/github/gh-cli.ts
-import { execSync as execSync2, spawnSync as spawnSync2 } from "child_process";
+import { spawnSync as spawnSync2 } from "child_process";
 function getGhPath() {
   try {
-    const which = execSync2("which gh", {
-      encoding: "utf-8",
-      stdio: ["pipe", "pipe", "pipe"]
-    });
-    const trimmed = which.trim();
-    return trimmed || null;
+    const result = spawnSync2("gh", ["--version"], { encoding: "utf8", windowsHide: true });
+    return result.status === 0 ? "gh" : null;
   } catch {
     return null;
   }
@@ -2127,7 +2123,7 @@ function ghExec(args, options) {
   const ghPath = getGhPath();
   if (!ghPath) {
     throw new Error(
-      "gh CLI not found. Install it from https://cli.github.com/ or set GITHUB_TOKEN environment variable."
+      "gh CLI not found. Install it from https://cli.github.com/ then reuse your existing GitHub login."
     );
   }
   log.debug(`gh exec: ${ghPath} ${args.join(" ")}`);
@@ -2156,12 +2152,8 @@ async function ensureGhAvailable() {
     log.debug("gh CLI detected");
     return;
   }
-  if (getGitHubToken()) {
-    log.debug("GITHUB_TOKEN env var detected \u2014 will use REST API directly");
-    return;
-  }
   throw new Error(
-    'GitHub authentication unavailable.\n  Option 1 (recommended): Install gh CLI \u2014 https://cli.github.com/\n    macOS:   brew install gh\n    Linux:   see https://github.com/cli/cli/blob/trunk/docs/install_linux.md\n  Option 2: Export a personal access token \u2014 GITHUB_TOKEN=ghp_... (needs "repo" scope)'
+    "GitHub authentication unavailable.\n  Option 1 (recommended): Install gh CLI \u2014 https://cli.github.com/\n    macOS:   brew install gh\n    Linux:   see https://github.com/cli/cli/blob/trunk/docs/install_linux.md\n    Windows: install GitHub CLI from https://cli.github.com/\n  Then reuse an existing login or run gh auth login --web --git-protocol https. Model API keys are not required."
   );
 }
 function getGitHubToken() {
@@ -2247,13 +2239,7 @@ async function ensureGhAuthenticated() {
   return verified;
 }
 function ghRepoClone(repo, localPath) {
-  const token2 = ghGetOAuthToken();
-  const cloneUrl = token2 ? `https://x-access-token:${token2}@github.com/${repo}.git` : `https://github.com/${repo}.git`;
-  const result = spawnSync2("git", ["clone", cloneUrl, localPath], {
-    encoding: "utf-8",
-    stdio: ["pipe", "pipe", "pipe"],
-    timeout: 12e4
-  });
+  const result = ghExec(["repo", "clone", repo, localPath]);
   const allOutput = `${result.stderr ?? ""} ${result.stdout ?? ""}`;
   if (allOutput.includes("not found") || allOutput.includes("does not exist") || allOutput.includes("Repository not found")) {
     throw new RepoNotFoundError3(repo);
@@ -2261,6 +2247,18 @@ function ghRepoClone(repo, localPath) {
   if (result.status !== 0) {
     const sanitized = allOutput.replace(/x-access-token:[^@]+@/g, "x-access-token:***@");
     throw new Error(`git clone failed: ${sanitized.trim()}`);
+  }
+  for (const helper of ["", "!gh auth git-credential"]) {
+    const configured = spawnSync2("git", [
+      "-C",
+      localPath,
+      "config",
+      "--local",
+      "--add",
+      "credential.https://github.com.helper",
+      helper
+    ], { encoding: "utf8", windowsHide: true });
+    if (configured.status !== 0) throw new Error("Repository cloned, but its GitHub credential helper could not be configured.");
   }
 }
 async function ghCreateRepo(owner, repo) {
@@ -2649,7 +2647,7 @@ var init_github = __esm({
 });
 
 // src/providers/cnb/cnb-cli.ts
-import { execSync as execSync3, spawnSync as spawnSync3 } from "child_process";
+import { execSync as execSync2, spawnSync as spawnSync3 } from "child_process";
 function cnbExec(args, options) {
   log.debug(`cnb exec: cnb ${args.join(" ")}`);
   if (options?.inheritStdio) {
@@ -2679,7 +2677,7 @@ function assertCnbApiOk(out, action) {
 }
 function isCnbInstalled() {
   try {
-    execSync3("which cnb", { stdio: ["pipe", "pipe", "pipe"] });
+    execSync2("which cnb", { stdio: ["pipe", "pipe", "pipe"] });
     return true;
   } catch {
     return false;
@@ -2692,7 +2690,7 @@ async function ensureCnbInstalled() {
   }
   const spin = spinner("Installing cnb CLI (@cnbcool/cnb-cli)...").start();
   try {
-    execSync3("npm install -g @cnbcool/cnb-cli", { stdio: ["pipe", "pipe", "pipe"], timeout: 12e4 });
+    execSync2("npm install -g @cnbcool/cnb-cli", { stdio: ["pipe", "pipe", "pipe"], timeout: 12e4 });
     if (!isCnbInstalled()) throw new Error("cnb not found on PATH after install");
     spin.succeed("cnb CLI installed");
   } catch (e) {
@@ -3337,6 +3335,7 @@ async function validateManifestSemantics(home, manifest) {
   for (const [id, resource] of Object.entries(manifest.resources)) {
     if (resource.id !== id) throw new Error(`Managed resource key/id mismatch: ${id}`);
     for (const target of resource.targets) {
+      if (target.preservePaths && (resource.type !== "skills" || target.kind !== "directory")) throw new Error("Local-only paths require a Skill directory");
       const external = !path12.isAbsolute(target.path) || !isWithin(scopeRoot, target.path);
       if (external && !(resource.type === "skills" && target.tool === "openclaw") && !isNarrowHostTarget(resource.type, target.tool, target.path, target.hostRoot)) {
         throw new Error(`Only OpenClaw skills may use an external managed target: ${target.path}`);
@@ -3521,7 +3520,7 @@ function removeSection(content, section) {
   if (`${before}${after}`.trim() === "") return "";
   return `${before}${after}`.trimEnd() + (before || after ? "\n" : "");
 }
-async function hashPath(target, kind, section) {
+async function hashPath(target, kind, section, preservePaths = []) {
   try {
     const stat6 = await fse3.lstat(target);
     if ((stat6.isDirectory() ? "directory" : "file") !== kind) return `kind:${stat6.isDirectory() ? "directory" : "file"}`;
@@ -3532,7 +3531,7 @@ async function hashPath(target, kind, section) {
     if (kind === "file") return digest(await fse3.readFile(target));
     const hash = crypto2.createHash("sha256");
     hash.update("directory\0");
-    await hashDirectory(target, "", hash);
+    await hashDirectory(target, "", hash, preservePaths);
     return hash.digest("hex");
   } catch (error) {
     if (error.code === "ENOENT") return null;
@@ -3602,22 +3601,24 @@ async function managedManifestUnchangedTargetPaths(home, type) {
   for (const resource of Object.values(manifest.resources)) {
     if (resource.type !== type) continue;
     for (const target of resource.targets) {
-      if (await hashPath(target.path, target.kind, target.section) === target.hash) {
+      if (await hashPath(target.path, target.kind, target.section, target.preservePaths) === target.hash) {
         unchanged.add(path12.resolve(target.path));
       }
     }
   }
   return unchanged;
 }
-async function hashDirectory(root, relative, hash) {
+async function hashDirectory(root, relative, hash, preservePaths = []) {
   const entries = await fse3.readdir(path12.join(root, relative), { withFileTypes: true });
   entries.sort((a, b) => a.name.localeCompare(b.name));
   for (const entry of entries) {
     const rel = relative ? path12.join(relative, entry.name) : entry.name;
+    if (preservePaths.length && entry.name === "__pycache__" && entry.isDirectory()) continue;
+    if (preservePaths.includes(rel.split(path12.sep).join("/"))) continue;
     const fullPath = path12.join(root, rel);
     if (entry.isDirectory()) {
       hash.update(`d:${rel}\0`);
-      await hashDirectory(root, rel, hash);
+      await hashDirectory(root, rel, hash, preservePaths);
     } else if (entry.isFile()) {
       hash.update(`f:${rel}\0`);
       hash.update(await fse3.readFile(fullPath));
@@ -3670,8 +3671,17 @@ async function stageTarget(target, transactionId, index) {
       if ((source.isDirectory() ? "directory" : "file") !== target.kind) throw new Error(`Managed source kind does not match ${target.path}`);
       await fse3.copy(target.sourcePath, payload, { overwrite: true });
     }
+    for (const local of target.preservePaths ?? []) {
+      const localPath = path12.join(payload, local);
+      const present = await fse3.lstat(localPath).then(() => true, (e) => {
+        if (e.code === "ENOENT") return false;
+        throw e;
+      });
+      if (present) throw new Error(`Remote source contains local-only path: ${local}`);
+      await assertAbsoluteWithin([payload], localPath, "Local-only staged path");
+    }
     if (target.prepareStaged) await target.prepareStaged(payload);
-    const hash = target.section ? digest(target.content) : await hashPath(payload, target.kind);
+    const hash = target.section ? digest(target.content) : await hashPath(payload, target.kind, void 0, target.preservePaths);
     if (!hash) throw new Error(`Could not stage ${target.path}`);
     return { target, root, payload, hash };
   } catch (error) {
@@ -3830,6 +3840,11 @@ async function recordOperation(home, journal, target, payload, stagedRoot, hostR
   await writeJournal(home, journal);
 }
 async function reconcileManagedResources(home, desiredResources, options = {}) {
+  for (const resource of desiredResources) for (const target of resource.targets) {
+    if (target.preservePaths && (resource.type !== "skills" || target.kind !== "directory" || target.preservePaths.some((p) => ![".runtime", "assets/douyin-cookie-bridge/bridge-secret.local.json"].includes(p)))) {
+      throw new Error("Invalid local-only Skill paths");
+    }
+  }
   if (options.plan) {
     const pending = await readJournal(home);
     if (pending && pending.status !== "completed" && pending.status !== "rolled-back") {
@@ -3872,7 +3887,7 @@ async function reconcileManagedResources(home, desiredResources, options = {}) {
     for (const target of resource.targets) {
       const prior = findRecordByPath(manifest, target.path);
       if (!prior) continue;
-      const currentHash = await hashPath(target.path, prior.kind, prior.section);
+      const currentHash = await hashPath(target.path, prior.kind, prior.section, prior.preservePaths);
       if (currentHash !== null && currentHash !== prior.hash) {
         conflictIds.add(resource.id);
         result.conflicts.push(`${resource.id}: ${target.path} was modified locally`);
@@ -3929,7 +3944,7 @@ async function reconcileManagedResources(home, desiredResources, options = {}) {
         const entry = staged.get(`${resource.id}\0${target.path}`);
         const prior = findRecordByPath(manifest, target.path);
         const targetExisted = await fse3.pathExists(target.path);
-        const currentHash = await hashPath(target.path, target.kind, target.section);
+        const currentHash = await hashPath(target.path, target.kind, target.section, target.preservePaths);
         let ownership;
         let backupPath;
         let backupHash;
@@ -3949,6 +3964,15 @@ async function reconcileManagedResources(home, desiredResources, options = {}) {
           backupHash = backup.hash;
         }
         if (currentHash !== entry.hash) {
+          for (const local of target.preservePaths ?? []) {
+            const from = path12.join(target.path, local);
+            if (await fse3.pathExists(from)) {
+              const resolved = await fse3.realpath(from);
+              const base = await fse3.realpath(target.path);
+              if (!isWithin(base, resolved) || (await fse3.lstat(from)).isSymbolicLink()) throw new Error(`Local-only path escapes Skill: ${local}`);
+              await fse3.copy(from, path12.join(entry.payload, local), { dereference: false });
+            }
+          }
           await recordOperation(home, journal, target.path, entry.payload, entry.root, target.hostRoot, target.tool, resource.type);
           result.applied.push(target.path);
           appliedCount++;
@@ -3960,6 +3984,7 @@ async function reconcileManagedResources(home, desiredResources, options = {}) {
           tool: target.tool,
           hostRoot: target.hostRoot,
           section: target.section,
+          preservePaths: target.preservePaths,
           hash: entry.hash,
           ownership,
           backupPath,
@@ -3983,7 +4008,11 @@ async function reconcileManagedResources(home, desiredResources, options = {}) {
       const wanted = /* @__PURE__ */ new Set([...desired?.targets.map((target) => target.path) ?? [], ...desired?.retainTargetPaths ?? []]);
       for (const oldTarget of oldResource.targets) {
         if (wanted.has(oldTarget.path) || desiredPaths.has(oldTarget.path)) continue;
-        const currentHash = await hashPath(oldTarget.path, oldTarget.kind, oldTarget.section);
+        if ((await Promise.all((oldTarget.preservePaths ?? []).map((local) => fse3.pathExists(path12.join(oldTarget.path, local))))).some(Boolean)) {
+          result.conflicts.push(`${id}: local runtime/data retained at ${oldTarget.path}; move it outside the Skill before uninstall or rename`);
+          continue;
+        }
+        const currentHash = await hashPath(oldTarget.path, oldTarget.kind, oldTarget.section, oldTarget.preservePaths);
         if (currentHash !== null && currentHash !== oldTarget.hash) {
           result.conflicts.push(`${id}: ${oldTarget.path} was modified locally`);
           continue;
@@ -4082,6 +4111,7 @@ var init_managed_resources = __esm({
       tool: z3.string().min(1).optional(),
       hostRoot: z3.string().min(1).optional(),
       section: ManagedSectionSchema.optional(),
+      preservePaths: z3.array(z3.enum([".runtime", "assets/douyin-cookie-bridge/bridge-secret.local.json"])).optional(),
       hash: z3.string().regex(HASH_PATTERN),
       ownership: z3.enum(["created", "adopted", "replaced-with-backup"]),
       backupPath: z3.string().min(1).optional(),
@@ -5315,7 +5345,7 @@ var init_session_id = __esm({
 
 // src/pid-monitor.ts
 import fs7 from "fs";
-import { execSync as execSync4 } from "child_process";
+import { execSync as execSync3 } from "child_process";
 function getParentPid(pid) {
   try {
     const stat6 = fs7.readFileSync(`/proc/${pid}/stat`, "utf-8");
@@ -5327,7 +5357,7 @@ function getParentPid(pid) {
   } catch {
   }
   try {
-    const out = execSync4(`ps -o ppid= -p ${pid}`, {
+    const out = execSync3(`ps -o ppid= -p ${pid}`, {
       encoding: "utf-8",
       timeout: 2e3,
       stdio: ["pipe", "pipe", "pipe"]
@@ -5344,7 +5374,7 @@ function getProcessComm(pid) {
   } catch {
   }
   try {
-    const out = execSync4(`ps -o comm= -p ${pid}`, {
+    const out = execSync3(`ps -o comm= -p ${pid}`, {
       encoding: "utf-8",
       timeout: 2e3,
       stdio: ["pipe", "pipe", "pipe"]
@@ -9056,6 +9086,7 @@ var init_skills = __esm({
               tool,
               ...specialSkillsDir ? { hostRoot: path24.dirname(specialSkillsDir) } : {},
               sourcePath: item.sourcePath,
+              preservePaths: [".runtime", "assets/douyin-cookie-bridge/bridge-secret.local.json"],
               // Preserve pull's historic destination-only frontmatter repair without
               // mutating the team checkout that supplied the resource.
               prepareStaged: async (payload) => {
@@ -9857,6 +9888,9 @@ function renderTomlAgent(spec, extras) {
       if (key === "tools_style") continue;
       tomlData[key] = value;
     }
+  }
+  if (Object.values(tomlData).some((value) => value !== null && typeof value === "object")) {
+    return stringifyToml({ ...tomlData, developer_instructions: spec.instructions.replace(/\n*$/, "") });
   }
   const prefix = stringifyToml(tomlData).trimEnd();
   const instructions = spec.instructions.replace(/\n*$/, "").replaceAll('"""', '\\"\\"\\"');
@@ -25415,7 +25449,7 @@ var init_import_iwiki = __esm({
 });
 
 // src/providers/github/mr-fetch.ts
-import { execSync as execSync5 } from "child_process";
+import { execSync as execSync4 } from "child_process";
 import https2 from "https";
 function parseGitHubPRUrl(url) {
   const match = url.match(/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)/);
@@ -25502,12 +25536,12 @@ async function fetchGitHubPR(url) {
   const repoArg = `${owner}/${repo}`;
   log.debug(`fetchGitHubPR: ${repoArg}#${number}`);
   try {
-    const viewOutput = execSync5(
+    const viewOutput = execSync4(
       `gh pr view ${number} --repo ${repoArg} --json title,body,author,mergedAt,commits`,
       { maxBuffer: 10 * 1024 * 1024, encoding: "utf8" }
     );
     const prView = JSON.parse(viewOutput);
-    const rawDiff = execSync5(
+    const rawDiff = execSync4(
       `gh pr diff ${number} --repo ${repoArg}`,
       { maxBuffer: 50 * 1024 * 1024, encoding: "utf8" }
     );
@@ -25914,7 +25948,7 @@ var init_import_mr = __esm({
 });
 
 // src/codebase.ts
-import { execSync as execSync6 } from "child_process";
+import { execSync as execSync5 } from "child_process";
 import fs30 from "fs";
 import path83 from "path";
 import matter8 from "gray-matter";
@@ -25930,7 +25964,7 @@ ${commitMessages}`);
     log.debug(`gatherRepoContext: git log \u5931\u8D25 \u2014 ${String(err)}`);
   }
   try {
-    const rawTree = execSync6(
+    const rawTree = execSync5(
       'find . -maxdepth 4 -not -path "*/.git/*" -not -path "*/node_modules/*" -not -path "*/__pycache__/*" -not -path "*/dist/*" -not -path "*/.claude/worktrees/*" -not -name "*.js.map"',
       { cwd: repoPath, encoding: "utf-8" }
     );

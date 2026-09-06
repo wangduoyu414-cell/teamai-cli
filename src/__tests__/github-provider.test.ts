@@ -176,7 +176,7 @@ describe('ghRepoClone', () => {
     vi.clearAllMocks();
     mockedSpawnSync.mockReset();
     mockedExecSync.mockReset();
-    // no gh CLI, no token by default
+    // CLI detection is the first spawn; tests provide its result separately.
     mockedExecSync.mockImplementation(() => {
       throw new Error('not found');
     });
@@ -189,6 +189,7 @@ describe('ghRepoClone', () => {
   });
 
   it('throws RepoNotFoundError when remote does not exist', () => {
+    mockedSpawnSync.mockReturnValueOnce({status:0, stdout:"gh version", stderr:""});
     mockedSpawnSync.mockReturnValue({
       status: 128,
       stdout: '',
@@ -197,7 +198,7 @@ describe('ghRepoClone', () => {
     expect(() => ghRepoClone('org/missing', '/tmp/clone')).toThrow(RepoNotFoundError);
   });
 
-  it('succeeds when git clone exits 0', () => {
+  it('succeeds when gh clone and local helper configuration exit 0', () => {
     mockedSpawnSync.mockReturnValue({
       status: 0,
       stdout: "Cloning into '/tmp/clone'...",
@@ -208,6 +209,7 @@ describe('ghRepoClone', () => {
 
   it('sanitizes token from error output', () => {
     process.env.GITHUB_TOKEN = 'ghp_secret';
+    mockedSpawnSync.mockReturnValueOnce({status:0, stdout:"gh version", stderr:""});
     mockedSpawnSync.mockReturnValue({
       status: 128,
       stdout: '',

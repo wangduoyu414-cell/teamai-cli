@@ -38,6 +38,20 @@ describe('file transport', () => {
     expect(fs.readFileSync(logFile, 'utf-8')).toContain('[DEBUG] hello from debug');
   });
 
+  it.each(['absent', 'existing'])('shows transient startup diagnostics without touching an %s log', (state) => {
+    if (state === 'existing') log.debug('normal command');
+    const before = fs.existsSync(logFile) ? fs.readFileSync(logFile, 'utf8') : null;
+    const spy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    try {
+      setVerbose(true);
+      log.debug('runtime discovery', { persist: false });
+      expect(spy).toHaveBeenCalledWith(expect.stringContaining('runtime discovery'));
+      expect(fs.existsSync(logFile) ? fs.readFileSync(logFile, 'utf8') : null).toBe(before);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
   it('writes error to file', () => {
     const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
     log.error('something broke');

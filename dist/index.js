@@ -168,8 +168,10 @@ var init_logger = __esm({
         console.error(chalk.red("\u2716"), msg);
         writeToFile("ERROR", msg);
       },
-      debug(msg) {
-        writeToFile("DEBUG", msg);
+      // Startup discovery runs before command-specific write guards. Such traces
+      // may be shown with --verbose without creating a durable log first.
+      debug(msg, options = {}) {
+        if (options.persist !== false) writeToFile("DEBUG", msg);
         if (!verboseEnabled || silentMode) return;
         writeInfoLine(`${chalk.gray("  [debug]")} ${msg}`);
       },
@@ -469,12 +471,12 @@ function gitPathDirs(root) {
 function ensureBundledRuntimeOnPath(platform = process.platform) {
   if (platform !== "win32") return;
   if (isOnPath("git", { platform })) {
-    log.debug("bundled runtime: git already resolves on PATH; leaving it alone");
+    log.debug("bundled runtime: git already resolves on PATH; leaving it alone", { persist: false });
     return;
   }
   const roots = BUNDLED_GIT_RESOLVERS.map((resolve) => resolve().find((root) => fs3.existsSync(path4.join(root, "cmd", "git.exe")))).filter((root) => root !== void 0);
   if (roots.length === 0) {
-    log.debug("bundled runtime: no bundled git to add to PATH");
+    log.debug("bundled runtime: no bundled git to add to PATH", { persist: false });
     return;
   }
   const entries = pathDirs();
@@ -485,7 +487,7 @@ function ensureBundledRuntimeOnPath(platform = process.platform) {
   const append = dirs.flatMap((d) => d.last).filter(fresh);
   if (prepend.length === 0 && append.length === 0) return;
   process.env.PATH = [...prepend, ...entries, ...append].join(path4.delimiter);
-  log.debug(`bundled runtime: PATH now leads with [${prepend.join("; ")}] and ends with [${append.join("; ")}]`);
+  log.debug(`bundled runtime: PATH now leads with [${prepend.join("; ")}] and ends with [${append.join("; ")}]`, { persist: false });
 }
 function bundledShellFor(tool) {
   const resolver = BUNDLED_SHELLS[tool];
@@ -58687,9 +58689,9 @@ program.name("teamai").description("TeamAI \u2014 Make Every Team AI Native").ve
     opts.dryRun = true;
     setFileLogging(false);
   }
+  if (opts.verbose) setVerbose(true);
   ensureBundledRuntimeOnPath();
   if (opts.dryRun) return;
-  if (opts.verbose) setVerbose(true);
   const name = actionCommand.name();
   if (TEAMAI_HOOK_SUBCOMMANDS.includes(name)) return;
   if (!triggersMigration(actionCommand)) return;

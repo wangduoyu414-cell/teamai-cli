@@ -192,14 +192,14 @@ const BUNDLED_GIT_RESOLVERS: Array<() => string[]> = [
 export function ensureBundledRuntimeOnPath(platform: NodeJS.Platform = process.platform): void {
   if (platform !== 'win32') return;
   if (isOnPath('git', { platform })) {
-    log.debug('bundled runtime: git already resolves on PATH; leaving it alone');
+    log.debug('bundled runtime: git already resolves on PATH; leaving it alone', { persist: false });
     return;
   }
   const roots = BUNDLED_GIT_RESOLVERS
     .map(resolve => resolve().find(root => fs.existsSync(path.join(root, 'cmd', 'git.exe'))))
     .filter((root): root is string => root !== undefined);
   if (roots.length === 0) {
-    log.debug('bundled runtime: no bundled git to add to PATH');
+    log.debug('bundled runtime: no bundled git to add to PATH', { persist: false });
     return;
   }
   const entries = pathDirs();
@@ -210,7 +210,7 @@ export function ensureBundledRuntimeOnPath(platform: NodeJS.Platform = process.p
   const append = dirs.flatMap(d => d.last).filter(fresh);
   if (prepend.length === 0 && append.length === 0) return;
   process.env.PATH = [...prepend, ...entries, ...append].join(path.delimiter);
-  log.debug(`bundled runtime: PATH now leads with [${prepend.join('; ')}] and ends with [${append.join('; ')}]`);
+  log.debug(`bundled runtime: PATH now leads with [${prepend.join('; ')}] and ends with [${append.join('; ')}]`, { persist: false });
 }
 
 /**

@@ -87,11 +87,11 @@ program
       opts.dryRun = true;
       setFileLogging(false);
     }
-    // Windows runtime discovery writes diagnostics. Apply the preview's
-    // read-only logging policy before discovery, but still prepare its PATH.
+    if (opts.verbose) setVerbose(true);
+    // Prepare PATH before migration/actions. Startup diagnostics remain
+    // console-only until the command-specific write guards have run.
     ensureBundledRuntimeOnPath();
     if (opts.dryRun) return;
-    if (opts.verbose) setVerbose(true);
 
     // Auto-migrate a legacy `<repo>/.teamai/` into the partition before the
     // command runs, so the trigger commands (and every path resolver they call)

@@ -1,3 +1,7 @@
+## 0.26.0-autocode.3
+
+- Keep bundled-runtime startup diagnostics console-only: they remain visible with `--verbose`, but cannot change the filesystem before host-root guards reject a command. Normal command logs still persist. Validate discovery with the real logger on every platform.
+
 ## 0.26.0-autocode.2
 
 - Apply preview logging policy before bundled-runtime discovery, so Windows `--plan` and `--dry-run` do not write a startup log. Normal commands retain runtime PATH preparation and diagnostics.

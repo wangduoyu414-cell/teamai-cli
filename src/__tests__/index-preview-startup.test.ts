@@ -8,9 +8,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 vi.mock('../bundled-runtime.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../bundled-runtime.js')>();
   const { log } = await import('../utils/logger.js');
-  return { ...actual, ensureBundledRuntimeOnPath: vi.fn(() => log.debug('runtime discovery')) };
+  return { ...actual, ensureBundledRuntimeOnPath: vi.fn(() => log.debug('runtime discovery', { persist: false })) };
 });
-vi.mock('../init.js', () => ({ init: vi.fn(async () => {}) }));
+vi.mock('../init.js', async () => {
+  const { log } = await import('../utils/logger.js');
+  return { init: vi.fn(async () => { log.debug('command action'); }) };
+});
 vi.mock('../mcp-cmd.js', () => ({ mcpInject: vi.fn(async () => {}) }));
 vi.mock('../migrate.js', () => ({ maybeMigrate: vi.fn(async () => undefined), queueKeptInCheckout: vi.fn(async () => null) }));
 
@@ -39,7 +42,9 @@ describe('CLI preview startup', () => {
     await program.parseAsync(['node', 'teamai', ...(mode === 'write' ? [] : [mode]), 'init', 'acme/team', '--scope', 'user']);
     expect(ensureBundledRuntimeOnPath).toHaveBeenCalledOnce();
     if (mode === 'write') {
-      expect(fs.readFileSync(path.join(home, '.teamai/debug.log'), 'utf8')).toContain('runtime discovery');
+      const saved = fs.readFileSync(path.join(home, '.teamai/debug.log'), 'utf8');
+      expect(saved).toContain('command action');
+      expect(saved).not.toContain('runtime discovery');
     } else {
       expect(fs.readdirSync(home)).toEqual([]);
     }

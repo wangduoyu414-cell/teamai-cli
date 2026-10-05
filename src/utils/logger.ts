@@ -170,8 +170,10 @@ export const log = {
     console.error(chalk.red('✖'), msg);
     writeToFile('ERROR', msg);
   },
-  debug(msg: string): void {
-    writeToFile('DEBUG', msg);
+  // Startup discovery runs before command-specific write guards. Such traces
+  // may be shown with --verbose without creating a durable log first.
+  debug(msg: string, options: { persist?: boolean } = {}): void {
+    if (options.persist !== false) writeToFile('DEBUG', msg);
     if (!verboseEnabled || silentMode) return;
     writeInfoLine(`${chalk.gray('  [debug]')} ${msg}`);
   },

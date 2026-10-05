@@ -9,13 +9,8 @@ vi.mock('../utils/home.js', () => ({
   getUserHome: () => homeState.home,
 }));
 
-// Mock the logger so the module's debug traces do not reach the real log file.
-vi.mock('../utils/logger.js', () => ({
-  log: { info: vi.fn(), success: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
-}));
-
 import { ensureBundledRuntimeOnPath, resetBundledRuntimeCache } from '../bundled-runtime.js';
-import { log } from '../utils/logger.js';
+import { _setLogFilePath, _resetState } from '../utils/logger.js';
 
 /** Lay out a WorkBuddy PortableGit runtime under the test home. */
 function makePortableGit(version: string, dirs = ['cmd', 'usr/bin', 'mingw64/bin']): string {
@@ -51,12 +46,17 @@ describe('ensureBundledRuntimeOnPath', () => {
 
   beforeEach(() => {
     homeState.home = fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-runtime-'));
+    _setLogFilePath(path.join(homeState.home, '.teamai', 'debug.log'));
     resetBundledRuntimeCache();
     vi.clearAllMocks();
     savedPath = process.env.PATH;
   });
 
   afterEach(() => {
+    // Even non-preview startup can later fail a host-root guard. Runtime
+    // discovery itself must never create a logger directory on that path.
+    expect(fs.existsSync(path.join(homeState.home, '.teamai'))).toBe(false);
+    _resetState();
     fs.rmSync(homeState.home, { recursive: true, force: true });
     if (savedPath === undefined) delete process.env.PATH;
     else process.env.PATH = savedPath;
@@ -73,7 +73,6 @@ describe('ensureBundledRuntimeOnPath', () => {
     expect(entries[0]).toBe(path.join(root, 'cmd'));
     expect(entries).toContain(original);
     expect(entries.indexOf(path.join(root, 'mingw64', 'bin'))).toBeGreaterThan(entries.indexOf(original));
-    expect(log.debug).toHaveBeenCalledWith(expect.stringContaining(path.join(root, 'cmd')));
   });
 
   it('picks the newest version and stays idempotent', () => {
@@ -97,7 +96,6 @@ describe('ensureBundledRuntimeOnPath', () => {
     ensureBundledRuntimeOnPath('win32');
 
     expect(process.env.PATH).toBe(foreign);
-    expect(log.debug).toHaveBeenCalledWith('bundled runtime: git already resolves on PATH; leaving it alone');
   });
 
   it('does not duplicate a dir PATH already carries', () => {
@@ -110,14 +108,13 @@ describe('ensureBundledRuntimeOnPath', () => {
     expect(entries.filter(e => e === path.join(root, 'cmd'))).toHaveLength(1);
   });
 
-  it('leaves PATH alone without a bundled runtime, and says so', () => {
+  it('leaves PATH alone without a bundled runtime', () => {
     const original = makeEmptyPathDir();
     process.env.PATH = original;
 
     ensureBundledRuntimeOnPath('win32');
 
     expect(process.env.PATH).toBe(original);
-    expect(log.debug).toHaveBeenCalledWith('bundled runtime: no bundled git to add to PATH');
   });
 
   it('skips a runtime whose cmd dir has no git.exe', () => {

@@ -1,3 +1,5 @@
+import { usesManagedPolicy } from './host-adapters.js';
+import { EXPLICIT_ONLY_HOSTS, isHostSelected, normalizeHostId } from './host-adapters.js';
 import path from 'node:path';
 import fse from 'fs-extra';
 import YAML from 'yaml';
@@ -474,6 +476,7 @@ async function pullSingleSource(
 
     // Deploy to each tool's skills directory
     for (const [tool, toolPath] of Object.entries(scopedToolPaths(teamConfig, localConfig))) {
+    if (usesManagedPolicy(teamConfig, localConfig) && (EXPLICIT_ONLY_HOSTS.has(normalizeHostId(tool)) || !isHostSelected(localConfig, tool))) continue;
       if (!toolPath.skills) continue;
       if (!await ResourceHandler.isToolInstalled(toolPath.skills, baseDir)) continue;
 

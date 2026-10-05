@@ -91,7 +91,7 @@ describe('doctor — env variables reach a shell', () => {
   async function envCheck(): Promise<Check> {
     const ctx = await resolveDoctorContext();
     if (!ctx) throw new Error('expected a resolved doctor context');
-    const check = (await buildChecks(ctx)).find((c) => c.name === 'Env variables injected in shell profile');
+    const check = (await buildChecks(ctx)).find((c) => c.name === 'Env variables injected in shell profile' || c.name === 'Env variables are not injected (disabled by team policy)');
     if (!check) throw new Error('no env check');
     return check;
   }

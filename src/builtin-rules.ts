@@ -1,3 +1,6 @@
+import { usesManagedPolicy } from './host-adapters.js';
+import { isBuiltinEnabled } from './types.js';
+import { isHostSelected, supportsStaticResource } from './host-adapters.js';
 import path from 'node:path';
 import { ensureDir, writeFile, pathExists } from './utils/fs.js';
 import { log } from './utils/logger.js';
@@ -51,6 +54,8 @@ export async function deployBuiltinRules(
     localConfig?: LocalConfig,
     options?: { skipRecall?: boolean },
 ): Promise<number> {
+  if (teamConfig.builtins?.rules?.mode === 'disabled') return 0;
+
     const defaultBaseDir = getUserHome();
     let deployed = 0;
 
@@ -70,7 +75,7 @@ export async function deployBuiltinRules(
             log.debug(`Skipping built-in rules for ${tool}: tool not installed`);
             continue;
         }
-        if (localConfig && isAgentExcluded(localConfig, tool)) continue;
+        if (localConfig && (isAgentExcluded(localConfig, tool) || (usesManagedPolicy(teamConfig, localConfig) && (!isHostSelected(localConfig, tool) || !supportsStaticResource(tool, 'rules', localConfig.scope))))) continue;
 
         const rulesDir = path.join(baseDir, toolPath.rules);
         if (!await pathExists(rulesDir)) continue;
@@ -82,6 +87,7 @@ export async function deployBuiltinRules(
             // with derived frontmatter; every other tool gets canonical `.md`.
             const ext = ruleFileExtensionForTool(tool);
             for (const rule of builtinRules) {
+                if (!isBuiltinEnabled(teamConfig, 'rules', rule.name)) continue;
                 const destFile = path.join(rulesDir, `${rule.name}${ext}`);
                 const content = usesCursorMdcRules(tool)
                     ? teamRuleToCursorMdc(rule.content)

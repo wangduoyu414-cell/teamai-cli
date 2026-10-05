@@ -34,7 +34,10 @@ import { acquireQueueLock, countQueued, pendingLearningsDir, queueOwner, sameQue
  */
 
 /** Directories/files under a legacy `.teamai/` that must NOT be copied. */
+const LIFECYCLE_ENTRIES = new Set(['managed-resources.json', 'managed-resources.journal.json', 'managed-resource-backups']);
+
 const SKIP_ENTRIES = new Set<string>([
+  ...LIFECYCLE_ENTRIES,
   // Disposable git worktrees: their gitdir records an ABSOLUTE path, so moving
   // them breaks the linkage. They are rebuilt on demand (git.ts calls them
   // "disposable worktrees"). Taken from the shared list, so a worktree added
@@ -722,7 +725,22 @@ async function retireLegacy(legacyDir: string): Promise<string> {
   await writeFile(path.join(legacyDir, '.gitignore'), BACKUP_GITIGNORE);
 
   const backup = await freeBackupPath(legacyDir);
-  await fse.rename(legacyDir, backup);
+  const retained = (await fse.readdir(legacyDir)).filter((name) => LIFECYCLE_ENTRIES.has(name));
+  if (retained.length === 0) {
+    await fse.rename(legacyDir, backup);
+  } else {
+    // Absolute ownership/backup references keep their original checkout root.
+    // Move only retired machine data; interruption is retryable entry by entry.
+    await fse.ensureDir(backup);
+    await writeFile(path.join(backup, '.gitignore'), BACKUP_GITIGNORE);
+    // Keep config.yaml until all other entries move: it is the retry signal
+    // planMigration reads after an interrupted retirement.
+    const entries = (await fse.readdir(legacyDir)).sort((a, b) => Number(a === 'config.yaml') - Number(b === 'config.yaml'));
+    for (const entry of entries) {
+      if (LIFECYCLE_ENTRIES.has(entry) || entry === '.gitignore') continue;
+      await fse.rename(path.join(legacyDir, entry), path.join(backup, entry));
+    }
+  }
   return backup;
 }
 

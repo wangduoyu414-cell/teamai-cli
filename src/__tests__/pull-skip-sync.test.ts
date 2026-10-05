@@ -23,6 +23,7 @@ vi.mock('../utils/git.js', () => ({
 }));
 
 vi.mock('../utils/logger.js', () => ({
+  setFileLogging: vi.fn(),
   log: {
     persist: vi.fn(),
     info: vi.fn(),

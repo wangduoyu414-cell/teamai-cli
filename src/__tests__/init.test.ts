@@ -102,6 +102,13 @@ vi.mock('../providers/cnb/cnb-cli.js', async (importOriginal) => {
   };
 });
 
+// Queue locking is exercised with real files in pending-learnings tests; these init
+// tests mock all persistence and must not consult a previous /tmp fixture.
+vi.mock('../utils/pending-learnings.js', async (original) => ({
+  ...(await original<typeof import('../utils/pending-learnings.js')>()),
+  setAsideQueueOnModeSwitch: vi.fn(async (_previous, _next, save) => { await save(); return { status: 'switched', aside: null }; }),
+}));
+
 vi.mock('../config.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../config.js')>()),
   saveLocalConfig: vi.fn(),
@@ -863,7 +870,7 @@ describe('init', () => {
         toolPaths: {},
       } as never);
 
-      await init({ repo: '.', dryRun: true });
+      await init({ repo: '.' });
 
       const errorCalls = vi.mocked(log.error).mock.calls.map(([message]) => String(message));
       const debugCalls = vi.mocked(log.debug).mock.calls.map(([message]) => String(message));
@@ -897,7 +904,7 @@ describe('init', () => {
 
       // The error leaves init, so the CLI prints it and exits non-zero; nothing
       // is written for the scope.
-      await expect(init({ repo: '.', dryRun: true })).rejects.toThrow(/Invalid roles manifest/);
+      await expect(init({ repo: '.' })).rejects.toThrow(/Invalid roles manifest/);
       expect(saveLocalConfigForScope).not.toHaveBeenCalled();
     });
 
@@ -913,7 +920,7 @@ describe('init', () => {
       const { saveLocalConfigForScope } = await import('../config.js');
       vi.mocked(saveLocalConfigForScope).mockClear();
 
-      await init({ repo: '.', dryRun: true });
+      await init({ repo: '.' });
 
       expect(saveLocalConfigForScope).toHaveBeenCalledWith(
         expect.not.objectContaining({ primaryRole: expect.anything() }),
@@ -1333,7 +1340,7 @@ describe('init --provider', () => {
       toolPaths: {},
     } as never);
 
-    await init({ repo: '.', provider: 'git', role: 'hai', dryRun: true });
+    await init({ repo: '.', provider: 'git', role: 'hai' });
 
     expect(mockExit).not.toHaveBeenCalled();
     expect(GitLabProvider.prototype.authenticate).not.toHaveBeenCalled();
@@ -1355,7 +1362,7 @@ describe('init --provider', () => {
     const { writeFile } = await import('../utils/fs.js');
     const { log } = await import('../utils/logger.js');
 
-    await init({ repo: '.', provider: 'git', role: 'hai', dryRun: true });
+    await init({ repo: '.', provider: 'git', role: 'hai' });
 
     expect(mockExit).toHaveBeenCalledWith(1);
     expect(log.error).toHaveBeenCalledWith(expect.stringContaining('Set GITLAB_URL=https://gitlab.example.test'));

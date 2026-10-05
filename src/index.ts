@@ -1,6 +1,6 @@
 import { createRequire } from 'node:module';
 import { Command, Option } from 'commander';
-import { setVerbose, setSilent, log } from './utils/logger.js';
+import { setVerbose, setSilent, setFileLogging, log } from './utils/logger.js';
 import { applyNonInteractiveGitEnv } from './utils/git-env.js';
 import { ensureBundledRuntimeOnPath } from './bundled-runtime.js';
 import type { GlobalOptions, LocalConfig } from './types.js';
@@ -76,10 +76,13 @@ program
   .name('teamai')
   .description('TeamAI — Make Every Team AI Native')
   .version(version)
+  .option('--plan', 'Preview lifecycle work without side effects')
   .option('--dry-run', 'Preview mode, no changes made')
   .option('-v, --verbose', 'Verbose output')
   .hook('preAction', async (thisCommand, actionCommand) => {
     const opts = thisCommand.opts();
+    if (opts.plan) { thisCommand.setOptionValue('dryRun', true); opts.dryRun = true; }
+    if (opts.dryRun) { setFileLogging(false); return; }
     if (opts.verbose) setVerbose(true);
 
     // Auto-migrate a legacy `<repo>/.teamai/` into the partition before the
@@ -744,6 +747,7 @@ mcpCmd
 mcpCmd
   .command('inject')
   .description('Inject team MCP servers into all AI tool configs')
+  .option('--plan', 'Preview lifecycle work without side effects')
   .option('--dry-run', 'Show what would change without writing')
   .option('--force', 'Overwrite servers that collide with user-owned entries')
   .action(async (cmdOpts) => {
@@ -845,6 +849,7 @@ modelsCmd
   .description('Point agents at a model profile (every compatible agent by default)')
   .option('--agent <name>', 'Only switch this agent. Repeatable or comma-separated.', collectRepeatable, [] as string[])
   .option('--model <id>', 'Default model to select (defaults to the first in the profile)')
+  .option('--plan', 'Preview lifecycle work without side effects')
   .option('--dry-run', 'Show what would change without writing')
   .action((profile: string, cmdOpts) => {
     const globalOpts = program.opts() as GlobalOptions;
@@ -855,6 +860,7 @@ modelsCmd
   .command('restore')
   .description('Restore agent model settings captured before the first TeamAI switch')
   .option('--agent <name>', 'Only restore this agent. Repeatable or comma-separated.', collectRepeatable, [] as string[])
+  .option('--plan', 'Preview lifecycle work without side effects')
   .option('--dry-run', 'Show what would change without writing')
   .action((cmdOpts) => {
     const globalOpts = program.opts() as GlobalOptions;
@@ -1252,6 +1258,7 @@ recallCmd
   .option('--archive', 'Move to archive/ instead of deleting')
   .option('--confidence-writeback', 'Update frontmatter confidence scores')
   .option('--update-quality', 'Find stale docs/rules/skills and suggest updates')
+  .option('--plan', 'Preview lifecycle work without side effects')
   .option('--dry-run', 'Show what would be done without making changes')
   .action(async (cmdOpts) => {
     if (!cmdOpts.confidenceWriteback && !cmdOpts.prune && !cmdOpts.updateQuality) {
@@ -1339,6 +1346,7 @@ recallCmd
   .command('promote [learningId]')
   .description('Promote a high-confidence learning to formal knowledge (docs/skills/rules)')
   .option('--category <cat>', 'Target category: skills | rules | docs')
+  .option('--plan', 'Preview lifecycle work without side effects')
   .option('--dry-run', 'Show what would be done without making changes')
   .action(async (learningId, cmdOpts) => {
     const { autoDetectInit } = await import('./config.js');

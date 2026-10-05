@@ -247,6 +247,34 @@ describe('planMigration', () => {
 });
 
 describe('runMigration', () => {
+  it.each([false, true])('keeps checkout ownership and absolute backups, including interrupted retirement=%s', async (interrupt) => {
+    await seedLegacyLayout();
+    const backup = path.join(legacyDir, 'managed-resource-backups', 'personal.md');
+    const ledger = JSON.stringify({ version: 1, backupPath: backup });
+    await fse.outputFile(backup, 'personal bytes');
+    await fse.writeFile(path.join(legacyDir, 'managed-resources.json'), ledger);
+    await fse.writeFile(path.join(legacyDir, 'managed-resources.journal.json'), 'opaque legacy journal');
+    const plan = await planMigration(repoRoot);
+    if (interrupt) {
+      const rename = vi.spyOn(fse, 'rename').mockImplementation(async (from, to) => {
+        if (String(from) === path.join(legacyDir, 'env')) throw new Error('interrupted retirement');
+        await fs.promises.rename(from, to);
+      });
+      try { await expect(runMigration(plan!)).rejects.toThrow('interrupted retirement'); }
+      finally { rename.mockRestore(); }
+      expect(await fse.pathExists(path.join(legacyDir, 'config.yaml'))).toBe(true);
+      const retry = await planMigration(repoRoot);
+      expect(retry?.mode).toBe('retire-only');
+      await runMigration(retry!);
+    } else await runMigration(plan!);
+    expect(await fse.readFile(backup, 'utf8')).toBe('personal bytes');
+    expect(await fse.readFile(path.join(legacyDir, 'managed-resources.json'), 'utf8')).toBe(ledger);
+    expect(await fse.readFile(path.join(legacyDir, 'managed-resources.journal.json'), 'utf8')).toBe('opaque legacy journal');
+    expect(await fse.pathExists(path.join(projectDataHome(repoRoot), 'managed-resources.json'))).toBe(false);
+    expect(await fse.pathExists(path.join(legacyDir, 'env'))).toBe(false);
+    expect(await planMigration(repoRoot)).toBeNull();
+  });
+
   it('migrates into the partition, keeps the git clone intact, and retires the source', async () => {
     await seedLegacyLayout();
     const plan = await planMigration(repoRoot);

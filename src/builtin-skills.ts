@@ -1,3 +1,6 @@
+import { usesManagedPolicy } from './host-adapters.js';
+import { isBuiltinEnabled } from './types.js';
+import { isHostSelected, supportsStaticResource } from './host-adapters.js';
 import fs from 'node:fs';
 import { createHash } from 'node:crypto';
 import path from 'node:path';
@@ -510,6 +513,8 @@ async function retireOtherCodexCopy(
  * - A tool's skills directory is not configured
  */
 export async function deployBuiltinSkills(teamConfig: TeamaiConfig, localConfig?: LocalConfig): Promise<number> {
+  if (teamConfig.builtins?.skills?.mode === 'disabled') return 0;
+
   const builtinDir = packagedSkillRoots().deployRoot;
 
   if (!await pathExists(builtinDir)) {
@@ -554,10 +559,11 @@ export async function deployBuiltinSkills(teamConfig: TeamaiConfig, localConfig?
     // An excluded agent is neither written to nor deleted from (usage-guide:
     // "the enabledAgents whitelist also gates CLI built-in skills"), so its
     // legacy directories are left alone too.
-    if (localConfig && isAgentExcluded(localConfig, tool)) continue;
+    if (localConfig && (isAgentExcluded(localConfig, tool) || (usesManagedPolicy(teamConfig, localConfig) && (!isHostSelected(localConfig, tool) || !supportsStaticResource(tool, 'skills', localConfig.scope))))) continue;
 
     let deployedHere = 0;
     for (const skillName of skillNames) {
+      if (!isBuiltinEnabled(teamConfig, 'skills', skillName)) continue;
       const srcDir = path.join(builtinDir, skillName);
       // Resolved without a source path, so the resolver only answers where the
       // skill lives and touches nothing: its Codex reconciliation deletes a

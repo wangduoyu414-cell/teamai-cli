@@ -10,7 +10,7 @@ vi.mock('chalk', () => ({
   default: { blue: (s: string) => s, green: (s: string) => s, yellow: (s: string) => s, red: (s: string) => s, gray: (s: string) => s, dim: (s: string) => s },
 }));
 
-import { log, setVerbose, setSilent, setStderrOnly, _setLogFilePath, _resetState } from '../utils/logger.js';
+import { setFileLogging, log, setVerbose, setSilent, setStderrOnly, _setLogFilePath, _resetState } from '../utils/logger.js';
 
 let tmpDir: string;
 let logFile: string;
@@ -98,6 +98,33 @@ describe('file transport', () => {
     // Make logFile a directory so appendFileSync fails with EISDIR
     fs.mkdirSync(logFile);
     expect(() => log.debug('ok')).not.toThrow();
+  });
+
+  it('can disable file writes for zero-side-effect plan commands', () => {
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    setFileLogging(false);
+    log.debug('plan debug');
+    log.error('plan error');
+    spy.mockRestore();
+    expect(fs.existsSync(logFile)).toBe(false);
+  });
+
+  it('uses the operating-system home when HOME is absent', () => {
+    const nativeHome = path.join(tmpDir, 'native-home');
+    fs.mkdirSync(nativeHome);
+    const originalHome = process.env.HOME;
+    delete process.env.HOME;
+    const homedir = vi.spyOn(os, 'homedir').mockReturnValue(nativeHome);
+    _resetState();
+
+    try {
+      log.debug('native home');
+      expect(fs.readFileSync(path.join(nativeHome, '.teamai', 'debug.log'), 'utf-8')).toContain('native home');
+    } finally {
+      homedir.mockRestore();
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+    }
   });
 });
 

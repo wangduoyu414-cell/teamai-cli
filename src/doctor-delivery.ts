@@ -579,7 +579,9 @@ export async function buildEnvDeliveryCheck(ctx: DoctorContext): Promise<Check[]
   const { problems, staleProfiles } = await envDeliveryProblems(ctx);
   return [
     {
-      name: 'Env variables injected in shell profile',
+      name: ctx.teamConfig?.sharing?.env?.injectShellProfile === false
+        ? 'Env variables are not injected (disabled by team policy)'
+        : 'Env variables injected in shell profile',
       source: 'local',
       check: async () => problems.length === 0,
       fix: problems.length === 0
@@ -722,7 +724,7 @@ async function envDeliveryProblems(
  */
 export async function buildDocsCheck(ctx: DoctorContext): Promise<Check[]> {
   const { localConfig, teamConfig } = ctx;
-  if (!teamConfig) return [];
+  if (!teamConfig || teamConfig.sharing?.docs?.mode === 'index-only') return [];
 
   const { listDocFiles, listStaleDocDirectories, resolveDocsForDirectory, resolveDocsDestination } = await import('./resources/docs.js');
   // The set pull delivers: no dotfiles, nothing of a docs namespace this member

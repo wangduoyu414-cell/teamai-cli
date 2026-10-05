@@ -23,6 +23,7 @@ import { getUserHome } from './utils/home.js';
 import { resolvePartitionDir, writeAnchorFile } from './utils/partition.js';
 import { log } from './utils/logger.js';
 import { loadRolesManifest, RolesManifestNotFoundError } from './roles.js';
+import { normalizeHostRoots } from './host-adapters.js';
 
 /**
  * Loads that serve a --dry-run write nothing: the legacy role migration, the
@@ -118,7 +119,7 @@ export async function loadLocalConfig(options: LoadOptions = {}): Promise<LocalC
  * `roleUnresolved` describes one load of the roles manifest, not the member.
  */
 function serializeLocalConfig(config: LocalConfig): string {
-  const { dataHome: _dataHome, roleUnresolved: _roleUnresolved, ...persisted } = config;
+  const { dataHome: _dataHome, roleUnresolved: _roleUnresolved, ...persisted } = config.hostRoots ? normalizeHostRoots(config) : config;
   return YAML.stringify(persisted);
 }
 

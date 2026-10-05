@@ -11,12 +11,16 @@ const COPILOT_PROJECT_MCP_CONFIG = '.github/mcp.json';
 // ─── Tool path config ───────────────────────────────────
 
 export const ToolPathsSchema = z.object({
+  /** Independent host installation probe. Defaults to the first path segment. */
+  probe: z.string().optional(),
   skills: z.string().optional(),
   rules: z.string().optional(),
   settings: z.string().optional(),
   /** Standalone hooks file for tools that do not store hooks in settings. */
   hooks: z.string().optional(),
   claudemd: z.string().optional(),
+  /** Native instruction host file. Falls back to claudemd for legacy configs. */
+  instruction: z.string().optional(),
   /** Per-tool agents directory (Phase 1: teamai-recall subagent target).
    * Optional — tools without subagent support omit this and agents sync skips them. */
   agents: z.string().optional(),
@@ -66,11 +70,25 @@ export const SharingConfigSchema = z.object({
   }).default({}),
   docs: z.object({
     localDir: z.string().default('~/.teamai/docs'),
+    /** Default copy preserves existing distribution behaviour; index-only opts out. */
+    mode: z.enum(['copy', 'index-only']).optional(),
   }).default({}),
+  instructions: z.object({
+    /** Team-repository path, relative to the knowledge root. */
+    source: z.string().optional(),
+  }).optional(),
   env: z.object({
     injectShellProfile: z.boolean().default(true),
     shellProfilePath: z.string().optional(),
   }).default({}),
+  usage: z.object({
+    enabled: z.boolean().default(true),
+    autoReport: z.boolean().default(true),
+    includePrompt: z.boolean().default(false),
+  }).optional(),
+  registration: z.object({
+    autoRegister: z.boolean().default(true),
+  }).optional(),
   // Optional (not .default) so existing TeamaiConfig literals stay valid; use
   // getHooksSharing() for the defaulted view.
   hooks: z.object({
@@ -150,6 +168,29 @@ export function getInterventionSharing(config: {
   sharing?: { intervention?: { correctionKeywords?: string[] } };
 }): { correctionKeywords: string[] } {
   return { correctionKeywords: config.sharing?.intervention?.correctionKeywords ?? [] };
+}
+
+export const BuiltinResourcePolicySchema = z.object({
+  mode: z.enum(['all', 'allowlist', 'disabled']).default('all'),
+  names: z.array(z.string()).default([]),
+});
+
+export const BuiltinPolicySchema = z.object({
+  skills: BuiltinResourcePolicySchema.default({}),
+  agents: BuiltinResourcePolicySchema.default({}),
+  rules: BuiltinResourcePolicySchema.default({}),
+  hooks: BuiltinResourcePolicySchema.default({}),
+});
+
+export function isBuiltinEnabled(
+  config: { builtins?: { skills?: { mode?: string; names?: string[] }; agents?: { mode?: string; names?: string[] }; rules?: { mode?: string; names?: string[] }; hooks?: { mode?: string; names?: string[] } } },
+  kind: 'skills' | 'agents' | 'rules' | 'hooks',
+  name: string,
+): boolean {
+  const policy = config.builtins?.[kind];
+  if (!policy || !policy.mode || policy.mode === 'all') return true;
+  if (policy.mode === 'disabled') return false;
+  return (policy.names ?? []).includes(name);
 }
 
 /** Defaulted view of the optional `sharing.hooks` config. */
@@ -299,6 +340,8 @@ export const TeamaiConfigSchema = z.object({
   /** Report session/usage stats back into the team repo on pull. Off = the
    * team repo never receives stat commits (e.g. read-only pull setups).
    * Default: on. */
+  builtins: BuiltinPolicySchema.optional(),
+  modelPolicy: z.object({ path: z.string().min(1), strict: z.boolean().default(true) }).optional(),
   usageReport: z.boolean().optional(),
   /** Run `git submodule update --init` on pull so skills distributed as git
    * submodules are populated and kept current. Off by default. */
@@ -469,6 +512,7 @@ export const TeamaiConfigSchema = z.object({
     // provider scans as user-dsh root (rank 400). dsh discovers both directory
     // bundles (<name>/SKILL.md) and flat Markdown files there natively.
     dsh: { skills: '.dsh/skills' },
+    qwen: { probe: '.qwen', skills: '.qwen/skills', rules: '.qwen/rules', instruction: '.qwen/QWEN.md', agents: '.qwen/agents' },
     workbuddy: { skills: '.workbuddy/skills', rules: '.workbuddy/rules', settings: '.workbuddy/settings.json', claudemd: 'AGENTS.md', agents: '.workbuddy/agents', mcp: '.workbuddy/mcp.json', mcpProject: '.workbuddy/mcp.json' },
     // OpenCode reads project config from <root>/.opencode/ but user config from
     // ~/.config/opencode/ — a different prefix, hence userScope. Skills are also
@@ -597,6 +641,8 @@ export const LocalConfigSchema = z.object({
    * contain a token the price table matches (opus / sonnet / haiku / fable /
    * mythos + version). Unset means "match the raw model name only".
    */
+  /** Canonical machine-local roots for hosts whose product configuration may move. */
+  hostRoots: z.record(z.string(), z.string()).optional(),
   modelAliases: z.record(z.string(), z.string()).optional(),
 });
 
@@ -962,6 +1008,7 @@ export function legacyManagedMcpManifestPath(dataHome: string): string {
 
 export interface GlobalOptions {
   dryRun?: boolean;
+  plan?: boolean;
   global?: boolean;
   registry?: string;
   npm?: boolean;
@@ -1887,7 +1934,7 @@ export function resolveToolBaseDir(tool: string, localConfig: LocalConfig): stri
 
 /** True when `tool` is in localConfig.disabledAgents (excluded from teamai sync). */
 export function isAgentDisabled(localConfig: { disabledAgents?: string[] }, tool: string): boolean {
-  return localConfig.disabledAgents?.includes(tool) ?? false;
+  return localConfig.disabledAgents?.map(normalizeHostId).includes(normalizeHostId(tool)) ?? false;
 }
 
 /**
@@ -1909,7 +1956,7 @@ export function isAgentExcluded(
   tool: string,
 ): boolean {
   if (isAgentDisabled(localConfig, tool)) return true;
-  return localConfig.enabledAgents ? !localConfig.enabledAgents.includes(tool) : false;
+  return localConfig.enabledAgents ? !localConfig.enabledAgents.map(normalizeHostId).includes(normalizeHostId(tool)) : false;
 }
 
 /**
@@ -2618,4 +2665,10 @@ export function getWebhookSharing(config: {
       retries: ep.retries ?? 3,
     })),
   };
+}
+
+/** Normalize public host aliases before selection and ownership checks. */
+export function normalizeHostId(value: string): string {
+  const id = value.trim().toLowerCase();
+  return id === 'deepseek-harness' || id === 'deepseekharness' ? 'dsh' : id;
 }

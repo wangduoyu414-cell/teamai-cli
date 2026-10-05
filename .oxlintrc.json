@@ -23,13 +23,22 @@
   },
   "overrides": [
     {
-      "files": ["src/__tests__/**"],
+      "files": [
+        "src/__tests__/**"
+      ],
       "rules": {
         "typescript/no-misused-promises": [
           "warn",
-          { "checksVoidReturn": { "arguments": false } }
+          {
+            "checksVoidReturn": {
+              "arguments": false
+            }
+          }
         ]
       }
     }
+  ],
+  "ignorePatterns": [
+    "dist/**"
   ]
 }

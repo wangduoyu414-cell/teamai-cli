@@ -1,3 +1,16 @@
+## 0.26.0-autocode.1
+
+- Rebase the fork's capabilities onto stable upstream v0.26.0 (`96e5331`). Keep native upstream delivery for ordinary configurations; existing `modelPolicy`, `builtins`, `sharing.instructions` or persisted host bindings activate the fork's managed-resource contracts.
+- Preserve Agent v2 host rendering, strict model bindings, quiet defaults, personal edits, local Skill runtime data and restore-on-uninstall backups. WorkBuddy/DSH static-only restrictions remain scoped to managed-policy installations.
+- Reconcile managed resources on unchanged-revision pulls, restore missing files, and return failure on offline refresh, malformed roles or unresolved conflicts. `pull --plan` / `--dry-run` previews the local snapshot without network refresh or filesystem writes.
+- Keep per-checkout ownership journals and absolute backups at their original paths during upstream project-data migration. Interrupted retirement is retryable; original personal files can still be restored on uninstall. Migration follows upstream's no-downgrade rule for project machine data.
+
+## 0.20.0-autocode.7
+
+- Detect GitHub CLI directly on Windows/macOS; cloning uses gh with a repository-local credential helper, never a token-bearing remote URL. GitHub synchronization now requires gh; token environment variables remain supported through gh.
+- Preserve explicit local Skill runtime and Cookie Bridge secret paths across source updates. Reject remote payloads at those paths; retain packages with local data on uninstall/rename. Ignore disposable Python bytecode in source conflict detection.
+- Reuse existing resource transactions and backups; add preservation, rollback, source-conflict and portable authentication regression tests.
+
 # Changelog
 
 All notable changes to this project will be documented in this file. See [standard-version](https://github.com/conventional-changelog/standard-version) for commit guidelines.

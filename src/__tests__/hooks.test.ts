@@ -25,7 +25,16 @@ vi.mock('../utils/logger.js', () => ({
   },
 }));
 
-import { getHookStatus, injectHooks, removeHooks, injectHooksToAllTools, TEAMAI_HOOK_SUBCOMMANDS, TEAMAI_LEGACY_HOOK_SUBCOMMANDS, CLAUDE_TO_CURSOR_EVENTS, reconcileHooks, applyAgentHook, removeAgentHook, isAgentHookSupportedTool, isAgentHookEvent, agentHookDescription } from '../hooks.js';
+vi.mock('../builtin-hooks.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../builtin-hooks.js')>();
+  return {
+    ...actual,
+    skipToolsWithoutShell: vi.fn(() => new Set<string>()),
+  };
+});
+
+import { skipToolsWithoutShell } from '../builtin-hooks.js';
+import { getHookStatus, injectHooks, removeHooks, injectHooksToAllTools, reconcileHooksToAllTools, TEAMAI_HOOK_SUBCOMMANDS, TEAMAI_LEGACY_HOOK_SUBCOMMANDS, CLAUDE_TO_CURSOR_EVENTS, reconcileHooks, applyAgentHook, removeAgentHook, isAgentHookSupportedTool, isAgentHookEvent, agentHookDescription } from '../hooks.js';
 
 // ── Helpers ──────────────────────────────────────────────
 
@@ -424,7 +433,7 @@ describe('hooks', () => {
       }
     });
 
-    it('filterAgents allows multiple agents (additive init runs)', async () => {
+    it('filterAgents keeps explicit-only hosts out of settings writes', async () => {
       const originalHome = process.env.HOME;
       process.env.HOME = '/test-home';
 
@@ -437,14 +446,43 @@ describe('hooks', () => {
           },
           undefined,
           ['codebuddy', 'workbuddy'],
+          true,
         );
 
         expect(mockFiles[path.join('/test-home', '.claude/settings.json')]).toBeUndefined();
         expect(mockFiles[path.join('/test-home', '.codebuddy/settings.json')]).toBeDefined();
-        expect(mockFiles[path.join('/test-home', '.workbuddy/settings.json')]).toBeDefined();
+        expect(mockFiles[path.join('/test-home', '.workbuddy/settings.json')]).toBeUndefined();
       } finally {
         process.env.HOME = originalHome;
       }
+    });
+
+    it('special hosts do not prepare a hook wrapper or emit hook warnings', async () => {
+      const { log } = await import('../utils/logger.js');
+
+      await injectHooksToAllTools(
+        {
+          workbuddy: { settings: '.workbuddy/settings.json' },
+          dsh: { settings: '.dsh/settings.json' },
+        },
+        '/test-home',
+        ['workbuddy', 'dsh'],
+        true,
+      );
+      await reconcileHooksToAllTools(
+        {
+          workbuddy: { settings: '.workbuddy/settings.json' },
+          dsh: { settings: '.dsh/settings.json' },
+        },
+        '/test-home',
+        [],
+        '/test-home/.teamai/managed-hooks.json',
+        { filterAgents: ['workbuddy', 'dsh'], managedStaticHosts: true },
+      );
+
+      expect(skipToolsWithoutShell).toHaveReturnedWith(new Set());
+      expect(log.warn).not.toHaveBeenCalled();
+      expect(mockFiles).toEqual({});
     });
 
     it('undefined filterAgents injects into all tools (backward compat)', async () => {

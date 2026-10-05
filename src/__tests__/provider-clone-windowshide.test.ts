@@ -12,6 +12,8 @@ const { mockedSpawnSync } = vi.hoisted(() => ({
   mockedSpawnSync: vi.fn((..._args: unknown[]) => ({ status: 0, stdout: '', stderr: '' })),
 }));
 
+vi.mock('cross-spawn', () => ({ default: { sync: mockedSpawnSync } }));
+vi.mock('../utils/cli-path.js', () => ({ resolveCliPath: () => 'gh' }));
 vi.mock('node:child_process', () => ({
   spawn: vi.fn(),
   spawnSync: mockedSpawnSync,
@@ -37,7 +39,7 @@ import { gfRepoClone } from '../providers/tgit/gf-cli.js';
 const ORIGINAL_ENV = { ...process.env };
 
 function gitCalls(): unknown[][] {
-  return mockedSpawnSync.mock.calls.filter((call) => call[0] === 'git') as unknown[][];
+  return mockedSpawnSync.mock.calls.filter((call) => call[0] === 'git' || call[0] === 'gh') as unknown[][];
 }
 
 beforeEach(() => {
@@ -57,7 +59,7 @@ afterEach(() => {
 
 describe('provider clone: git child launches hide the console window', () => {
   const cases: Array<[string, () => void, number]> = [
-    ['ghRepoClone', () => ghRepoClone('owner/repo', 'D:/tmp/e2e-gh'), 1],
+    ['ghRepoClone', () => ghRepoClone('owner/repo', 'D:/tmp/e2e-gh'), 3],
     ['gitlabRepoClone', () => gitlabRepoClone('owner/repo', 'D:/tmp/e2e-gl'), 1],
     ['gitcodeRepoClone', () => gitcodeRepoClone('owner/repo', 'D:/tmp/e2e-gc'), 1],
     ['cnbRepoClone', () => cnbRepoClone('owner/repo', 'D:/tmp/e2e-cnb'), 2],

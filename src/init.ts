@@ -1,3 +1,4 @@
+import { prepareSelectedProjectHostRoots, normalizeHostRoots, usesManagedPolicy } from './host-adapters.js';
 import YAML from 'yaml';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -547,6 +548,8 @@ export async function initHttp(
   url: string,
   options: GlobalOptions & { scope?: string; role?: string; project?: string; agent?: string | string[]; force?: boolean; token?: string; inheritUserScope?: boolean },
 ): Promise<void> {
+  if (options.dryRun || options.plan) { log.info('Plan — init would validate and configure TeamAI. No network or file writes performed.'); return; }
+
   const { resolveApiKey, saveApiKey, getApiKeyPath } = await import('./api-key.js');
 
   log.info('Initializing teamai (HTTP read-only consumer)...');
@@ -671,6 +674,10 @@ export async function initHttp(
   const carriedToolRoots = existingLocalConfig?.toolRoots
     ?? (scope === 'project' ? (await loadLocalConfigForScope('user'))?.toolRoots : undefined);
   if (carriedToolRoots) localConfig.toolRoots = { ...carriedToolRoots };
+  if (usesManagedPolicy(await loadTeamConfig(localConfig.repo.localPath) ?? undefined, localConfig)) {
+    prepareSelectedProjectHostRoots(localConfig);
+    Object.assign(localConfig, normalizeHostRoots(localConfig));
+  }
   recordClaudeConfigRoot(localConfig);
   await releasePreviousClaudeRoot(teamConfig, existingLocalConfig, localConfig);
 
@@ -1010,6 +1017,8 @@ export async function initSelfRepo(options: GlobalOptions & {
   force?: boolean;
   inheritUserScope?: boolean;
 }): Promise<void> {
+  if (options.dryRun || options.plan) { log.info('Plan — init would validate and configure TeamAI. No network or file writes performed.'); return; }
+
   log.info('Initializing teamai (single-repo mode)...');
 
   const cwd = process.cwd();
@@ -1192,6 +1201,10 @@ export async function initSelfRepo(options: GlobalOptions & {
   // back to the default root. recordClaudeConfigRoot then overwrites the claude
   // entry when the variable IS set.
   if (existingSelfConfig?.toolRoots) localConfig.toolRoots = { ...existingSelfConfig.toolRoots };
+  if (usesManagedPolicy(await loadTeamConfig(localConfig.repo.localPath) ?? undefined, localConfig)) {
+    prepareSelectedProjectHostRoots(localConfig);
+    Object.assign(localConfig, normalizeHostRoots(localConfig));
+  }
   recordClaudeConfigRoot(localConfig);
 
   // Step 5: write local config (into the partition via dataHome) + single-repo
@@ -1275,8 +1288,8 @@ export async function initSelfRepo(options: GlobalOptions & {
     }
   }
 
-  // Step 6: register member on the reports orphan branch (never touches main / active tree).
-  if (!options.dryRun) {
+  // Step 6: registration respects the team's existing privacy policy.
+  if (!options.dryRun && (await loadTeamConfig(localConfig.repo.localPath))?.sharing.registration?.autoRegister !== false) {
     try {
       const { updateReports } = await import('./utils/reports-branch.js');
       let isNewSelfMember = false;
@@ -1375,6 +1388,8 @@ export async function init(options: GlobalOptions & {
   self?: boolean;
   provider?: string;
 }): Promise<void> {
+  if (options.dryRun || options.plan) { log.info('Plan — init would validate and configure TeamAI. No network or file writes performed.'); return; }
+
   let forcedProvider: ProviderName | undefined;
   try {
     forcedProvider = resolveInitProvider(options.provider);
@@ -1791,7 +1806,7 @@ export async function init(options: GlobalOptions & {
   // default branch). The clone's leftover members/ is a read-only inherited
   // root: the merge below absorbs the member's pre-switch file.
   let isNewMember = true;
-  if (!options.dryRun) {
+  if (!options.dryRun && (await loadTeamConfig(localPath))?.sharing.registration?.autoRegister !== false) {
     try {
       const { updateReports } = await import('./utils/reports-branch.js');
       let memberChanged = false;
@@ -1927,6 +1942,10 @@ export async function init(options: GlobalOptions & {
   const carriedToolRoots = carriedConfig?.toolRoots
     ?? (scope === 'project' ? (await loadLocalConfigForScope('user'))?.toolRoots : undefined);
   if (carriedToolRoots) localConfig.toolRoots = { ...carriedToolRoots };
+  if (usesManagedPolicy(await loadTeamConfig(localConfig.repo.localPath) ?? undefined, localConfig)) {
+    prepareSelectedProjectHostRoots(localConfig);
+    Object.assign(localConfig, normalizeHostRoots(localConfig));
+  }
   recordClaudeConfigRoot(localConfig);
   await releasePreviousClaudeRoot(currentConfig, carriedConfig, localConfig);
 

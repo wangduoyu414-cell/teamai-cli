@@ -883,22 +883,22 @@ describe('prefixFromEntryPath', () => {
   });
 
   it('strips the POSIX lib/ nesting and hands npm the prefix it expects', () => {
-    const entry = path.join('/usr', 'local', 'lib', 'node_modules', 'teamai-cli', 'dist', 'index.js');
+    const entry = path.join('/usr', 'local', 'lib', 'node_modules', '@wangduoyu414-cell/teamai-cli', 'dist', 'index.js');
     existsSpy.mockReturnValue(true);
 
     expect(prefixFromEntryPath(entry, true)).toEqual({ prefix: path.join('/usr', 'local'), global: true });
     // The sanity check must look under <prefix>/lib/node_modules/<pkg>.
     expect(existsSpy).toHaveBeenCalledWith(
-      path.join('/usr', 'local', 'lib', 'node_modules', 'teamai-cli'),
+      path.join('/usr', 'local', 'lib', 'node_modules', '@wangduoyu414-cell/teamai-cli'),
     );
   });
 
   it('returns the slice before node_modules on Windows layouts', () => {
-    const entry = path.join('C:', 'tools', 'node_modules', 'teamai-cli', 'dist', 'index.js');
+    const entry = path.join('C:', 'tools', 'node_modules', '@wangduoyu414-cell/teamai-cli', 'dist', 'index.js');
     existsSpy.mockReturnValue(true);
 
     expect(prefixFromEntryPath(entry, false)).toEqual({ prefix: path.join('C:', 'tools'), global: true });
-    expect(existsSpy).toHaveBeenCalledWith(path.join('C:', 'tools', 'node_modules', 'teamai-cli'));
+    expect(existsSpy).toHaveBeenCalledWith(path.join('C:', 'tools', 'node_modules', '@wangduoyu414-cell/teamai-cli'));
   });
 
   it('detects the flat vendored layout on POSIX (no lib component)', () => {
@@ -906,21 +906,21 @@ describe('prefixFromEntryPath', () => {
     // nesting npm -g would create. The sanity check must verify the layout
     // that was actually matched — not <prefix>/lib/node_modules/<pkg>, which
     // does not exist here.
-    const entry = path.join('/home', 'u', '.teamai', 'node_modules', 'teamai-cli', 'dist', 'index.js');
+    const entry = path.join('/home', 'u', '.teamai', 'node_modules', '@wangduoyu414-cell/teamai-cli', 'dist', 'index.js');
     existsSpy.mockReturnValue(true);
 
     expect(prefixFromEntryPath(entry, true)).toEqual({ prefix: path.join('/home', 'u', '.teamai'), global: false });
     expect(existsSpy).toHaveBeenCalledWith(
-      path.join('/home', 'u', '.teamai', 'node_modules', 'teamai-cli'),
+      path.join('/home', 'u', '.teamai', 'node_modules', '@wangduoyu414-cell/teamai-cli'),
     );
   });
 
   it('keeps non-lib roots on POSIX (project-local installs)', () => {
-    const entry = path.join('/home', 'u', 'proj', 'node_modules', 'teamai-cli', 'dist', 'index.js');
+    const entry = path.join('/home', 'u', 'proj', 'node_modules', '@wangduoyu414-cell/teamai-cli', 'dist', 'index.js');
     existsSpy.mockReturnValue(true);
 
     expect(prefixFromEntryPath(entry, true)).toEqual({ prefix: path.join('/home', 'u', 'proj'), global: false });
-    expect(existsSpy).toHaveBeenCalledWith(path.join('/home', 'u', 'proj', 'node_modules', 'teamai-cli'));
+    expect(existsSpy).toHaveBeenCalledWith(path.join('/home', 'u', 'proj', 'node_modules', '@wangduoyu414-cell/teamai-cli'));
   });
 
   it('returns null for paths outside an npm-managed layout', () => {
@@ -930,12 +930,12 @@ describe('prefixFromEntryPath', () => {
   });
 
   it('returns null when the package dir is not under the derived prefix', () => {
-    const entry = path.join('/usr', 'local', 'lib', 'node_modules', 'teamai-cli', 'dist', 'index.js');
+    const entry = path.join('/usr', 'local', 'lib', 'node_modules', '@wangduoyu414-cell/teamai-cli', 'dist', 'index.js');
     existsSpy.mockReturnValue(false);
 
     expect(prefixFromEntryPath(entry, true)).toBeNull();
     expect(existsSpy).toHaveBeenCalledWith(
-      path.join('/usr', 'local', 'lib', 'node_modules', 'teamai-cli'),
+      path.join('/usr', 'local', 'lib', 'node_modules', '@wangduoyu414-cell/teamai-cli'),
     );
   });
 });

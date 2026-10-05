@@ -1,3 +1,5 @@
+import { usesManagedPolicy } from '../host-adapters.js';
+import { EXPLICIT_ONLY_HOSTS, isHostSelected, normalizeHostId } from '../host-adapters.js';
 import crypto from 'node:crypto';
 import path from 'node:path';
 import fse from 'fs-extra';
@@ -87,6 +89,7 @@ async function syncRulesToLocal(
   if (!await pathExists(teamRulesDir)) return;
 
   for (const [tool, toolPath] of Object.entries(scopedToolPaths(teamConfig, localConfig))) {
+    if (usesManagedPolicy(teamConfig, localConfig) && (EXPLICIT_ONLY_HOSTS.has(normalizeHostId(tool)) || !isHostSelected(localConfig, tool))) continue;
     if (!toolPath.rules) continue;
     if (isAgentExcluded(localConfig, tool)) continue;
     if (!await isToolInstalledForConfig(tool, toolPath.rules, localConfig)) continue;
@@ -222,6 +225,7 @@ async function syncSkillsToLocal(
   }
 
   for (const [tool, toolPath] of Object.entries(scopedToolPaths(teamConfig, localConfig))) {
+    if (usesManagedPolicy(teamConfig, localConfig) && (EXPLICIT_ONLY_HOSTS.has(normalizeHostId(tool)) || !isHostSelected(localConfig, tool))) continue;
     if (!toolPath.skills) continue;
     if (!await ResourceHandler.isToolInstalled(toolPath.skills, baseDir)) continue;
 

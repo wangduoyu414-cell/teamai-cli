@@ -1,3 +1,8 @@
+import { getCopilotHome } from '../types.js';
+import { usesManagedPolicy } from '../host-adapters.js';
+import { getTeamaiHome } from '../types.js';
+import { loadManagedResourceManifest, reconcileManagedResources, type DesiredManagedResource } from '../managed-resources.js';
+import { isHostSelected, supportsStaticResource, resolveHostResourcePath, resolveHostRoot, assertHostRootsStable } from '../host-adapters.js';
 import path from 'node:path';
 import YAML from 'yaml';
 import { isToolInstalledForConfig, ResourceHandler } from './base.js';
@@ -70,10 +75,15 @@ export async function skillsDirForTool(
   tool: string,
   configuredSkillsPath: string | undefined,
   localConfig: LocalConfig,
+  probePath?: string,
 ): Promise<string | null> {
-  if (!configuredSkillsPath) return null;
+  if (!configuredSkillsPath || (usesManagedPolicy(undefined, localConfig) && (!isHostSelected(localConfig, tool) || !supportsStaticResource(tool, 'skills', localConfig.scope)))) return null;
+  if (localConfig.hostRoots) assertHostRootsStable(localConfig);
+  const special = localConfig.hostRoots ? resolveHostResourcePath(tool, 'skills', localConfig) : undefined;
+  if (special) return await pathExists(resolveHostRoot(tool, localConfig.scope, localConfig.projectRoot)!) ? special : null;
 
   if (tool === 'openclaw') {
+    if (localConfig.scope === 'project') return null;
     const wsDir = await resolveOpenclawWorkspaceDir();
     if (!wsDir) {
       log.debug('Skipping skill sync for openclaw: workspace dir not found');
@@ -93,7 +103,7 @@ export async function skillsDirForTool(
     return path.join(getHermesHome(), 'skills');
   }
 
-  if (!await isToolInstalledForConfig(tool, configuredSkillsPath, localConfig)) {
+  if (!await isToolInstalledForConfig(tool, configuredSkillsPath, localConfig, undefined, probePath)) {
     log.debug(`Skipping skill sync for ${tool}: tool not installed`);
     return null;
   }
@@ -119,8 +129,9 @@ export async function skillTargetForTool(
   localConfig: LocalConfig,
   skillName: string,
   sourcePath?: string,
+  probePath?: string,
 ): Promise<string | null> {
-  const skillsDir = await skillsDirForTool(tool, configuredSkillsPath, localConfig);
+  const skillsDir = await skillsDirForTool(tool, configuredSkillsPath, localConfig, probePath);
   if (skillsDir === null || configuredSkillsPath === undefined) return null;
 
   // Codex alone can redirect a skill to the shared `.agents/skills` directory,
@@ -553,8 +564,8 @@ export class SkillsHandler extends ResourceHandler {
 
     // Scan each tool's skills directory
     for (const [tool, toolPath] of Object.entries(scopedToolPaths(teamConfig, localConfig))) {
-      if (!toolPath.skills) continue;
-      const skillsDir = path.join(resolveToolBaseDir(tool, localConfig), toolPath.skills);
+      if (!toolPath.skills || (usesManagedPolicy(teamConfig, localConfig) && (!isHostSelected(localConfig, tool) || !supportsStaticResource(tool, 'skills', localConfig.scope)))) continue;
+      const skillsDir = resolveHostResourcePath(tool, 'skills', localConfig) ?? path.join(resolveToolBaseDir(tool, localConfig), toolPath.skills);
       if (!await pathExists(skillsDir)) continue;
 
       // Use recursive scanning to find all skills at any depth
@@ -719,7 +730,7 @@ export class SkillsHandler extends ResourceHandler {
     for (const [tool, toolPath] of Object.entries(scopedToolPaths(teamConfig, localConfig))) {
       if (isAgentExcluded(localConfig, tool)) continue;
 
-      const dest = await skillTargetForTool(tool, toolPath.skills, localConfig, item.name, sourcePath);
+      const dest = await skillTargetForTool(tool, toolPath.skills, localConfig, item.name, sourcePath, toolPath.probe);
       if (dest) targets.push({ tool, dest });
     }
     return targets;
@@ -737,6 +748,7 @@ export class SkillsHandler extends ResourceHandler {
    * Pull a skill from team repo to all configured AI tool directories.
    */
   async pullItem(item: ResourceItem, teamConfig: TeamaiConfig, localConfig: LocalConfig): Promise<void> {
+    if (!usesManagedPolicy(teamConfig, localConfig)) {
     const otherVersions = await otherVersionFiles(localConfig.repo.localPath, item);
     for (const { tool, dest } of await this.resolveTargets(teamConfig, localConfig, item, item.sourcePath)) {
       try {
@@ -748,6 +760,29 @@ export class SkillsHandler extends ResourceHandler {
         log.warn(`Failed to sync skill ${item.name} to ${tool}: ${(e as Error).message}`);
       }
     }
+      return;
+    }
+    const resource = await this.buildManagedResource(item, teamConfig, localConfig);
+    const result = await reconcileManagedResources(getTeamaiHome(localConfig.scope, localConfig.projectRoot), [resource]);
+    for (const conflict of result.conflicts) log.warn(`Preserved local skill: ${conflict}`);
+  }
+
+  async buildManagedResource(item: ResourceItem, teamConfig: TeamaiConfig, localConfig: LocalConfig): Promise<DesiredManagedResource> {
+    const targets: DesiredManagedResource['targets'] = [];
+    for (const { tool, dest } of await this.resolveTargets(teamConfig, localConfig, item)) {
+      const hostRoot = localConfig.hostRoots?.[tool] ?? (tool === 'copilot' ? getCopilotHome() : tool === 'hermes' ? getHermesHome() : resolveHostRoot(tool, localConfig.scope, localConfig.projectRoot));
+      targets.push({ path: dest, kind: 'directory', tool, sourcePath: item.sourcePath,
+        ...(hostRoot ? { hostRoot } : {}),
+        preservePaths: ['.runtime', 'assets/douyin-cookie-bridge/bridge-secret.local.json'],
+        prepareStaged: async (staged) => { await ensureSkillFrontmatter(staged, item.name); },
+      });
+    }
+    const id = `skills:${item.name}`;
+    const manifest = await loadManagedResourceManifest(getTeamaiHome(localConfig.scope, localConfig.projectRoot));
+    const retainTargetPaths = (manifest.resources[id]?.targets ?? [])
+      .filter((target) => !target.tool || !isHostSelected(localConfig, target.tool))
+      .map((target) => target.path);
+    return { id, type: 'skills', targets, retainTargetPaths };
   }
 
   /**
@@ -779,7 +814,7 @@ export class SkillsHandler extends ResourceHandler {
 
     // Remove from each tool's skills directory
     for (const [tool, toolPath] of Object.entries(scopedToolPaths(teamConfig, localConfig))) {
-      if (!toolPath.skills) continue;
+      if (!toolPath.skills || (usesManagedPolicy(teamConfig, localConfig) && (!isHostSelected(localConfig, tool) || !supportsStaticResource(tool, 'skills', localConfig.scope)))) continue;
       // Not ours to write to, so not ours to delete from. Above the OpenClaw
       // branch, so the workspace copy is covered by the same gate.
       if (isAgentExcluded(localConfig, tool)) continue;

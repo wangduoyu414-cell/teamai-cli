@@ -1,3 +1,5 @@
+import { usesManagedPolicy } from './host-adapters.js';
+import { EXPLICIT_ONLY_HOSTS, isHostSelected, normalizeHostId } from './host-adapters.js';
 import crypto from 'node:crypto';
 import path from 'node:path';
 import fse from 'fs-extra';
@@ -222,6 +224,7 @@ export async function resolveMcpTargets(
   // Skills/settings/agents probe paths must reflect the active scope: OpenCode's
   // user-scope resources live under ~/.config/opencode, not ~/.opencode.
   for (const [tool, paths] of Object.entries(scopedToolPaths(teamConfig, localConfig))) {
+    if (usesManagedPolicy(teamConfig, localConfig) && (EXPLICIT_ONLY_HOSTS.has(normalizeHostId(tool)) || !isHostSelected(localConfig, tool))) continue;
     const format = detectMcpFormat(tool);
     if (!format) continue;
 

@@ -287,6 +287,8 @@ export class DocsHandler extends ResourceHandler {
    * directory. `pull` resolves the set once and calls `pullDocs`.
    */
   async pullItem(_item: ResourceItem, teamConfig: TeamaiConfig, localConfig: LocalConfig): Promise<void> {
+    if (teamConfig.sharing.docs.mode === 'index-only') return;
+
     await this.pullDocs(await resolveDocsForDirectory(localConfig), teamConfig, localConfig);
   }
 
@@ -296,6 +298,7 @@ export class DocsHandler extends ResourceHandler {
    * withdraw the unchanged copies of a namespace not active here (#707).
    */
   async pullDocs(desired: DesiredDocs, teamConfig: TeamaiConfig, localConfig: LocalConfig): Promise<void> {
+    if (teamConfig.sharing.docs.mode === 'index-only') return;
     const localDocsDir = resolveDocsDestination(teamConfig, localConfig);
     const src = desired.sourceDir;
     // Validate the source before touching the destination, including an empty bundle.

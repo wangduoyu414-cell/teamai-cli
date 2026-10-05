@@ -46,7 +46,7 @@ export function ghExec(
   const ghPath = getGhPath();
   if (!ghPath) {
     throw new Error(
-      'gh CLI not found. Install it from https://cli.github.com/ or set GITHUB_TOKEN environment variable.',
+      'gh CLI not found. Install it from https://cli.github.com/ then reuse your existing GitHub login.',
     );
   }
 
@@ -64,6 +64,7 @@ export function ghExec(
   const result = crossSpawn.sync(ghPath, args, {
     env: { ...process.env, ...options?.env },
     encoding: 'utf-8',
+    windowsHide: true,
     maxBuffer: 10 * 1024 * 1024,
     cwd: options?.cwd,
   });
@@ -87,17 +88,13 @@ export async function ensureGhAvailable(): Promise<void> {
     return;
   }
 
-  if (getGitHubToken()) {
-    log.debug('GITHUB_TOKEN env var detected — will use REST API directly');
-    return;
-  }
-
   throw new Error(
     'GitHub authentication unavailable.\n' +
       '  Option 1 (recommended): Install gh CLI — https://cli.github.com/\n' +
       '    macOS:   brew install gh\n' +
       '    Linux:   see https://github.com/cli/cli/blob/trunk/docs/install_linux.md\n' +
-      '  Option 2: Export a personal access token — GITHUB_TOKEN=ghp_... (needs "repo" scope)',
+      '    Windows: install GitHub CLI from https://cli.github.com/\n' +
+      '  Then reuse an existing login or run gh auth login --web --git-protocol https. Model API keys are not required.',
   );
 }
 
@@ -251,22 +248,13 @@ export class RepoNotFoundError extends Error {
 }
 
 /**
- * Clone a GitHub repo using `git clone` with an embedded OAuth token so
- * subsequent pull/push operations work without a separate credential helper.
+ * Clone through gh using its existing authentication without embedding credentials in Git URLs.
  * Throws RepoNotFoundError when the remote does not exist.
  */
 export function ghRepoClone(repo: string, localPath: string): void {
-  const token = ghGetOAuthToken();
-  const cloneUrl = token
-    ? `https://x-access-token:${token}@github.com/${repo}.git`
-    : `https://github.com/${repo}.git`;
-
-  const result = spawnSync('git', ['clone', cloneUrl, localPath], {
-    encoding: 'utf-8',
-    stdio: ['pipe', 'pipe', 'pipe'],
-    timeout: 120_000,
-    windowsHide: true,
-  });
+  // Let gh use the user's existing login/credential helper. Never persist a
+  // credential-bearing origin URL in the cloned repository.
+  const result = ghExec(['repo', 'clone', repo, localPath]);
 
   const allOutput = `${result.stderr ?? ''} ${result.stdout ?? ''}`;
   if (
@@ -279,6 +267,13 @@ export function ghRepoClone(repo: string, localPath: string): void {
   if (result.status !== 0) {
     const sanitized = allOutput.replace(/x-access-token:[^@]+@/g, 'x-access-token:***@');
     throw new Error(`git clone failed: ${sanitized.trim()}`);
+  }
+  // Configure only this clone, not global Git settings. Empty helper resets
+  // inherited helpers; subsequent plain Git pulls reuse the same gh login.
+  for (const helper of ['', '!gh auth git-credential']) {
+    const configured = spawnSync('git', ['-C', localPath, 'config', '--local', '--add',
+      'credential.https://github.com.helper', helper], {encoding:'utf8', windowsHide:true});
+    if (configured.status !== 0) throw new Error('Repository cloned, but its GitHub credential helper could not be configured.');
   }
 }
 

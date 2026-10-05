@@ -12,6 +12,7 @@ Generated: do not edit by hand. Regenerate with
 ## Global options
 
 - `-V, --version` — output the version number
+- `--plan` — Preview lifecycle work without side effects
 - `--dry-run` — Preview mode, no changes made
 - `-v, --verbose` — Verbose output
 
@@ -214,6 +215,7 @@ Generated: do not edit by hand. Regenerate with
 - `teamai mcp` — Manage team MCP servers across AI tools
   - `teamai mcp list` — List team MCP servers and their per-tool install status
   - `teamai mcp inject` — Inject team MCP servers into all AI tool configs
+    - `--plan` — Preview lifecycle work without side effects
     - `--dry-run` — Show what would change without writing
     - `--force` — Overwrite servers that collide with user-owned entries
   - `teamai mcp remove` — Remove all teamai-managed MCP servers from AI tool configs
@@ -246,9 +248,11 @@ Generated: do not edit by hand. Regenerate with
   - `teamai models switch <profile>` — Point agents at a model profile (every compatible agent by default)
     - `--agent <name>` — Only switch this agent. Repeatable or comma-separated.
     - `--model <id>` — Default model to select (defaults to the first in the profile)
+    - `--plan` — Preview lifecycle work without side effects
     - `--dry-run` — Show what would change without writing
   - `teamai models restore` — Restore agent model settings captured before the first TeamAI switch
     - `--agent <name>` — Only restore this agent. Repeatable or comma-separated.
+    - `--plan` — Preview lifecycle work without side effects
     - `--dry-run` — Show what would change without writing
   - `teamai models remove <profile>` — Remove a personal model profile without changing agent settings
 
@@ -308,9 +312,11 @@ Generated: do not edit by hand. Regenerate with
     - `--archive` — Move to archive/ instead of deleting
     - `--confidence-writeback` — Update frontmatter confidence scores
     - `--update-quality` — Find stale docs/rules/skills and suggest updates
+    - `--plan` — Preview lifecycle work without side effects
     - `--dry-run` — Show what would be done without making changes
   - `teamai recall promote [learningId]` — Promote a high-confidence learning to formal knowledge (docs/skills/rules)
     - `--category <cat>` — Target category: skills | rules | docs
+    - `--plan` — Preview lifecycle work without side effects
     - `--dry-run` — Show what would be done without making changes
 
 ## import

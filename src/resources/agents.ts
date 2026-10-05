@@ -1,3 +1,8 @@
+import { usesManagedPolicy } from '../host-adapters.js';
+import { getTeamaiHome, getCopilotHome } from '../types.js';
+import { loadModelPolicy, resolveModelRef } from '../model-policy.js';
+import { managedManifestUnchangedTargetPaths, loadManagedResourceManifest, reconcileManagedResources, type DesiredManagedResource } from '../managed-resources.js';
+import { isHostSelected, supportsStaticResource } from '../host-adapters.js';
 import path from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import { parse as parseYaml } from 'yaml';
@@ -31,6 +36,8 @@ import {
   ALL_SUPPORTED_TOOLS,
   AGENT_FILE_EXTENSIONS,
   agentStemFromFilename,
+  agentFilename,
+  reverseFromQwen,
 } from './agent-format.js';
 import type { AgentSpec, ToolName, ReverseResult, ParseResult, MergeResult, RenderResult } from './agent-format.js';
 
@@ -188,6 +195,7 @@ export class AgentsHandler extends ResourceHandler {
     options?: ScanForPushOptions,
   ): Promise<AgentResourceItem[]> {
     const requestedNamespace = options?.namespace;
+    const unchangedManagedPaths = await managedManifestUnchangedTargetPaths(getTeamaiHome(localConfig.scope, localConfig.projectRoot), 'agents');
     const teamAgentsDir = path.join(localConfig.repo.localPath, 'agents');
     const tombstones = await this.removedStems(teamConfig, localConfig);
     // Single-repo mode: users drop canonical agent files straight into the repo's
@@ -292,7 +300,7 @@ export class AgentsHandler extends ResourceHandler {
     const grouped = new Map<string, Map<string, string>>(); // stem → (tool → filePath)
 
     for (const [tool, toolPath] of Object.entries(scopedToolPaths(teamConfig, localConfig))) {
-      if (!toolPath.agents) continue;
+      if (!toolPath.agents || (usesManagedPolicy(teamConfig, localConfig) && (!isHostSelected(localConfig, tool) || !supportsStaticResource(tool, 'agents', localConfig.scope)))) continue;
       // An excluded tool is neither written nor cleaned by teamai, so what it
       // holds is not a source either: `removeItem` leaves its copy behind, and
       // a namespaced removal tombstones only `<ns>/<stem>`, so reading that
@@ -311,6 +319,7 @@ export class AgentsHandler extends ResourceHandler {
         if (directStems.has(stem)) continue; // canonical direct-pickup wins (self mode)
 
         const filePath = path.join(agentsDir, file);
+        if (usesManagedPolicy(teamConfig, localConfig) && unchangedManagedPaths.has(path.resolve(filePath))) continue;
         let toolGroup = grouped.get(stem);
         if (!toolGroup) {
           toolGroup = new Map();
@@ -639,6 +648,7 @@ export class AgentsHandler extends ResourceHandler {
    * Legacy format (.md): copies .md as-is to Claude-compatible tools.
    */
   async pullItem(item: ResourceItem, teamConfig: TeamaiConfig, localConfig: LocalConfig): Promise<void> {
+    if (!usesManagedPolicy(teamConfig, localConfig)) {
     const agentItem = item as AgentResourceItem;
 
     // Determine format: explicit flag takes precedence; fall back to extension detection
@@ -676,19 +686,28 @@ export class AgentsHandler extends ResourceHandler {
         log.warn(`Failed to sync agent ${item.name} to ${tool}: ${(e as Error).message}`);
       }
     }
+      return;
+    }
+    const resource = await this.buildManagedResource(item, teamConfig, localConfig);
+    if (!resource) return;
+    const result = await reconcileManagedResources(getTeamaiHome(localConfig.scope, localConfig.projectRoot), [resource]);
+    for (const conflict of result.conflicts) log.warn(`Preserved local agent: ${conflict}`);
   }
 
-  /**
-   * Remove an agent from the team repo and all tool agents/ directories.
-   * Tries both .yaml and .md extensions in the team repo.
-   * Records a tombstone to prevent re-push.
-   */
-  /**
-   * `vr` when push placed it at `agents/fe/vr.yaml`: the author's local copy is
-   * at the tool's agents root, so the name they type is the bare one. Without
-   * this, `remove` matched that bare name and deleted every `vr` in every
-   * namespace — other people's agents included (#649 review).
-   */
+  async buildManagedResource(item: ResourceItem, teamConfig: TeamaiConfig, localConfig: LocalConfig): Promise<DesiredManagedResource | null> {
+    if (!await this.parsesAsAgent(item as AgentResourceItem)) {
+      log.warn(`Invalid agent: ${item.relativePath}; existing targets are retained`);
+      return null;
+    }
+    const targets = (await this.deliveryTargets(teamConfig, localConfig, item)).map(({ tool, dest, content }) => ({ path: dest, kind: 'file' as const, tool, content, ...(tool === 'copilot' ? { hostRoot: getCopilotHome() } : {}) }));
+    const id = `agents:${item.name}`;
+    const manifest = await loadManagedResourceManifest(getTeamaiHome(localConfig.scope, localConfig.projectRoot));
+    const retainTargetPaths = (manifest.resources[id]?.targets ?? [])
+      .filter((target) => !target.tool || !isHostSelected(localConfig, target.tool))
+      .map((target) => target.path);
+    return { id, type: 'agents', targets, retainTargetPaths };
+  }
+
   async publishedNameFor(name: string, localConfig: LocalConfig): Promise<string | null> {
     const placed = placedResourcePath(
       (await loadStateForScope(localConfig)).placedAgents, 'agents', name,
@@ -760,7 +779,7 @@ export class AgentsHandler extends ResourceHandler {
     }
 
     for (const [tool, toolPath] of Object.entries(scopedToolPaths(teamConfig, localConfig))) {
-      if (!toolPath.agents) continue;
+      if (!toolPath.agents || (usesManagedPolicy(teamConfig, localConfig) && (!isHostSelected(localConfig, tool) || !supportsStaticResource(tool, 'agents', localConfig.scope)))) continue;
       // A tool the member excluded is not ours to write to, so it is not ours
       // to delete from either. This is the gate pull's tombstone pass applies.
       if (isAgentExcluded(localConfig, tool)) continue;
@@ -796,6 +815,7 @@ export class AgentsHandler extends ResourceHandler {
     teamConfig: TeamaiConfig,
     localConfig: LocalConfig,
     activeNamespaces: string[],
+    protectedPaths: Set<string> = new Set(),
   ): Promise<void> {
     const items = await this.scanTeamForPull(teamConfig, localConfig);
     // The same selection `pull` delivers with, records and overrides included:
@@ -822,14 +842,15 @@ export class AgentsHandler extends ResourceHandler {
     for (const { tool, dir: destDir } of await this.agentToolDirs(teamConfig, localConfig)) {
       const activeDestinations = new Set<string>();
       for (const item of active) {
-        const rendered = await this.renderedForTool(item, tool);
-        if (rendered) activeDestinations.add(`${item.name}${rendered.ext}`);
+        const rendered = await this.renderedForTool(item, tool, teamConfig, localConfig);
+        if (rendered) activeDestinations.add(rendered.filename ?? `${item.name}${rendered.ext}`);
       }
       for (const item of inactive) {
         if (item.namespace === undefined && unusable.has(item.name)) continue;
-        const expected = await this.renderedForTool(item, tool);
-        if (!expected || activeDestinations.has(`${item.name}${expected.ext}`)) continue;
-        const deployed = path.join(destDir, `${item.name}${expected.ext}`);
+        const expected = await this.renderedForTool(item, tool, teamConfig, localConfig);
+        if (!expected || activeDestinations.has((expected.filename ?? `${item.name}${expected.ext}`))) continue;
+        const deployed = path.join(destDir, expected.filename ?? `${item.name}${expected.ext}`);
+        if (protectedPaths.has(path.resolve(deployed))) continue;
         const current = await readFileSafe(deployed);
         if (current === null) continue;
         if (current !== expected.content) {
@@ -855,15 +876,15 @@ export class AgentsHandler extends ResourceHandler {
     teamConfig: TeamaiConfig,
     localConfig: LocalConfig,
     item: ResourceItem,
-  ): Promise<{ tool: ToolName; dest: string; render: RenderResult }[]> {
+  ): Promise<{ tool: ToolName; dest: string; render: RenderResult & { filename?: string } }[]> {
     const agentItem = item as AgentResourceItem;
     const renders: { tool: ToolName; dest: string; render: RenderResult }[] = [];
 
     for (const { tool, dir } of await this.agentToolDirs(teamConfig, localConfig)) {
-      const render = await this.renderedForTool(agentItem, tool);
+      const render = await this.renderedForTool(agentItem, tool, teamConfig, localConfig);
       if (!render) continue;
 
-      renders.push({ tool, dest: path.join(dir, `${item.name}${render.ext}`), render });
+      renders.push({ tool, dest: path.join(dir, render.filename ?? `${item.name}${render.ext}`), render });
     }
 
     return renders;
@@ -885,7 +906,7 @@ export class AgentsHandler extends ResourceHandler {
     const dirs: { tool: ToolName; dir: string }[] = [];
 
     for (const [tool, toolPath] of Object.entries(scopedToolPaths(teamConfig, localConfig))) {
-      if (!toolPath.agents || !isKnownTool(tool) || isAgentExcluded(localConfig, tool)) continue;
+      if (!toolPath.agents || !isKnownTool(tool) || isAgentExcluded(localConfig, tool) || (usesManagedPolicy(teamConfig, localConfig) && (!isHostSelected(localConfig, tool) || !supportsStaticResource(tool, 'agents', localConfig.scope)))) continue;
       if (!await isToolInstalledForConfig(tool, toolPath.agents, localConfig)) {
         log.debug(`Skipping agent sync for ${tool}: tool not installed`);
         continue;
@@ -917,7 +938,7 @@ export class AgentsHandler extends ResourceHandler {
    * is not a target (legacy `.md` only reaches LEGACY_MD_TOOLS, a YAML spec
    * honours `targets`, an unparsable spec is skipped like pull skips it).
    */
-  private async renderedForTool(item: AgentResourceItem, tool: ToolName): Promise<RenderResult | null> {
+  private async renderedForTool(item: AgentResourceItem, tool: ToolName, teamConfig: TeamaiConfig, localConfig: LocalConfig): Promise<(RenderResult & { filename?: string }) | null> {
     const content = await readFileSafe(item.sourcePath);
     if (content === null) return null;
     if (isLegacyAgent(item)) {
@@ -926,7 +947,12 @@ export class AgentsHandler extends ResourceHandler {
     const parsed = parseAgentYaml(content, `${item.name}.yaml`);
     if (!parsed.ok) return null;
     if (parsed.spec.targets && !parsed.spec.targets.includes(tool)) return null;
-    return renderForTool(parsed.spec, tool);
+    if (parsed.spec.schema_version === 2 && parsed.spec.hosts && !parsed.spec.hosts[tool]) return null;
+    const spec = await resolveAgentModel(parsed.spec, tool, localConfig.repo.localPath, teamConfig.modelPolicy);
+    const render = renderForTool(spec, tool);
+    const declared = agentFilename(spec, tool);
+    if (!declared || /[\\/]/.test(declared) || declared === '.' || declared === '..' || declared.includes('\0')) throw new Error(`Unsafe agent filename: ${declared}`);
+    return { ...render, filename: path.extname(declared) ? declared : `${declared}${render.ext}` };
   }
 
   // ─── Private helpers ──────────────────────────────────────────────────────
@@ -1057,21 +1083,6 @@ function mergeCanonicalEdits(
 }
 
 /** Remove an obsolete same-stem native rendering after a format migration. */
-async function removeStaleAgentSiblings(agentsDir: string, stem: string, targetExt: string): Promise<void> {
-  for (const file of await listFiles(agentsDir)) {
-    if (agentStemFromFilename(file) !== stem || file === `${stem}${targetExt}`) continue;
-    await remove(path.join(agentsDir, file));
-    log.debug(`Removed stale agent sibling ${file} for ${stem}`);
-  }
-}
-
-/**
- * Whether an agent is the legacy `.md` kind, copied verbatim to Claude-shaped
- * tools rather than rendered from a spec. `scanTeamForPull` sets the flag; a
- * caller that builds an item by hand may not, so the source extension decides
- * when it is absent. Pull and the delivery check must agree on this, or one
- * renders a `.md` body as YAML while the other copies it.
- */
 function isLegacyAgent(item: AgentResourceItem): boolean {
   return item.legacy === true || !item.sourcePath.endsWith('.yaml');
 }
@@ -1138,5 +1149,43 @@ function reverseByTool(tool: ToolName, filePath: string, content: string): Rever
       return reverseFromOpencode(filePath, content);
     case 'workbuddy':
       return reverseFromWorkbuddy(filePath, content);
+    case 'qwen':
+      return reverseFromQwen(filePath, content);
+  }
+}
+
+async function resolveAgentModel(
+  spec: AgentSpec,
+  tool: ToolName,
+  repoPath: string,
+  config?: { path: string; strict?: boolean },
+): Promise<AgentSpec> {
+  const host = spec.hosts?.[tool];
+  const ref = host?.model_ref ?? spec.model_ref;
+  if (!ref) return spec;
+  const policy = await loadModelPolicy(repoPath, config);
+  if (!policy) throw new Error(`Agent ${spec.name} uses model_ref but no modelPolicy is configured`);
+  const resolved = resolveModelRef(policy, tool, ref);
+  return {
+    ...spec,
+    model: resolved.model,
+    ...(resolved.effort ? { effort: resolved.effort } : {}),
+    hosts: {
+      ...spec.hosts,
+      [tool]: {
+        ...host,
+        model: resolved.model,
+        ...(resolved.effort ? { effort: resolved.effort } : {}),
+      },
+    },
+  };
+}
+
+
+async function removeStaleAgentSiblings(agentsDir: string, stem: string, targetExt: string): Promise<void> {
+  for (const file of await listFiles(agentsDir)) {
+    if (agentStemFromFilename(file) !== stem || file === `${stem}${targetExt}`) continue;
+    await remove(path.join(agentsDir, file));
+    log.debug(`Removed stale agent sibling ${file} for ${stem}`);
   }
 }

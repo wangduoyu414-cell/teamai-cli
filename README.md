@@ -29,6 +29,8 @@ TeamAI turns individual AI capabilities into shared team capabilities — across
   <img src="assets/use-cases.png" alt="Eight everyday scenarios, before and after TeamAI" width="100%">
 </p>
 
+> This fork is based on stable upstream **v0.26.0**. It keeps autocode’s managed-resource, model-policy and static-host contracts; ordinary upstream configurations retain native delivery. See [the fork changelog](CHANGELOG.md) for migration and preview behavior. Installed from an immutable commit archive, not npm.
+
 ## Quick Start
 
 Send this one line to your AI tool:
@@ -73,7 +75,8 @@ Once a teammate is set up, they just open their agent and already have the team'
 ### Install
 
 ```bash
-npm install -g teamai-cli
+TEAMAI_CORE_COMMIT=<commit-from-teamai-core.lock.json>
+npm install -g "https://github.com/wangduoyu414-cell/teamai-cli/archive/${TEAMAI_CORE_COMMIT}.tar.gz"
 ```
 
 ### Team admin / solo user

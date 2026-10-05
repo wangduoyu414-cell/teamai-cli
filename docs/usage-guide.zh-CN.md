@@ -569,7 +569,8 @@ teamai skill path wiki              # 打印打包目录，用于运行 skill �
 
 ```bash
 teamai pull              # 手动拉取
-teamai pull --dry-run    # 试运行，不实际修改
+teamai pull --dry-run    # 只读计划：不刷新 Git、不 bootstrap、不改 hooks 或文件
+teamai pull --plan       # --dry-run 的别名
 ```
 
 手动执行 `teamai pull` 会在结束时运行 `teamai doctor` 的检查，并逐条打印失败项及其修复建议——包括它刚刚报告同步的 skill 是否真的落到每个启用工具的磁盘上、且可被读取。全部通过时不会有任何额外输出，退出码也不变。SessionStart hook 路径和 `--dry-run` 完全不运行检查，会话启动速度保持不变。托管平台相关的检查（`gh`/`gf` 认证）留给 `teamai doctor`：这次 pull 刚刚用过该平台。
@@ -2073,6 +2074,9 @@ sharing:
     enabled: false             # 可选；成员可在本地覆盖
   docs:
     localDir: ./.teamai/docs
+    # mode: index-only  # 可选：docs 仅保留在团队 checkout 中供索引
+  instructions:
+    source: AGENTS.md   # 可选：部署到各工具的原生 instruction 文件
   env:
     injectShellProfile: true
   coAuthor:

@@ -1,3 +1,4 @@
+import { isHostSelected, normalizeHostId, resolveHostResourcePath, resolveHostRoot } from './host-adapters.js';
 import path from 'node:path';
 import { pathExists, ensureDir } from './utils/fs.js';
 import {
@@ -5,7 +6,6 @@ import {
   getCopilotHome,
   resolveBaseDir,
   resolveToolBaseDir,
-  isAgentDisabled,
   scopedToolPaths,
   CLAUDE_TOOL_ID,
   detectClaudeConfigRoot,
@@ -38,7 +38,7 @@ export function normalizeAgentList(agent?: string | string[]): string[] {
   const seen = new Set<string>();
   for (const part of raw) {
     for (const piece of String(part).split(',')) {
-      const id = piece.trim();
+      const id = normalizeHostId(piece);
       if (id && !seen.has(id)) {
         seen.add(id);
         out.push(id);
@@ -70,6 +70,7 @@ export interface KnownAgent {
   category: AgentCategory;
   /** Skills directory relative to the user's HOME (no leading slash). */
   skillsPath: string;
+  probePath?: string;
 }
 
 /**
@@ -82,12 +83,13 @@ export const KNOWN_AGENTS: KnownAgent[] = [
   { id: 'claude', displayName: 'Claude Code', category: 'coding', skillsPath: '.claude/skills' },
   { id: 'claude-internal', displayName: 'Claude Code Internal', category: 'coding', skillsPath: '.claude-internal/skills' },
   { id: 'tclaude', displayName: 'TClaude', category: 'coding', skillsPath: '.tclaude/skills' },
-  { id: 'codex', displayName: 'Codex CLI', category: 'coding', skillsPath: '.codex/skills' },
+  { id: 'codex', displayName: 'Codex CLI', category: 'coding', skillsPath: '.agents/skills', probePath: '.codex' },
   { id: 'codex-internal', displayName: 'Codex CLI Internal', category: 'coding', skillsPath: '.codex-internal/skills' },
   { id: 'tcodex', displayName: 'TCodex', category: 'coding', skillsPath: '.tcodex/skills' },
   { id: 'cursor', displayName: 'Cursor', category: 'coding', skillsPath: '.cursor/skills' },
   { id: 'joycode', displayName: 'JoyCode', category: 'coding', skillsPath: '.joycode/skills' },
   { id: 'codebuddy', displayName: 'CodeBuddy', category: 'coding', skillsPath: '.codebuddy/skills' },
+  { id: 'dsh', displayName: 'DeepSeek Harness', category: 'coding', skillsPath: '.dsh/skills', probePath: '.dsh' },
 
   // Additional coding agents from skills-manage
   { id: 'gemini', displayName: 'Gemini CLI', category: 'coding', skillsPath: '.gemini/skills' },
@@ -169,16 +171,17 @@ export async function seedSelfModeToolDirs(
   const baseDir = resolveBaseDir(localConfig);
   const configured = teamConfig.toolPaths ?? {};
 
-  let targets = localConfig.enabledAgents ?? [];
+  let targets = (localConfig.enabledAgents ?? []).map(normalizeHostId);
   // Never seed an explicitly disabled agent.
-  targets = targets.filter((id) => !isAgentDisabled(localConfig, id));
+  targets = targets.filter((id) => isHostSelected(localConfig, id));
 
   const seeded: string[] = [];
   for (const id of targets) {
     const skillsPath = configured[id]?.skills
       ?? KNOWN_AGENTS.find((a) => a.id === id)?.skillsPath;
     if (!skillsPath) continue;
-    await ensureDir(path.join(baseDir, skillsPath));
+    const specialDestination = resolveHostResourcePath(id, 'skills', localConfig);
+    await ensureDir(specialDestination ?? path.join(baseDir, skillsPath));
     seeded.push(id);
   }
   return seeded;
@@ -207,15 +210,17 @@ export async function detectHomeInstalledAgents(
       if (await pathExists(getCopilotHome())) found.push(id);
       continue;
     }
-    const skillsPath = KNOWN_AGENTS.find((a) => a.id === id)?.skillsPath;
+    const known = KNOWN_AGENTS.find((a) => a.id === id);
+    const skillsPath = known?.probePath ?? known?.skillsPath;
     if (!skillsPath) continue;
+    const specialRoot = resolveHostRoot(id, 'user');
     const rootSegment = skillsPath.split('/')[0]; // e.g. ".claude"
     if (!rootSegment) continue;
     // A Claude Code relocated with CLAUDE_CONFIG_DIR may have no ~/.claude at
     // all; the developer still uses it. This runs before any config exists, so
     // the variable is the only signal.
     const relocated = id === CLAUDE_TOOL_ID ? detectClaudeConfigRoot() : null;
-    if (await pathExists(path.join(home, rootSegment)) || (relocated !== null && await pathExists(relocated))) {
+    if (await pathExists(specialRoot ?? path.join(home, rootSegment)) || (relocated !== null && await pathExists(relocated))) {
       found.push(id);
     }
   }
@@ -237,13 +242,14 @@ export function getEffectiveAgents(
     if (!paths.skills) continue;
     const existing = byId.get(id);
     if (existing) {
-      byId.set(id, { ...existing, skillsPath: paths.skills, fromTeamConfig: true });
+      byId.set(id, { ...existing, skillsPath: paths.skills, ...(paths.probe ? { probePath: paths.probe } : {}), fromTeamConfig: true });
     } else {
       byId.set(id, {
         id,
         displayName: id,
         category: 'coding',
         skillsPath: paths.skills,
+        probePath: paths.probe,
         fromTeamConfig: true,
       });
     }

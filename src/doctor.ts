@@ -1,3 +1,5 @@
+import { buildSpecialHostReports, buildSpecialHostDiagnostics } from './doctor-special-hosts.js';
+import { isHostSelected, usesManagedPolicy } from './host-adapters.js';
 import path from 'node:path';
 import { detectProjectConfig, loadLocalConfig, loadTeamConfig } from './config.js';
 import { pathExists, readFileSafe } from './utils/fs.js';
@@ -44,6 +46,7 @@ export type CheckSource = 'local' | 'provider';
 import { hasPiHooks } from './pi-hooks.js';
 
 export interface Check {
+  id?: string;
   name: string;
   source: CheckSource;
   /**
@@ -98,6 +101,7 @@ export interface DoctorOptions extends GlobalOptions {
 
 /** One check after it ran. */
 export interface CheckResult {
+  id?: string;
   name: string;
   ok: boolean;
   fix?: string;
@@ -105,6 +109,11 @@ export interface CheckResult {
 
 /** What `doctor --json` prints. One object, one place that builds it. */
 export interface DoctorReport {
+  schemaVersion?: 1;
+  projectRoot?: string | null;
+  provider?: string;
+  hosts?: Awaited<ReturnType<typeof buildSpecialHostReports>>;
+  notices?: string[];
   ok: boolean;
   /** null before initialization, when there is no config to scope. */
   scope: string | null;
@@ -305,15 +314,15 @@ async function hasInstalledCodexHooks(toolPaths: TeamaiConfig['toolPaths'], base
  * when TeamAI is not initialized here — the caller decides how to report that.
  */
 export async function resolveDoctorContext(): Promise<DoctorContext | null> {
-  const projectConfig = await detectProjectConfig();
-  const localConfig = projectConfig ?? (await loadLocalConfig());
+  const projectConfig = await detectProjectConfig(undefined, undefined, { dryRun: true });
+  const localConfig = projectConfig ?? (await loadLocalConfig({ dryRun: true }));
   if (!localConfig) return null;
 
   const teamConfig = await loadTeamConfig(localConfig.repo.localPath);
   const toolPaths: TeamaiConfig['toolPaths'] = teamConfig
     ? Object.fromEntries(
       Object.entries(scopedToolPaths(teamConfig, localConfig))
-        .filter(([tool]) => !isAgentExcluded(localConfig, tool)),
+        .filter(([tool]) => !isAgentExcluded(localConfig, tool) && (!usesManagedPolicy(teamConfig, localConfig) || isHostSelected(localConfig, tool))),
     )
     : {};
   // Hook checks must look where hooks are actually injected. resolveHookScope
@@ -326,7 +335,7 @@ export async function resolveDoctorContext(): Promise<DoctorContext | null> {
   const hookToolPaths: TeamaiConfig['toolPaths'] = teamConfig
     ? Object.fromEntries(
       Object.entries(scopedToolPaths(teamConfig, { ...localConfig, scope: hookScope.scope }))
-        .filter(([tool]) => !isAgentExcluded(localConfig, tool)),
+        .filter(([tool]) => !isAgentExcluded(localConfig, tool) && (!usesManagedPolicy(teamConfig, localConfig) || isHostSelected(localConfig, tool))),
     )
     : {};
   const baseDir = hookScope.baseDir;
@@ -424,6 +433,7 @@ export async function buildChecks(ctx: DoctorContext, stage: CheckStage = 'docto
       fix: 'Run `teamai init` to clone the team repo',
     },
     {
+      id: 'config.team',
       name: 'Team config (teamai.yaml) is valid',
       source: 'local',
       check: async () => {
@@ -476,9 +486,10 @@ export async function runChecks(
   onResult?: (result: CheckResult) => void,
 ): Promise<CheckResult[]> {
   const results: CheckResult[] = [];
-  for (const { name, check, fix } of checks) {
+  for (const { id, name, check, fix } of checks) {
     const ok = await check();
     const result: CheckResult = ok ? { name, ok } : { name, ok, fix };
+    result.id = id ?? `check.${name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/-$/, '')}`;
     results.push(result);
     onResult?.(result);
   }
@@ -512,14 +523,17 @@ export async function doctor(options: DoctorOptions): Promise<boolean> {
 
   log.info('Running diagnostics...\n');
   const ctx = await resolveDoctorContext();
+  const hosts = await buildSpecialHostReports(ctx?.localConfig ?? null);
+  const metadata = { schemaVersion: 1 as const, hosts, projectRoot: ctx?.localConfig.projectRoot ?? null, provider: ctx?.localConfig.provider ?? ctx?.teamConfig?.provider ?? 'unknown' };
   if (!ctx) {
     const notInitialized: CheckResult = {
+      id: 'config.initialized',
       name: 'TeamAI is not initialized',
       ok: false,
       fix: 'Run `teamai init <repo-url>` in a project, or add `--scope user` for all projects',
     };
     if (jsonMode) {
-      emitReport({ ok: false, scope: null, checks: [notInitialized] });
+      emitReport({ ...metadata, ok: false, scope: 'user', notices: [], checks: [notInitialized] });
     } else {
       console.log('  Scope: not initialized\n');
       renderResult(notInitialized);
@@ -536,12 +550,16 @@ export async function doctor(options: DoctorOptions): Promise<boolean> {
     console.log(`  Scope: ${scopeLabel}\n`);
   }
 
-  const results = await runChecks(await buildChecks(ctx), jsonMode ? undefined : renderResult);
+  const special = await buildSpecialHostDiagnostics(localConfig, ctx.teamConfig, hosts);
+  const results = await runChecks([...await buildChecks(ctx), ...special.checks], jsonMode ? undefined : renderResult);
   let allPassed = results.every((r) => r.ok);
 
   const { pkgDoctorReport } = await import('./pkg/commands.js');
   const packageReport = await pkgDoctorReport(localConfig, process.cwd());
-  if (packageReport && !packageReport.allPassed) allPassed = false;
+  if (packageReport) {
+    results.push({ id: 'packages', name: 'Declared packages are ready', ok: packageReport.allPassed });
+    if (!packageReport.allPassed) allPassed = false;
+  }
 
   // Codex trust-gate reminder: even when hooks are installed, Codex may not run
   // them until the user reviews/trusts them. Note only — teamai never writes
@@ -552,6 +570,7 @@ export async function doctor(options: DoctorOptions): Promise<boolean> {
   // Info, not checks: which namespace item or entry replaces which root one
   // (#707).
   const notes = [
+    ...special.notices,
     ...await buildNamespaceNotes(ctx),
     ...await entryNamespaceNotes(ctx),
     ...(codexNote ? [codexNote] : []),
@@ -559,6 +578,8 @@ export async function doctor(options: DoctorOptions): Promise<boolean> {
 
   if (jsonMode) {
     emitReport({
+      ...metadata,
+      notices: notes,
       ok: allPassed,
       scope,
       checks: results,

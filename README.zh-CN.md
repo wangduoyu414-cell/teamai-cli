@@ -29,6 +29,8 @@ TeamAI 将个人的 AI 能力转化为团队共享能力，并在不同 Agent、
   <img src="assets/use-cases.zh-CN.png" alt="八个日常场景：使用 TeamAI 前后对比" width="100%">
 </p>
 
+> 本 Fork 基于上游稳定版 **v0.26.0**，保留 autocode 的受管资源、模型策略与静态宿主合同；普通上游配置继续使用原生同步方式。迁移与预演行为见 [Fork 更新记录](CHANGELOG.md)。 安装来源为不可变提交压缩包。
+
 ## 快速开始
 
 把下面这一句发给你的 AI 工具:
@@ -79,7 +81,8 @@ Skills、Rules、MCP 等 Agent 能用的资源都可以分享：
 ### 安装
 
 ```bash
-npm install -g teamai-cli
+TEAMAI_CORE_COMMIT=<teamai-core.lock.json 中的提交>
+npm install -g "https://github.com/wangduoyu414-cell/teamai-cli/archive/${TEAMAI_CORE_COMMIT}.tar.gz"
 ```
 
 ### 团队管理员 / 个人使用者

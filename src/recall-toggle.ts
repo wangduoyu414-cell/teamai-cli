@@ -21,9 +21,11 @@ import {
   type TeamaiConfig,
   type LocalConfig,
 } from './types.js';
+import { usesManagedPolicy, assertHostRootsStable, isHostSelected, supportsStaticResource } from './host-adapters.js';
 
 async function removeRecallArtifacts(teamConfig: TeamaiConfig, localConfig: LocalConfig): Promise<void> {
   for (const [tool, toolPath] of Object.entries(scopedToolPaths(teamConfig, localConfig))) {
+    if (usesManagedPolicy(teamConfig, localConfig) && !isHostSelected(localConfig, tool)) continue;
     const baseDir = resolveToolBaseDir(tool, localConfig);
     // Remove recall rule file
     if (toolPath.rules) {
@@ -66,7 +68,7 @@ async function removeRecallArtifacts(teamConfig: TeamaiConfig, localConfig: Loca
     }
 
     // Remove recall block from CLAUDE.md
-    if (toolPath.claudemd) {
+    if (toolPath.claudemd && (!usesManagedPolicy(teamConfig, localConfig) || supportsStaticResource(tool, 'instructions', localConfig.scope))) {
       const claudeMdPath = path.join(baseDir, toolPath.claudemd);
       const content = await readFileSafe(claudeMdPath);
       if (content && content.includes(TEAMAI_RECALL_RULES_START)) {
@@ -103,6 +105,7 @@ async function deployRecallArtifacts(teamConfig: TeamaiConfig, localConfig: Loca
   const recallBlock = compileRecallRulesBlock();
 
   for (const [tool, toolPath] of Object.entries(scopedToolPaths(teamConfig, localConfig))) {
+    if (usesManagedPolicy(teamConfig, localConfig) && !isHostSelected(localConfig, tool)) continue;
     if (isAgentExcluded(localConfig, tool)) continue;
     if (!toolPath.claudemd || !toolPath.agents) continue;
     if (!await isToolInstalledForConfig(tool, toolPath.agents, localConfig)) continue;
@@ -124,6 +127,7 @@ async function deployRecallArtifacts(teamConfig: TeamaiConfig, localConfig: Loca
 
 export async function recallDisable(_opts: GlobalOptions): Promise<void> {
   const { localConfig, teamConfig } = await autoDetectInit();
+  if (usesManagedPolicy(teamConfig, localConfig)) assertHostRootsStable(localConfig);
 
   const updated = { ...localConfig, recallEnabled: false };
   await saveLocalConfigForScope(updated, localConfig.scope, localConfig.projectRoot);
@@ -134,6 +138,7 @@ export async function recallDisable(_opts: GlobalOptions): Promise<void> {
 
 export async function recallEnable(_opts: GlobalOptions): Promise<void> {
   const { localConfig, teamConfig } = await autoDetectInit();
+  if (usesManagedPolicy(teamConfig, localConfig)) assertHostRootsStable(localConfig);
 
   const updated = { ...localConfig, recallEnabled: true };
   await saveLocalConfigForScope(updated, localConfig.scope, localConfig.projectRoot);

@@ -12,6 +12,7 @@ export async function isToolInstalledForConfig(
   toolPath: string,
   localConfig: LocalConfig,
   exactConfigPath?: string,
+  probePath?: string,
 ): Promise<boolean> {
   const baseDir = resolveToolBaseDir(tool, localConfig);
   if (tool === COPILOT_TOOL_ID) {
@@ -19,7 +20,7 @@ export async function isToolInstalledForConfig(
       || (exactConfigPath !== undefined && await pathExists(exactConfigPath))
       || pathExists(getCopilotHome());
   }
-  return ResourceHandler.isToolInstalled(toolPath, baseDir);
+  return ResourceHandler.isToolInstalled(toolPath, baseDir, probePath);
 }
 
 /**
@@ -130,9 +131,9 @@ export abstract class ResourceHandler {
    * This prevents creating directories for tools the user hasn't installed.
    * @param baseDir - Override base directory (defaults to HOME). Used for project scope.
    */
-  static async isToolInstalled(toolPath: string, baseDir?: string): Promise<boolean> {
+  static async isToolInstalled(toolPath: string, baseDir?: string, probePath?: string, rootOverride?: string): Promise<boolean> {
     const base = baseDir ?? getUserHome();
-    const toolRoot = path.join(base, toolInstallRoot(toolPath));
+    const toolRoot = rootOverride ?? path.join(base, toolInstallRoot(probePath ?? toolPath));
     return pathExists(toolRoot);
   }
 

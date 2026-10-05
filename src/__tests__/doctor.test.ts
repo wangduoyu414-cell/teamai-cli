@@ -1,3 +1,5 @@
+import { getAgentVersion } from '../agent-version.js';
+const mockedGetAgentVersion = vi.mocked(getAgentVersion);
 import { describe, it, expect, vi, beforeEach, afterEach, type Mock } from 'vitest';
 import path from 'node:path';
 
@@ -46,6 +48,10 @@ vi.mock('../resources/docs.js', async (importOriginal) => ({
     ...(await importOriginal<typeof import('../resources/docs.js')>()),
     listDocFiles: vi.fn().mockResolvedValue([]),
     resolveDocsDestination: vi.fn().mockReturnValue('/tmp/team-docs'),
+}));
+
+vi.mock('../agent-version.js', () => ({
+    getAgentVersion: vi.fn(),
 }));
 
 // Mock the tgit provider to avoid side effects
@@ -405,7 +411,7 @@ describe('doctor — hook checks', () => {
         await doctor({});
 
         const allCalls = consoleSpy.mock.calls.map((c) => c[0]);
-        const envLine = allCalls.find((msg: string) => msg.includes('Env variables'));
+        const envLine = allCalls.find((msg: string) => msg.includes('Env variables injected'));
         expect(envLine).toContain('✔');
     });
 
@@ -426,7 +432,7 @@ describe('doctor — hook checks', () => {
         await doctor({});
 
         const allCalls = consoleSpy.mock.calls.map((c) => c[0]);
-        const envLine = allCalls.find((msg: string) => msg.includes('Env variables'));
+        const envLine = allCalls.find((msg: string) => msg.includes('Env variables are not injected'));
         expect(envLine).toContain('✔');
     });
 
@@ -598,7 +604,7 @@ describe('doctor — JSON report', () => {
         const report = emittedReport();
         expect(allPassed).toBe(false);
         expect(report.ok).toBe(false);
-        expect(report.scope).toBeNull();
+        expect(report.scope).toBe('user');
         expect(report.checks).toHaveLength(1);
         expect(report.checks[0]).toMatchObject({ name: 'TeamAI is not initialized', ok: false });
         expect(report.checks[0].fix).toContain('teamai init');
@@ -840,5 +846,107 @@ describe('doctor — the recorded Claude Code root', () => {
         // Re-running init cannot record this value, so the fix says why instead.
         expect(check!.fix).toContain('outside the home directory');
         expect(check!.fix).not.toContain('to record it');
+    });
+});
+
+describe('doctor — explicit host checks', () => {
+    it('reports the validated WorkBuddy version for an explicitly selected host', async () => {
+        mockedLoadLocalConfig.mockResolvedValue({
+            ...mockLocalConfig,
+            scope: 'user',
+            enabledAgents: ['workbuddy'],
+            hostRoots: { workbuddy: '/tmp/workbuddy' },
+        });
+        mockedGetAgentVersion.mockResolvedValue('5.3.13');
+
+        await doctor({});
+
+        const allCalls = [...consoleSpy.mock.calls, ...vi.mocked(log.info).mock.calls].map((c) => c[0]);
+        expect(allCalls.some((msg: string) => msg.includes('WorkBuddy: selected'))).toBe(true);
+        expect(allCalls.some((msg: string) => msg.includes('✔ WorkBuddy version matches 5.3.13'))).toBe(true);
+        expect(allCalls.some((msg: string) => msg.includes('runtime loading is a separate host smoke check'))).toBe(true);
+    });
+
+    it('fails DSH diagnostics when the installed version differs from the exact gate', async () => {
+        mockedLoadLocalConfig.mockResolvedValue({
+            ...mockLocalConfig,
+            scope: 'user',
+            enabledAgents: ['dsh'],
+            hostRoots: { dsh: '/tmp/dsh' },
+        });
+        mockedGetAgentVersion.mockResolvedValue('0.1.2');
+
+        await doctor({});
+
+        const allCalls = consoleSpy.mock.calls.map((c) => c[0]);
+        expect(allCalls.some((msg: string) => msg.includes('✖ DSH version matches 0.1.1-rc.1'))).toBe(true);
+        expect(allCalls.some((msg: string) => msg.includes('Install DSH 0.1.1-rc.1'))).toBe(true);
+    });
+
+    it('does not infer duplicate DSH runtime loading from identical instruction files', async () => {
+        mockedLoadLocalConfig.mockResolvedValue({
+            ...mockLocalConfig,
+            scope: 'user',
+            enabledAgents: ['dsh'],
+            hostRoots: { dsh: '/tmp/dsh' },
+        });
+        mockedLoadTeamConfig.mockResolvedValue({
+            ...mockTeamConfig,
+            sharing: { instructions: { source: 'AGENTS.md' } },
+        });
+        mockedGetAgentVersion.mockResolvedValue('0.1.1-rc.1');
+        mockedReadFileSafe.mockImplementation(async (filePath: string) => (
+            filePath.includes('settings.json') ? buildFullHooksContent() : 'same instructions'
+        ));
+
+        await doctor({ json: true });
+        const report = JSON.parse(consoleSpy.mock.calls.at(-1)![0]) as DoctorReport;
+
+        expect(report.notices).toContain(
+            'Identical user-level and project-level AGENTS.md files exist in this workspace; TeamAI does not infer duplicate DSH runtime loading from file presence alone',
+        );
+        expect(report.notices!.some((notice) => notice.includes('DSH is loading identical'))).toBe(false);
+    });
+});
+
+describe('doctor — JSON report', () => {
+    it('emits one machine-readable report without human output', async () => {
+        mockedLoadTeamConfig.mockResolvedValue({
+            ...mockTeamConfig,
+            sharing: { env: { injectShellProfile: false } },
+        });
+
+        await doctor({ json: true });
+        const report = JSON.parse(consoleSpy.mock.calls.at(-1)![0]) as DoctorReport;
+
+        expect(report).toMatchObject({
+            schemaVersion: 1,
+            ok: true,
+            scope: 'user',
+            provider: 'tgit',
+            hosts: {
+                workbuddy: { selected: false, runtimeSmoke: 'manual' },
+                dsh: { selected: false, runtimeSmoke: 'opt-in-read-only' },
+            },
+        });
+        const checkIds = report.checks.map((check) => check.id);
+        expect(checkIds.every((id) => typeof id === 'string' && id.length > 0)).toBe(true);
+        expect(new Set(checkIds).size).toBe(checkIds.length);
+        expect(consoleSpy).toHaveBeenCalledTimes(1);
+        expect(JSON.parse(consoleSpy.mock.calls[0][0])).toEqual(report);
+    });
+
+    it('returns ok=false and structured failed checks for an invalid team config', async () => {
+        mockedLoadTeamConfig.mockResolvedValue(null);
+
+        await doctor({ json: true });
+        const report = JSON.parse(consoleSpy.mock.calls.at(-1)![0]) as DoctorReport;
+
+        expect(report.ok).toBe(false);
+        expect(report.checks).toContainEqual(expect.objectContaining({
+            id: 'config.team',
+            name: 'Team config (teamai.yaml) is valid',
+            ok: false,
+        }));
     });
 });

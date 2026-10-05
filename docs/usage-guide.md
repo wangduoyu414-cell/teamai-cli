@@ -86,7 +86,8 @@ TeamAI's product is one loop, not three separate products:
 ## Installation
 
 ```bash
-npm install -g teamai-cli
+TEAMAI_CORE_COMMIT=<commit-from-teamai-core.lock.json>
+npm install -g "https://github.com/wangduoyu414-cell/teamai-cli/archive/${TEAMAI_CORE_COMMIT}.tar.gz"
 
 # Verify
 teamai --version
@@ -543,7 +544,8 @@ Once the admin shares the team repo URL with members:
 **Project-scoped teams (default):**
 
 ```bash
-npm install -g teamai-cli
+TEAMAI_CORE_COMMIT=<commit-from-teamai-core.lock.json>
+npm install -g "https://github.com/wangduoyu414-cell/teamai-cli/archive/${TEAMAI_CORE_COMMIT}.tar.gz"
 cd /path/to/my-project
 teamai init https://github.com/yourorg/yourrepo
 # Done! AI tools now automatically have access to team resources
@@ -640,7 +642,8 @@ If you need to sync immediately, you can run it manually:
 
 ```bash
 teamai pull              # Manual pull
-teamai pull --dry-run    # Dry run, no actual changes
+teamai pull --dry-run    # Read-only plan: no Git refresh, bootstrap, hooks, or file writes
+teamai pull --plan       # Alias for --dry-run
 ```
 
 A manual `teamai pull` ends by running the `teamai doctor` checks and printing each one that failed, with its fix — including whether the skills it just reported syncing are readable on disk for every enabled tool. It prints nothing when they all pass, and the exit code is unchanged. The SessionStart hook path and `--dry-run` run no checks at all, so session startup stays as fast as before. Provider checks (`gh`/`gf` authentication) are left to `teamai doctor`: the pull just used the provider.
@@ -2217,6 +2220,9 @@ sharing:
     enabled: false             # optional; members can override locally
   docs:
     localDir: ./.teamai/docs
+    # mode: index-only  # optional: keep docs in the team checkout for indexing only
+  instructions:
+    source: AGENTS.md   # optional; deployed to each tool's native instruction host
   env:
     injectShellProfile: true
   coAuthor:
@@ -2511,7 +2517,10 @@ teamai remove rules <name>
 
 ---
 
-> **Repo**: https://github.com/Tencent/teamai-cli
+> **Fork**: https://github.com/wangduoyu414-cell/teamai-cli
+>
+> **Upstream**: https://github.com/Tencent/teamai-cli
+>
 > **Feedback**: file an Issue in the repo
 
 Dashboard workspace selection supports installed project scopes and user scope. Linked worktrees share a project. The all-workspaces view shows all local sessions and the startup knowledge scope. Health report sections are integrated into Team Context and Team Improvement. Restart the dashboard to discover newly installed scopes.

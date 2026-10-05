@@ -1,3 +1,5 @@
+import { usesManagedPolicy } from '../host-adapters.js';
+import { isHostSelected, supportsStaticResource } from '../host-adapters.js';
 import path from 'node:path';
 import { isToolInstalledForConfig, ResourceHandler } from './base.js';
 import type { ResourceItem, ResourceItemStatus, DeliveryTarget, TeamaiConfig, LocalConfig } from '../types.js';
@@ -257,7 +259,7 @@ export class RulesHandler extends ResourceHandler {
     const targets: DeliveryTarget[] = [];
     for (const [tool, toolPath] of Object.entries(scopedToolPaths(teamConfig, localConfig))) {
       if (isAgentExcluded(localConfig, tool)) continue;
-      if (!toolPath.rules) continue;
+      if (!toolPath.rules || (usesManagedPolicy(teamConfig, localConfig) && (!isHostSelected(localConfig, tool) || !supportsStaticResource(tool, 'rules', localConfig.scope)))) continue;
 
       // Skip tools that are not installed
       if (!await isToolInstalledForConfig(tool, toolPath.rules, localConfig)) {
@@ -391,7 +393,7 @@ export class RulesHandler extends ResourceHandler {
     // teamai layout wrote `.md` there, so both are removed — otherwise `remove`
     // would report success while leaving the rule on disk.
     for (const [tool, toolPath] of Object.entries(scopedToolPaths(teamConfig, localConfig))) {
-      if (!toolPath.rules) continue;
+      if (!toolPath.rules || (usesManagedPolicy(teamConfig, localConfig) && (!isHostSelected(localConfig, tool) || !supportsStaticResource(tool, 'rules', localConfig.scope)))) continue;
       // Not ours to write to, so not ours to delete from. Same gate as the
       // tombstone pass in pull.
       if (isAgentExcluded(localConfig, tool)) continue;
@@ -503,7 +505,7 @@ export class RulesHandler extends ResourceHandler {
       ? (await (await import('../pull.js')).resolveCheckoutBases(localConfig, state)).revs
       : [];
     for (const [tool, toolPath] of Object.entries(scopedToolPaths(teamConfig, localConfig))) {
-      if (!toolPath.rules) continue;
+      if (!toolPath.rules || (usesManagedPolicy(teamConfig, localConfig) && (!isHostSelected(localConfig, tool) || !supportsStaticResource(tool, 'rules', localConfig.scope)))) continue;
       // `pullItem` above skips excluded tools, so this pass must skip them too.
       // Without it the stale sweep deletes from a directory teamai never wrote.
       if (isAgentExcluded(localConfig, tool)) continue;

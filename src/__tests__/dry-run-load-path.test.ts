@@ -344,7 +344,6 @@ describe('--dry-run on a fresh self-mode clone (#866)', () => {
   // base commit; it only became reachable on a fresh self-mode clone once
   // detection stopped aborting first (#850). Declared and counted rather than
   // filtered out, so any OTHER new entry still fails this test.
-  const PULL_LOCK_DIR = `${path.join('home', '.teamai', 'locks')}/`;
   // `git fetch` — which the preview performs on purpose, so that its plan is
   // based on the same `origin/<default>` the real push would branch from —
   // leaves its own one-line record behind. It names no ref, changes no working
@@ -352,7 +351,7 @@ describe('--dry-run on a fresh self-mode clone (#866)', () => {
   // above: declared and counted, so any other new entry still fails this test.
   const FETCH_HEAD = path.join('app', '.git', 'FETCH_HEAD');
   const SELF_COMMANDS: Array<[string, () => Promise<void>, string[]]> = [
-    ['pull --dry-run', () => pull({ dryRun: true }), [PULL_LOCK_DIR]],
+    ['pull --dry-run', () => pull({ dryRun: true }), []],
     ['push --dry-run', () => push({ dryRun: true }), [FETCH_HEAD]],
   ];
 

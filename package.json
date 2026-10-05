@@ -1,7 +1,7 @@
 {
-  "name": "teamai-cli",
-  "version": "0.26.0",
-  "description": "TeamAI — Make Every Team AI Native (skill sync + shared knowledge base, powered by Git)",
+  "name": "@wangduoyu414-cell/teamai-cli",
+  "version": "0.26.0-autocode.1",
+  "description": "TeamAI \u2014 Make Every Team AI Native (skill sync + shared knowledge base, powered by Git)",
   "type": "module",
   "bin": {
     "teamai": "dist/index.js"
@@ -34,11 +34,11 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Tencent/teamai-cli.git"
+    "url": "git+https://github.com/wangduoyu414-cell/teamai-cli.git"
   },
-  "homepage": "https://github.com/Tencent/teamai-cli#readme",
+  "homepage": "https://github.com/wangduoyu414-cell/teamai-cli#readme",
   "bugs": {
-    "url": "https://github.com/Tencent/teamai-cli/issues"
+    "url": "https://github.com/wangduoyu414-cell/teamai-cli/issues"
   },
   "keywords": [
     "ai",

@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach, type Mock } from 'vite
 
 // ─── Mocks ──────────────────────────────────────────────
 
+vi.mock('cross-spawn', () => ({ default: { sync: vi.fn() } }));
 vi.mock('node:child_process', () => ({
   spawnSync: vi.fn(),
 }));
@@ -33,6 +34,7 @@ vi.mock('../utils/logger.js', () => ({
 
 // ─── Imports after mocks ────────────────────────────────
 
+import crossSpawn from 'cross-spawn';
 import { spawnSync } from 'node:child_process';
 import { parseGitHubRepoInput } from '../providers/github/repo-url.js';
 import {
@@ -179,9 +181,10 @@ describe('ghRepoClone', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    mockedSpawnSync.mockReset();
-    mockedResolveCliPath.mockReturnValue(null);
-    // no gh CLI (resolver -> null), no token by default
+    vi.mocked(crossSpawn.sync).mockReset();
+    mockedSpawnSync.mockReturnValue({ status: 0, stdout: '', stderr: '' });
+    mockedResolveCliPath.mockReturnValue('/native/gh');
+    // Clone uses the authenticated CLI; no token in Git URLs.
     delete process.env.GITHUB_TOKEN;
     delete process.env.GH_TOKEN;
   });
@@ -191,7 +194,7 @@ describe('ghRepoClone', () => {
   });
 
   it('throws RepoNotFoundError when remote does not exist', () => {
-    mockedSpawnSync.mockReturnValue({
+    (crossSpawn.sync as Mock).mockReturnValue({
       status: 128,
       stdout: '',
       stderr: 'remote: Repository not found.',
@@ -199,8 +202,8 @@ describe('ghRepoClone', () => {
     expect(() => ghRepoClone('org/missing', '/tmp/clone')).toThrow(RepoNotFoundError);
   });
 
-  it('succeeds when git clone exits 0', () => {
-    mockedSpawnSync.mockReturnValue({
+  it('succeeds when gh clone and local helper configuration exit 0', () => {
+    (crossSpawn.sync as Mock).mockReturnValue({
       status: 0,
       stdout: "Cloning into '/tmp/clone'...",
       stderr: '',
@@ -210,7 +213,7 @@ describe('ghRepoClone', () => {
 
   it('sanitizes token from error output', () => {
     process.env.GITHUB_TOKEN = 'ghp_secret';
-    mockedSpawnSync.mockReturnValue({
+    (crossSpawn.sync as Mock).mockReturnValue({
       status: 128,
       stdout: '',
       stderr: 'fatal: unable to connect to x-access-token:ghp_secret@github.com',

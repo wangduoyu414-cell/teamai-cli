@@ -1,3 +1,5 @@
+import { isBuiltinEnabled } from './types.js';
+import { EXPLICIT_ONLY_HOSTS, normalizeHostId, usesManagedPolicy } from './host-adapters.js';
 import { CODEX_TOOL_IDS } from './utils/tool-names.js';
 import path from 'node:path';
 import { realpathSync } from 'node:fs';
@@ -28,10 +30,9 @@ import { getUserHome } from './utils/home.js';
  * Lobster-family agents (OpenClaw engine) that use HOOK.md + handler.ts instead
  * of settings.json (issue #1, 方案二 §四).
  *
- * WorkBuddy is intentionally NOT here: it reads Claude-format hooks from
- * ~/.workbuddy/settings.json (verified on 5.2.0), so it routes through the
- * settings-based injection path like codebuddy. The remaining claw variants
- * stay on the OpenClaw HOOK.md path pending real-device confirmation.
+ * WorkBuddy's low-level Claude-format adapter remains for backward-compatible
+ * cleanup/tests, but fleet reconciliation excludes explicit-only static hosts
+ * and therefore never writes its settings file.
  */
 export const OPENCLAW_TOOLS = new Set(['openclaw', 'qclaw', 'easyclaw', 'autoclaw']);
 
@@ -1450,7 +1451,8 @@ async function reconcilePiExtension(
  * Only writes to tools whose root directory already exists on disk,
  * preventing creation of config dirs for tools the user hasn't installed.
  */
-export async function injectHooksToAllTools(toolPaths: Record<string, { settings?: string }>, baseDir?: string, filterAgents?: string[]): Promise<void> {
+export async function injectHooksToAllTools(toolPaths: Record<string, { settings?: string }>, baseDir?: string, filterAgents?: string[], managedStaticHosts = false): Promise<void> {
+  if (managedStaticHosts) toolPaths = Object.fromEntries(Object.entries(toolPaths).filter(([tool]) => !EXPLICIT_ONLY_HOSTS.has(normalizeHostId(tool))));
   const resolvedBaseDir = baseDir ?? getUserHome();
   const skipped = skipToolsWithoutShell(
     Object.keys(toolPaths).filter(t => !filterAgents || filterAgents.includes(t)),
@@ -1548,8 +1550,9 @@ export async function reconcileHooksToAllTools(
   baseDir: string,
   teamDefs: HookDef[],
   manifestPath: string,
-  opts: { removeAll?: boolean; builtinOverride?: BuiltinHookOverride; filterAgents?: string[]; settingsOnly?: boolean; installedBaseDir?: string; teamHookProjectRoot?: string; scope?: Scope; builtinsOnly?: BuiltinsOnly } = {},
+  opts: { removeAll?: boolean; builtinOverride?: BuiltinHookOverride; filterAgents?: string[]; settingsOnly?: boolean; installedBaseDir?: string; teamHookProjectRoot?: string; scope?: Scope; builtinsOnly?: BuiltinsOnly; managedStaticHosts?: boolean } = {},
 ): Promise<void> {
+  if (opts.managedStaticHosts) toolPaths = Object.fromEntries(Object.entries(toolPaths).filter(([tool]) => !EXPLICIT_ONLY_HOSTS.has(normalizeHostId(tool))));
   // Without the manifest, reconcileHooks manages the built-in entries only.
   const teamManifestPath = opts.builtinsOnly ? undefined : manifestPath;
   const defs = opts.builtinsOnly ? [] : teamDefs;
@@ -1853,9 +1856,17 @@ export async function reconcileTeamHooksForConfig(
     }
     return resolved.ok ? { ok: true, defs: teamDefs } : { ok: false, builtins: builtinsOnly ?? 'with-overrides' };
   }
+  const hookPolicy = teamConfig.builtins?.hooks;
+  const policyDisabled = hookPolicy?.mode === 'disabled'
+    ? builtinHookDefs('claude').map((d) => d.key)
+    : hookPolicy?.mode === 'allowlist'
+      ? builtinHookDefs('claude').filter((d) => !isBuiltinEnabled(teamConfig, 'hooks', d.key)).map((d) => d.key)
+      : [];
+  const mergedBuiltin = { ...builtin, disabled: [...new Set([...(builtin?.disabled ?? []), ...policyDisabled])] };
   await reconcileHooksToAllTools(hookToolPaths, baseDir, teamDefs, manifestPath, {
     removeAll: opts.removeAll,
-    builtinOverride: builtin,
+    builtinOverride: mergedBuiltin,
+    managedStaticHosts: usesManagedPolicy(teamConfig, localConfig),
     filterAgents,
     teamHookProjectRoot: localConfig.scope === 'project' && !isSelfMode(localConfig)
       ? localConfig.projectRoot

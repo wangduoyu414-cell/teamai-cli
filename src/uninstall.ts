@@ -1,3 +1,6 @@
+import { getTeamaiHome } from './types.js';
+import { managedManifestTargetPaths, loadManagedResourceManifest, uninstallManagedResources } from './managed-resources.js';
+import { EXPLICIT_ONLY_HOSTS, normalizeHostId, usesManagedPolicy } from './host-adapters.js';
 import path from 'node:path';
 import { autoDetectInit, saveLocalConfig, saveLocalConfigForScope } from './config.js';
 import { reconcileHooks, hasTeamaiHooks } from './hooks.js';
@@ -280,11 +283,13 @@ async function discoverToolResources(
    * HOME forever.
    */
   hookSettingsPath?: string,
+  managedStaticHosts = false,
 ): Promise<ToolResources> {
   const res: ToolResources = {
     hookFiles: [], openclawHookDirs: [], opencodeHookScopes: [], ompHookFile: null, piHookFiles: [], dshHookFile: null,
     claudeMdFiles: [], skillDirs: [], ruleFiles: [], agentFiles: [],
   };
+  if (managedStaticHosts && EXPLICIT_ONLY_HOSTS.has(normalizeHostId(tool))) return res;
 
   // (a) Hooks — settings.json / hooks.json
   if (toolPath.hooks) {
@@ -562,6 +567,7 @@ async function buildRemovalPlan(
         standaloneHookManifestPath,
         localConfig.scope,
         hookToolPaths[tool]?.settings,
+        usesManagedPolicy(teamConfig, localConfig),
       ),
     );
   }
@@ -1126,7 +1132,7 @@ export async function uninstall(opts: UninstallOptions): Promise<void> {
   let teamConfig: TeamaiConfig | null = null;
 
   try {
-    const result = await autoDetectInit();
+    const result = await autoDetectInit(undefined, { dryRun: !!(opts.plan || opts.dryRun) });
     localConfig = result.localConfig;
     teamConfig = result.teamConfig;
   } catch {
@@ -1138,7 +1144,7 @@ export async function uninstall(opts: UninstallOptions): Promise<void> {
     let agentKey: string | undefined = opts.agent;
     if (opts.agent) {
       const tools = Object.keys(teamConfig.toolPaths);
-      const matched = tools.find((t) => t.toLowerCase() === opts.agent!.toLowerCase());
+      const matched = tools.find((t) => normalizeHostId(t) === normalizeHostId(opts.agent!));
       if (!matched) {
         log.error(`Unknown tool "${opts.agent}". Available tools: ${tools.join(', ')}`);
         process.exitCode = 2;
@@ -1146,16 +1152,27 @@ export async function uninstall(opts: UninstallOptions): Promise<void> {
       }
       agentKey = matched; // normalize to canonical toolPaths key
     }
+    const lifecycleHome = getTeamaiHome(localConfig.scope, localConfig.projectRoot);
+    const lifecyclePlan = await uninstallManagedResources(lifecycleHome, { tool: agentKey, plan: true });
+    const managedPaths = await managedManifestTargetPaths(lifecycleHome);
     const plan = await buildRemovalPlan(localConfig, teamConfig, agentKey);
+    plan.skillDirs = plan.skillDirs.filter((entry) => !managedPaths.has(path.resolve(entry.dir)));
+    plan.agentFiles = plan.agentFiles.filter((entry) => !managedPaths.has(path.resolve(entry)));
+    plan.claudeMdFiles = plan.claudeMdFiles.filter((entry) => !managedPaths.has(path.resolve(entry)));
 
-    if (isPlanEmpty(plan)) {
+    const hasTargetConfigState = agentKey && (localConfig.enabledAgents?.map(normalizeHostId).includes(agentKey) || localConfig.hostRoots?.[normalizeHostId(agentKey)]);
+    if (isPlanEmpty(plan) && lifecyclePlan.planned.length === 0 && lifecyclePlan.conflicts.length === 0 && !hasTargetConfigState) {
       log.info('Nothing to uninstall');
       return;
     }
 
+    // A binding with no deployed files still needs explicit unbinding, not removal of the shared home.
+    if (agentKey && lifecyclePlan.planned.length === 0 && [...managedPaths].length === 0 && localConfig.hostRoots?.[agentKey]) {
+      plan.includeShared = false; plan.teamaiHomeExists = false;
+    }
     printSummary(plan, agentKey);
 
-    if (opts.dryRun) {
+    if (opts.dryRun || opts.plan) {
       log.info('Dry run — no changes made');
       return;
     }
@@ -1166,6 +1183,18 @@ export async function uninstall(opts: UninstallOptions): Promise<void> {
         log.info('Cancelled');
         return;
       }
+    }
+
+    const lifecycle = await uninstallManagedResources(lifecycleHome, { tool: agentKey });
+    if (lifecycle.conflicts.length > 0) {
+      for (const conflict of lifecycle.conflicts) log.warn(`Preserved local change: ${conflict}`);
+      process.exitCode = 1;
+      return;
+    }
+    const remaining = await loadManagedResourceManifest(lifecycleHome);
+    if (Object.keys(remaining.resources).length > 0) {
+      plan.includeShared = false;
+      plan.teamaiHomeExists = false;
     }
 
     // Model profiles are machine-global, independent of a project's resources.
@@ -1245,8 +1274,12 @@ export async function uninstall(opts: UninstallOptions): Promise<void> {
       // read by the hook path as "whitelist nothing" and stop hook sync for the
       // remaining tools too. The disabledAgents exclusion below is what actually
       // keeps the uninstalled tool out on the next pull.
+      if (cfg.hostRoots) {
+        delete cfg.hostRoots[normalizeHostId(agentKey)];
+        if (Object.keys(cfg.hostRoots).length === 0) delete cfg.hostRoots;
+      }
       if (cfg.enabledAgents) {
-        cfg.enabledAgents = cfg.enabledAgents.filter((t) => t !== agentKey);
+        cfg.enabledAgents = cfg.enabledAgents.map(normalizeHostId).filter((t) => t !== agentKey);
       }
       const prevDisabled = cfg.disabledAgents ?? [];
       cfg.disabledAgents = [...new Set([...prevDisabled, agentKey])];
@@ -1271,13 +1304,18 @@ export async function uninstall(opts: UninstallOptions): Promise<void> {
       return;
     }
 
+    if ((await managedManifestTargetPaths(home)).size > 0) {
+      log.error('Managed resources remain. Restore the TeamAI configuration before uninstalling.');
+      process.exitCode = 1;
+      return;
+    }
     console.log('');
     console.log('⚠  Uninstalling user scope (no valid configuration detected — home directory only)');
     console.log('⚠  The following TeamAI home directory will be removed:');
     console.log(`     ${home}/`);
     console.log('');
 
-    if (opts.dryRun) {
+    if (opts.dryRun || opts.plan) {
       log.info('Dry run — no changes made');
       return;
     }

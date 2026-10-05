@@ -1,3 +1,6 @@
+import { usesManagedPolicy } from './host-adapters.js';
+import { isBuiltinEnabled } from './types.js';
+import { isHostSelected, supportsStaticResource } from './host-adapters.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -94,6 +97,8 @@ export async function deployBuiltinAgents(
   localConfig?: LocalConfig,
   options?: { skipRecall?: boolean },
 ): Promise<number> {
+  if (teamConfig.builtins?.agents?.mode === 'disabled') return 0;
+
   const builtinDir = getBuiltinAgentsDir();
   if (!await pathExists(builtinDir)) {
     log.debug('No built-in agents directory found, skipping deployment');
@@ -128,7 +133,7 @@ export async function deployBuiltinAgents(
       log.debug(`Skipping built-in agent deployment for ${tool}: tool not installed`);
       continue;
     }
-    if (localConfig && isAgentExcluded(localConfig, tool)) continue;
+    if (localConfig && (isAgentExcluded(localConfig, tool) || (usesManagedPolicy(teamConfig, localConfig) && (!isHostSelected(localConfig, tool) || !supportsStaticResource(tool, 'agents', localConfig.scope))))) continue;
     if (!(ALL_SUPPORTED_TOOLS as string[]).includes(tool)) {
       log.warn(
         `Skipping built-in agent deployment for ${tool}: unsupported agent format; ` +
@@ -146,6 +151,7 @@ export async function deployBuiltinAgents(
     }
 
     for (const file of agentFiles) {
+      if (!isBuiltinEnabled(teamConfig, 'agents', path.basename(file, '.md'))) continue;
       const src = path.join(builtinDir, file);
       try {
         const source = await readFileSafe(src);

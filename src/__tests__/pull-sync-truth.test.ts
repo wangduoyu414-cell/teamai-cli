@@ -21,11 +21,13 @@ vi.mock('../config.js', async (importOriginal) => ({
 }));
 
 vi.mock('../utils/git.js', () => ({
+  listWorktrees: vi.fn().mockResolvedValue([]),
   pullRepo: vi.fn().mockResolvedValue('already up to date'),
   getHeadRev: vi.fn().mockResolvedValue('abc1234'),
 }));
 
 vi.mock('../utils/logger.js', () => ({
+  setFileLogging: vi.fn(),
   log: {
     info: vi.fn(),
     success: vi.fn(),
@@ -200,7 +202,7 @@ describe('pull reports what reached the tool directory (#585)', () => {
     }
     const outcome = { completed: false };
     await pull({ silent: true, force: true }, outcome);
-    expect(outcome.completed).toBe(failure === 'none');
+    expect(outcome.completed, vi.mocked(log.warn).mock.calls.flat().join('\n')).toBe(failure === 'none');
     for (const scope of ['user', 'project']) {
       const succeeded = scope !== failure;
       expect(successLines().includes(`[${scope}] Synced 1 docs`)).toBe(succeeded);

@@ -22,8 +22,8 @@ export interface ManagedResourceTarget {
   hostRoot?: string;
   content?: string;
   sourcePath?: string;
-  /** Optional destination-local normalization, run against the staged payload. */
-  prepareStaged?: (payloadPath: string) => Promise<void>;
+  /** Normalized source bytes shared by read-only comparison and staged writes. */
+  sourceOverrides?: Record<string, string>;
   /** A project instruction owns this block only, never the surrounding file. */
   section?: ManagedSection;
   /** Explicit local-only Skill paths: never supplied by the remote source. */
@@ -522,7 +522,7 @@ function removeSection(content: string, section: ManagedSection): string {
   return `${before}${after}`.trimEnd() + (before || after ? '\n' : '');
 }
 
-async function hashPath(target: string, kind: ManagedPathKind, section?: ManagedSection, preservePaths: string[] = []): Promise<string | null> {
+async function hashPath(target: string, kind: ManagedPathKind, section?: ManagedSection, preservePaths: string[] = [], sourceOverrides?: Record<string, string>): Promise<string | null> {
   try {
     const stat = await fse.lstat(target);
     if ((stat.isDirectory() ? 'directory' : 'file') !== kind) return `kind:${stat.isDirectory() ? 'directory' : 'file'}`;
@@ -533,7 +533,7 @@ async function hashPath(target: string, kind: ManagedPathKind, section?: Managed
     if (kind === 'file') return digest(await fse.readFile(target));
     const hash = crypto.createHash('sha256');
     hash.update('directory\0');
-    await hashDirectory(target, '', hash, preservePaths);
+    await hashDirectory(target, '', hash, preservePaths, sourceOverrides);
     return hash.digest('hex');
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
@@ -626,21 +626,22 @@ export async function managedManifestUnchangedTargetPaths(
   return unchanged;
 }
 
-async function hashDirectory(root: string, relative: string, hash: crypto.Hash, preservePaths: string[] = []): Promise<void> {
+async function hashDirectory(root: string, relative: string, hash: crypto.Hash, preservePaths: string[] = [], sourceOverrides?: Record<string, string>): Promise<void> {
   const entries = await fse.readdir(path.join(root, relative), { withFileTypes: true });
   entries.sort((a, b) => a.name.localeCompare(b.name));
   for (const entry of entries) {
     const rel = relative ? path.join(relative, entry.name) : entry.name;
     // Python bytecode is disposable runtime output, not a source edit.
     if (preservePaths.length && entry.name === "__pycache__" && entry.isDirectory()) continue;
+    if (preservePaths.length && entry.isFile() && ['.ds_store', 'thumbs.db', 'desktop.ini'].includes(entry.name.toLowerCase())) continue;
     if (preservePaths.includes(rel.split(path.sep).join("/"))) continue;
     const fullPath = path.join(root, rel);
     if (entry.isDirectory()) {
       hash.update(`d:${rel}\0`);
-      await hashDirectory(root, rel, hash, preservePaths);
+      await hashDirectory(root, rel, hash, preservePaths, sourceOverrides);
     } else if (entry.isFile()) {
       hash.update(`f:${rel}\0`);
-      hash.update(await fse.readFile(fullPath));
+      hash.update(sourceOverrides?.[rel.split(path.sep).join('/')] ?? await fse.readFile(fullPath));
     } else {
       hash.update(`other:${rel}\0`);
     }
@@ -706,7 +707,12 @@ async function stageTarget(target: ManagedResourceTarget, transactionId: string,
       if (present) throw new Error(`Remote source contains local-only path: ${local}`);
       await assertAbsoluteWithin([payload], localPath, 'Local-only staged path');
     }
-    if (target.prepareStaged) await target.prepareStaged(payload);
+    for (const [relative, content] of Object.entries(target.sourceOverrides ?? {})) {
+      const destination = path.join(payload, relative);
+      await assertAbsoluteWithin([payload], destination, 'Normalized source file');
+      if (!(await fse.stat(destination)).isFile()) throw new Error(`Normalized source is not a file: ${relative}`);
+      await fse.writeFile(destination, content, 'utf8');
+    }
     const hash = target.section ? digest(target.content!) : await hashPath(payload, target.kind, undefined, target.preservePaths);
     if (!hash) throw new Error(`Could not stage ${target.path}`);
     return { target, root, payload, hash };
@@ -970,6 +976,13 @@ export async function reconcileManagedResources(
       if (!prior) continue;
       const currentHash = await hashPath(target.path, prior.kind, prior.section, prior.preservePaths);
       if (currentHash !== null && currentHash !== prior.hash) {
+        // A member may have already published exactly these edits. Compare the
+        // actual deployment bytes, including Skill metadata normalization, so
+        // both plan and pull accept convergence without ignoring extra files.
+        const desiredHash = target.content !== undefined
+          ? digest(target.content)
+          : target.sourcePath ? await hashPath(target.sourcePath, target.kind, undefined, target.preservePaths, target.sourceOverrides) : null;
+        if (currentHash === desiredHash) continue;
         conflictIds.add(resource.id);
         result.conflicts.push(`${resource.id}: ${target.path} was modified locally`);
       }

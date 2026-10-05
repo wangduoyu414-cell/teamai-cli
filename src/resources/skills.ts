@@ -168,28 +168,32 @@ export async function ensureSkillFrontmatter(skillDir: string, skillName: string
   const skillMdPath = path.join(skillDir, SKILL_MD);
   const content = await readFileSafe(skillMdPath);
   if (!content) return false;
+  const normalized = normalizeSkillFrontmatter(content, skillName);
+  if (normalized === content) return false;
+  await writeFile(skillMdPath, normalized);
+  return true;
+}
 
+/** Pure normalization also lets managed plan/pull compare the deployed bytes. */
+function normalizeSkillFrontmatter(content: string, skillName: string): string {
   const { data, body, raw, valid } = splitFrontmatter(content);
 
   if (!raw) {
     // No frontmatter at all — derive description from first heading or first non-empty line
     const description = extractDescriptionFromContent(body, skillName);
-    const newContent = stringifyFrontmatter({ name: skillName, description }, body);
-    await writeFile(skillMdPath, newContent);
-    log.debug(`Injected YAML frontmatter into ${skillName}/SKILL.md`);
-    return true;
+    return stringifyFrontmatter({ name: skillName, description }, body);
   }
 
   if (!valid) {
     log.warn(`Could not repair malformed frontmatter in ${skillName}/SKILL.md; leaving it unchanged`);
-    return false;
+    return content;
   }
 
   // Frontmatter exists — check for missing fields
   const hasName = typeof data['name'] === 'string' && String(data['name']).trim() !== '';
   const hasDescription = typeof data['description'] === 'string' && String(data['description']).trim() !== '';
 
-  if (hasName && hasDescription) return false; // Already complete
+  if (hasName && hasDescription) return content; // Already complete
 
   const missingFields: Record<string, string> = {};
   if (!hasName) missingFields.name = skillName;
@@ -197,10 +201,7 @@ export async function ensureSkillFrontmatter(skillDir: string, skillName: string
 
   // Preserve existing comments, quoting, key order, and line endings. Re-serializing
   // the whole block would make an unrelated metadata repair unnecessarily lossy.
-  const newContent = appendFrontmatterFields(raw, missingFields) + body;
-  await writeFile(skillMdPath, newContent);
-  log.debug(`Added missing frontmatter fields to ${skillName}/SKILL.md`);
-  return true;
+  return appendFrontmatterFields(raw, missingFields) + body;
 }
 
 /**
@@ -771,12 +772,14 @@ export class SkillsHandler extends ResourceHandler {
 
   async buildManagedResource(item: ResourceItem, teamConfig: TeamaiConfig, localConfig: LocalConfig): Promise<DesiredManagedResource> {
     const targets: DesiredManagedResource['targets'] = [];
+    const source = await readFileSafe(path.join(item.sourcePath, SKILL_MD));
+    const sourceOverrides = source ? { [SKILL_MD]: normalizeSkillFrontmatter(source, item.name) } : undefined;
     for (const { tool, dest } of await this.resolveTargets(teamConfig, localConfig, item)) {
       const hostRoot = localConfig.hostRoots?.[tool] ?? (tool === 'copilot' ? getCopilotHome() : tool === 'hermes' ? getHermesHome() : resolveHostRoot(tool, localConfig.scope, localConfig.projectRoot));
       targets.push({ path: dest, kind: 'directory', tool, sourcePath: item.sourcePath,
         ...(hostRoot ? { hostRoot } : {}),
         preservePaths: ['.runtime', 'assets/douyin-cookie-bridge/bridge-secret.local.json'],
-        prepareStaged: async (staged) => { await ensureSkillFrontmatter(staged, item.name); },
+        sourceOverrides,
       });
     }
     const id = `skills:${item.name}`;

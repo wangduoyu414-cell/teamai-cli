@@ -10173,7 +10173,7 @@ function removeSection(content, section) {
   if (`${before}${after}`.trim() === "") return "";
   return `${before}${after}`.trimEnd() + (before || after ? "\n" : "");
 }
-async function hashPath(target, kind, section, preservePaths = []) {
+async function hashPath(target, kind, section, preservePaths = [], sourceOverrides) {
   try {
     const stat10 = await fse3.lstat(target);
     if ((stat10.isDirectory() ? "directory" : "file") !== kind) return `kind:${stat10.isDirectory() ? "directory" : "file"}`;
@@ -10184,7 +10184,7 @@ async function hashPath(target, kind, section, preservePaths = []) {
     if (kind === "file") return digest(await fse3.readFile(target));
     const hash2 = crypto3.createHash("sha256");
     hash2.update("directory\0");
-    await hashDirectory(target, "", hash2, preservePaths);
+    await hashDirectory(target, "", hash2, preservePaths, sourceOverrides);
     return hash2.digest("hex");
   } catch (error) {
     if (error.code === "ENOENT") return null;
@@ -10261,20 +10261,21 @@ async function managedManifestUnchangedTargetPaths(home, type) {
   }
   return unchanged;
 }
-async function hashDirectory(root, relative, hash2, preservePaths = []) {
+async function hashDirectory(root, relative, hash2, preservePaths = [], sourceOverrides) {
   const entries = await fse3.readdir(path29.join(root, relative), { withFileTypes: true });
   entries.sort((a, b) => a.name.localeCompare(b.name));
   for (const entry of entries) {
     const rel = relative ? path29.join(relative, entry.name) : entry.name;
     if (preservePaths.length && entry.name === "__pycache__" && entry.isDirectory()) continue;
+    if (preservePaths.length && entry.isFile() && [".ds_store", "thumbs.db", "desktop.ini"].includes(entry.name.toLowerCase())) continue;
     if (preservePaths.includes(rel.split(path29.sep).join("/"))) continue;
     const fullPath = path29.join(root, rel);
     if (entry.isDirectory()) {
       hash2.update(`d:${rel}\0`);
-      await hashDirectory(root, rel, hash2, preservePaths);
+      await hashDirectory(root, rel, hash2, preservePaths, sourceOverrides);
     } else if (entry.isFile()) {
       hash2.update(`f:${rel}\0`);
-      hash2.update(await fse3.readFile(fullPath));
+      hash2.update(sourceOverrides?.[rel.split(path29.sep).join("/")] ?? await fse3.readFile(fullPath));
     } else {
       hash2.update(`other:${rel}\0`);
     }
@@ -10333,7 +10334,12 @@ async function stageTarget(target, transactionId, index) {
       if (present) throw new Error(`Remote source contains local-only path: ${local}`);
       await assertAbsoluteWithin([payload], localPath, "Local-only staged path");
     }
-    if (target.prepareStaged) await target.prepareStaged(payload);
+    for (const [relative, content] of Object.entries(target.sourceOverrides ?? {})) {
+      const destination = path29.join(payload, relative);
+      await assertAbsoluteWithin([payload], destination, "Normalized source file");
+      if (!(await fse3.stat(destination)).isFile()) throw new Error(`Normalized source is not a file: ${relative}`);
+      await fse3.writeFile(destination, content, "utf8");
+    }
     const hash2 = target.section ? digest(target.content) : await hashPath(payload, target.kind, void 0, target.preservePaths);
     if (!hash2) throw new Error(`Could not stage ${target.path}`);
     return { target, root, payload, hash: hash2 };
@@ -10542,6 +10548,8 @@ async function reconcileManagedResources(home, desiredResources, options = {}) {
       if (!prior) continue;
       const currentHash = await hashPath(target.path, prior.kind, prior.section, prior.preservePaths);
       if (currentHash !== null && currentHash !== prior.hash) {
+        const desiredHash = target.content !== void 0 ? digest(target.content) : target.sourcePath ? await hashPath(target.sourcePath, target.kind, void 0, target.preservePaths, target.sourceOverrides) : null;
+        if (currentHash === desiredHash) continue;
         conflictIds.add(resource.id);
         result.conflicts.push(`${resource.id}: ${target.path} was modified locally`);
       }
@@ -20238,28 +20246,28 @@ async function ensureSkillFrontmatter(skillDir, skillName) {
   const skillMdPath = path49.join(skillDir, SKILL_MD2);
   const content = await readFileSafe(skillMdPath);
   if (!content) return false;
+  const normalized = normalizeSkillFrontmatter(content, skillName);
+  if (normalized === content) return false;
+  await writeFile(skillMdPath, normalized);
+  return true;
+}
+function normalizeSkillFrontmatter(content, skillName) {
   const { data, body, raw, valid } = splitFrontmatter2(content);
   if (!raw) {
     const description = extractDescriptionFromContent(body, skillName);
-    const newContent2 = stringifyFrontmatter({ name: skillName, description }, body);
-    await writeFile(skillMdPath, newContent2);
-    log.debug(`Injected YAML frontmatter into ${skillName}/SKILL.md`);
-    return true;
+    return stringifyFrontmatter({ name: skillName, description }, body);
   }
   if (!valid) {
     log.warn(`Could not repair malformed frontmatter in ${skillName}/SKILL.md; leaving it unchanged`);
-    return false;
+    return content;
   }
   const hasName = typeof data["name"] === "string" && String(data["name"]).trim() !== "";
   const hasDescription = typeof data["description"] === "string" && String(data["description"]).trim() !== "";
-  if (hasName && hasDescription) return false;
+  if (hasName && hasDescription) return content;
   const missingFields = {};
   if (!hasName) missingFields.name = skillName;
   if (!hasDescription) missingFields.description = extractDescriptionFromContent(body, skillName);
-  const newContent = appendFrontmatterFields(raw, missingFields) + body;
-  await writeFile(skillMdPath, newContent);
-  log.debug(`Added missing frontmatter fields to ${skillName}/SKILL.md`);
-  return true;
+  return appendFrontmatterFields(raw, missingFields) + body;
 }
 function extractDescriptionFromContent(content, skillName) {
   const lines = content.split("\n");
@@ -20679,6 +20687,8 @@ var init_skills = __esm({
       }
       async buildManagedResource(item, teamConfig, localConfig) {
         const targets = [];
+        const source = await readFileSafe(path49.join(item.sourcePath, SKILL_MD2));
+        const sourceOverrides = source ? { [SKILL_MD2]: normalizeSkillFrontmatter(source, item.name) } : void 0;
         for (const { tool, dest } of await this.resolveTargets(teamConfig, localConfig, item)) {
           const hostRoot = localConfig.hostRoots?.[tool] ?? (tool === "copilot" ? getCopilotHome() : tool === "hermes" ? getHermesHome() : resolveHostRoot(tool, localConfig.scope, localConfig.projectRoot));
           targets.push({
@@ -20688,9 +20698,7 @@ var init_skills = __esm({
             sourcePath: item.sourcePath,
             ...hostRoot ? { hostRoot } : {},
             preservePaths: [".runtime", "assets/douyin-cookie-bridge/bridge-secret.local.json"],
-            prepareStaged: async (staged) => {
-              await ensureSkillFrontmatter(staged, item.name);
-            }
+            sourceOverrides
           });
         }
         const id = `skills:${item.name}`;
@@ -27312,12 +27320,14 @@ async function init(options) {
     } catch (e) {
       log.warn(`Member registration skipped (non-blocking): ${e.message}`);
     }
-  } else {
+  } else if (options.dryRun) {
     log.info(`[dry-run] Would register member ${username} on the teamai-reports branch`);
+  } else {
+    log.debug("Member registration is disabled by team policy");
   }
   const currentConfig = await loadTeamConfig(localPath);
   const hasReviewers = currentConfig?.reviewers && currentConfig.reviewers.length > 0;
-  if (isNewMember && !hasReviewers && !options.force) {
+  if (isNewMember && !hasReviewers && !options.force && currentConfig?.sharing.registration?.autoRegister !== false) {
     const wantReviewers = await askConfirmation(
       "\nWould you like to configure default MR reviewers? [y/N] "
     );
@@ -27422,10 +27432,14 @@ async function init(options) {
   log.success("teamai initialized successfully!");
   if (stubDeployed > 0) {
     log.info("The built-in teamai skill is ready in your IDE; it loads its workflows with `teamai skill get`.");
-  } else {
+  } else if (reloadedTeamConfig?.builtins?.skills?.mode !== "disabled") {
     log.warn("The built-in teamai skill was not deployed to any AI tool, so agents cannot find TeamAI yet. The reason is printed above or recorded in ~/.teamai/debug.log; the usual one is that none of the selected tools is installed. Run `teamai pull` once it is fixed.");
   }
-  log.info("Skills, rules, env and docs auto-sync on each session start when the selected agent has active TeamAI hooks.");
+  if (reloadedTeamConfig?.sharing.hooks?.autoApply === false) {
+    log.info("Run `teamai pull` to install or update team resources. Session-start synchronization is disabled by team policy.");
+  } else {
+    log.info("Skills, rules, env and docs auto-sync on each session start when the selected agent has active TeamAI hooks.");
+  }
   log.info("Run `teamai status` to check current config.");
   closePrompt();
 }
@@ -32749,7 +32763,11 @@ async function refreshTeamRepo(localConfig) {
     }
     return { label: "single-repo (knowledge on main)", version: version3, submodulesFailed: false, submodulesChanged: false };
   }
-  const result = await pullRepo(localConfig.repo.localPath);
+  const currentPolicy = await loadTeamConfig(localConfig.repo.localPath);
+  const result = await pullRepo(
+    localConfig.repo.localPath,
+    usesManagedPolicy(currentPolicy ?? void 0, localConfig) ? { preserveLocalChanges: true } : void 0
+  );
   let version2 = null;
   try {
     version2 = await getHeadRev(localConfig.repo.localPath);
@@ -33039,6 +33057,10 @@ async function pullForScope(localConfig, options, reported, policy = {}, result)
   } catch (e) {
     const reason = `[${scopeLabel}] Pull failed: ${e.message}`;
     process.exitCode = 1;
+    if (result) {
+      result.resourceSyncFailed = true;
+      if (usesManagedPolicy(declaredConfig ?? void 0, localConfig)) result.blockedScopes.add(localConfig);
+    }
     pullSpin.fail(reason);
     log.persist(reason);
     return;
@@ -33925,7 +33947,7 @@ async function pull(options, result) {
   if (options.dryRun) setFileLogging(false);
   resetWarnOnce();
   const reported = /* @__PURE__ */ new Set();
-  const syncResult = { completed: false, docsSyncFailed: false, resourceSyncFailed: false };
+  const syncResult = { completed: false, docsSyncFailed: false, resourceSyncFailed: false, blockedScopes: /* @__PURE__ */ new Set() };
   const needsHookMigration = await legacyHooksNeedReinject().catch(() => false);
   const contended = /* @__PURE__ */ new Set();
   const heldLocks = /* @__PURE__ */ new Map();
@@ -34020,8 +34042,8 @@ async function pull(options, result) {
         log.warn(`Project-scope pull error: ${e.message}`);
       }
     }
-    const reconcileUser = activeUserConfig && !contended.has(activeUserConfig) ? activeUserConfig : null;
-    const reconcileProject = projectConfig && !contended.has(projectConfig) ? projectConfig : null;
+    const reconcileUser = activeUserConfig && !contended.has(activeUserConfig) && !syncResult.blockedScopes.has(activeUserConfig) ? activeUserConfig : null;
+    const reconcileProject = projectConfig && !contended.has(projectConfig) && !syncResult.blockedScopes.has(projectConfig) ? projectConfig : null;
     postPullRepo = (reconcileProject ?? reconcileUser)?.repo.localPath ?? null;
     if (needsHookMigration && !options.dryRun) {
       const migrateScope = reconcileProject ?? reconcileUser;
@@ -34098,7 +34120,7 @@ async function pull(options, result) {
         log.debug(`Source pull skipped: ${e.message}`);
       }
     }
-    await reportPostPullChecks(options, reported, contended.size > 0);
+    await reportPostPullChecks(options, reported, contended.size > 0 || syncResult.blockedScopes.size > 0);
   } finally {
     if (result) result.completed = syncResult.completed && !syncResult.docsSyncFailed && !syncResult.resourceSyncFailed;
     const releaseSyncLocks = async () => {
@@ -36518,16 +36540,23 @@ async function commitPaths(localPath, message, files) {
   await git.commit(message);
   return true;
 }
-async function pullRepo(localPath) {
+async function pullRepo(localPath, options = {}) {
   const git = createGit(localPath);
   const branch = (await git.revparse(["--abbrev-ref", "HEAD"])).trim();
+  if (options.preserveLocalChanges && (await git.status()).files.length > 0) {
+    throw new Error(`Team repo cache has local changes at ${localPath}. Nothing was overwritten. Copy your work to your authoring checkout, then commit or stash the cache changes before retrying.`);
+  }
   try {
     const result = await git.pull(["--ff-only"]);
+    if (options.preserveLocalChanges && (await git.status()).ahead > 0) {
+      throw new Error(`Team repo cache has unpublished commits at ${localPath}; publish or preserve them before retrying.`);
+    }
     if (result.summary.changes === 0 && result.summary.insertions === 0 && result.summary.deletions === 0) {
       return "already up to date";
     }
     return `${result.summary.changes} file(s) changed`;
   } catch (err) {
+    if (options.preserveLocalChanges) throw err;
     const dedicated = await isDedicatedRepoRoot(localPath);
     if (!dedicated) {
       throw err;

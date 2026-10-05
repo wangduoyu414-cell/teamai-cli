@@ -16,15 +16,16 @@ reports before anything else.
 
 This is the #1 onboarding issue. In order:
 
-1. **Open a fresh session.** Resources sync on **session start** via a hook, not
-   at init time. An empty skills folder right after `teamai init` is normal.
+1. **Check the team's update policy.** Active hooks sync on session start, not
+   at init time. With `sharing.hooks.autoApply: false`, always sync manually.
+   An empty skills folder right after `teamai init` is normal.
 2. **Sync manually to confirm:**
    ```bash
    teamai pull
    teamai list        # do the team skills appear now?
    ```
-3. **Check the hook is installed** (`teamai doctor` reports this). If missing,
-   re-inject and reopen the tool:
+3. **When policy enables hooks, check they are installed** (`teamai doctor`
+   reports this). If missing, re-inject and reopen the tool:
    ```bash
    teamai hooks inject
    ```
@@ -63,6 +64,16 @@ This is the #1 onboarding issue. In order:
    for that project: do it only with their consent.
    `recall` refuses the same way with `Nothing was searched: <file>: <reason>`:
    no team knowledge was searched, so do not report that the team has none.
+
+## Managed-resource conflicts
+
+Do not delete the managed manifest or use `--force` to bypass local edits. If the
+installed source already exactly matches the published deployment, pull accepts it;
+otherwise compare and preserve the local changes before retrying. Extra personal
+files count as changes, while `.DS_Store`, `Thumbs.db`, `desktop.ini` and Python
+bytecode caches do not. A modified or locally ahead team-repo cache also stops a
+managed refresh, without hard reset. Move the work to the team's authoring checkout
+and resolve the cache state; do not discard it just to make synchronization pass.
 
 ## Permission / access denied
 

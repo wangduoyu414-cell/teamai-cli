@@ -639,6 +639,33 @@ describe('pullRepo', () => {
     expect(mockGit.reset).toHaveBeenCalledWith(['--hard', 'origin/main']);
   });
 
+  it('stops before updating a protected cache with local files', async () => {
+    mockGit.status.mockResolvedValue({ files: [{ path: 'skill.md' }], ahead: 0 });
+    await expect(pullRepo('/tmp/x', { preserveLocalChanges: true })).rejects.toThrow('Nothing was overwritten');
+    expect(mockGit.pull).not.toHaveBeenCalled();
+    expect(mockGit.reset).not.toHaveBeenCalled();
+  });
+
+  it('preserves unpublished commits in a protected cache', async () => {
+    mockGit.status.mockResolvedValue({ files: [], ahead: 1 });
+    mockGit.pull.mockResolvedValue({ summary: { changes: 0, insertions: 0, deletions: 0 } });
+    await expect(pullRepo('/tmp/x', { preserveLocalChanges: true })).rejects.toThrow('unpublished commits');
+    expect(mockGit.reset).not.toHaveBeenCalled();
+  });
+
+  it('never hard-resets a protected cache after a failed fast-forward', async () => {
+    mockGit.pull.mockRejectedValue(new Error('Not possible to fast-forward, aborting.'));
+    await expect(pullRepo('/tmp/x', { preserveLocalChanges: true })).rejects.toThrow('fast-forward');
+    expect(mockGit.fetch).not.toHaveBeenCalled();
+    expect(mockGit.reset).not.toHaveBeenCalled();
+  });
+
+  it('updates a clean protected cache normally', async () => {
+    mockGit.status.mockResolvedValue({ files: [], ahead: 0 });
+    mockGit.pull.mockResolvedValue({ summary: { changes: 1, insertions: 2, deletions: 0 } });
+    await expect(pullRepo('/tmp/x', { preserveLocalChanges: true })).resolves.toBe('1 file(s) changed');
+  });
+
   it('re-throws when fetch fails after diverged pull', async () => {
     mockGit.pull.mockRejectedValue(new Error('Not possible to fast-forward, aborting.'));
     mockGit.fetch.mockRejectedValue(new Error('could not read from remote'));

@@ -1849,15 +1849,17 @@ export async function init(options: GlobalOptions & {
     } catch (e) {
       log.warn(`Member registration skipped (non-blocking): ${(e as Error).message}`);
     }
-  } else {
+  } else if (options.dryRun) {
     log.info(`[dry-run] Would register member ${username} on the teamai-reports branch`);
+  } else {
+    log.debug('Member registration is disabled by team policy');
   }
 
   // Step 5.5: Configure default MR reviewers (only for fresh setup with no reviewers yet).
   // --force implies non-interactive: skip reviewer prompts entirely (can be configured later).
   const currentConfig = await loadTeamConfig(localPath);
   const hasReviewers = currentConfig?.reviewers && currentConfig.reviewers.length > 0;
-  if (isNewMember && !hasReviewers && !options.force) {
+  if (isNewMember && !hasReviewers && !options.force && currentConfig?.sharing.registration?.autoRegister !== false) {
     const wantReviewers = await askConfirmation(
       '\nWould you like to configure default MR reviewers? [y/N] ',
     );
@@ -2002,10 +2004,14 @@ export async function init(options: GlobalOptions & {
   log.success('teamai initialized successfully!');
   if (stubDeployed > 0) {
     log.info('The built-in teamai skill is ready in your IDE; it loads its workflows with `teamai skill get`.');
-  } else {
+  } else if (reloadedTeamConfig?.builtins?.skills?.mode !== 'disabled') {
     log.warn('The built-in teamai skill was not deployed to any AI tool, so agents cannot find TeamAI yet. The reason is printed above or recorded in ~/.teamai/debug.log; the usual one is that none of the selected tools is installed. Run `teamai pull` once it is fixed.');
   }
-  log.info('Skills, rules, env and docs auto-sync on each session start when the selected agent has active TeamAI hooks.');
+  if (reloadedTeamConfig?.sharing.hooks?.autoApply === false) {
+    log.info('Run `teamai pull` to install or update team resources. Session-start synchronization is disabled by team policy.');
+  } else {
+    log.info('Skills, rules, env and docs auto-sync on each session start when the selected agent has active TeamAI hooks.');
+  }
   log.info('Run `teamai status` to check current config.');
 
   // Close the readline singleton so the process can exit cleanly.

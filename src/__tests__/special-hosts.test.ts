@@ -10,10 +10,11 @@ vi.mock('node:child_process', async (importOriginal) => ({
 }));
 
 import { SkillsHandler } from '../resources/skills.js';
+import { AgentsHandler } from '../resources/agents.js';
 import { loadManagedResourceManifest, reconcileManagedResources } from '../managed-resources.js';
 import { reconcileManagedInstructions, retainMissingUnselectedTargets } from '../pull.js';
 import { resolveBaseDir, TeamaiConfigSchema, type LocalConfig, type TeamaiConfig } from '../types.js';
-import { assertDshExactVersion, assertHostRootsStable, isHostSelected, normalizeHostId, normalizeHostRoots, prepareSelectedProjectHostRoots } from '../host-adapters.js';
+import { assertDshExactVersion, assertHostRootsStable, isHostSelected, normalizeHostId, normalizeHostRoots, prepareSelectedProjectHostRoots, usesManagedPolicy } from '../host-adapters.js';
 
 const tempDirs: string[] = [];
 
@@ -61,6 +62,74 @@ describe('special static hosts', () => {
     expect(isHostSelected({ enabledAgents: undefined, disabledAgents: undefined } as LocalConfig, 'dsh')).toBe(false);
     expect(isHostSelected({ enabledAgents: ['deepseek-harness'], disabledAgents: undefined } as LocalConfig, 'dsh')).toBe(true);
     expect(isHostSelected({ enabledAgents: ['dsh'], disabledAgents: ['deepseekharness'] } as LocalConfig, 'dsh')).toBe(false);
+  });
+
+  it('does not select installed special hosts through team policy without a local allowlist or roots', async () => {
+    const { home, repo } = await fixture();
+    await Promise.all(['.claude', '.workbuddy', '.dsh'].map((name) => fse.ensureDir(path.join(home, name))));
+    const localConfig: LocalConfig = {
+      repo: { localPath: repo, remote: 'https://example.test/team.git' },
+      username: 'test', scope: 'user', additionalRoles: [],
+    };
+    const teamConfig = config({
+      claude: { skills: '.claude/skills' },
+      workbuddy: { skills: '.workbuddy/skills' },
+      dsh: { skills: '.dsh/skills' },
+    });
+    const item = {
+      name: 'example', type: 'skills' as const,
+      sourcePath: path.join(repo, 'skills', 'example'), relativePath: 'skills/example',
+    };
+    await fse.outputFile(path.join(item.sourcePath, 'SKILL.md'), '---\nname: example\ndescription: example\n---\n');
+    const handler = new SkillsHandler();
+    expect((await handler.deliveryTargets(teamConfig, localConfig, item)).map(({ tool }) => tool)).toEqual(['claude']);
+    await handler.pullItem(item, teamConfig, localConfig);
+    expect(await fse.pathExists(path.join(home, '.claude/skills/example/SKILL.md'))).toBe(true);
+    expect(await fse.pathExists(path.join(home, '.workbuddy/skills'))).toBe(false);
+    expect(await fse.pathExists(path.join(home, '.dsh/skills'))).toBe(false);
+  });
+
+  it.each(['skills', 'agents'] as const)('keeps local %s edits and ledger ownership after removing the last team policy flag', async (type) => {
+    const { home, repo } = await fixture();
+    await fse.ensureDir(path.join(home, '.claude'));
+    const localConfig: LocalConfig = {
+      repo: { localPath: repo, remote: 'https://example.test/team.git' },
+      username: 'test', scope: 'user', additionalRoles: [], enabledAgents: ['claude'],
+    };
+    const teamConfig = config({ claude: { skills: '.claude/skills', agents: '.claude/agents' } });
+    const sourcePath = path.join(repo, type, type === 'skills' ? 'example' : 'example.md');
+    const sourceFile = type === 'skills' ? path.join(sourcePath, 'SKILL.md') : sourcePath;
+    await fse.outputFile(sourceFile, '---\nname: example\ndescription: example\n---\nTeam instructions.\n');
+    const item = { name: 'example', type, sourcePath, relativePath: path.relative(repo, sourcePath) };
+    const handler = type === 'skills' ? new SkillsHandler() : new AgentsHandler();
+    await handler.pullItem(item, teamConfig, localConfig);
+    const ledger = path.join(home, '.teamai', 'managed-resources.json');
+    const before = await fse.readFile(ledger, 'utf8');
+    const target = path.join(home, '.claude', type, type === 'skills' ? 'example/SKILL.md' : 'example.md');
+    await fse.writeFile(target, 'Personal changes must survive.\n');
+    delete teamConfig.sharing.instructions;
+    expect(usesManagedPolicy(teamConfig, localConfig)).toBe(true);
+    await handler.pullItem(item, teamConfig, localConfig);
+    expect(await fse.readFile(target, 'utf8')).toBe('Personal changes must survive.\n');
+    expect(await fse.readFile(ledger, 'utf8')).toBe(before);
+  });
+
+  it.each(['managed-resources.json', 'managed-resources.journal.json'])('does not fall back to direct copying when %s is corrupt', async (record) => {
+    const { home, repo } = await fixture();
+    const localConfig: LocalConfig = {
+      repo: { localPath: repo, remote: 'https://example.test/team.git' },
+      username: 'test', scope: 'user', additionalRoles: [], enabledAgents: ['claude'],
+    };
+    const teamConfig = TeamaiConfigSchema.parse({ team: 'test', repo: 'https://example.test/team.git', toolPaths: { claude: { skills: '.claude/skills' } } });
+    const item = { name: 'example', type: 'skills' as const, sourcePath: path.join(repo, 'skills/example'), relativePath: 'skills/example' };
+    const target = path.join(home, '.claude/skills/example/SKILL.md');
+    await fse.outputFile(path.join(item.sourcePath, 'SKILL.md'), '---\nname: example\ndescription: example\n---\nTeam copy.\n');
+    await fse.outputFile(target, 'Personal file.\n');
+    expect(usesManagedPolicy(teamConfig, localConfig)).toBe(false);
+    await fse.outputFile(path.join(home, '.teamai', record), '{broken');
+    expect(usesManagedPolicy(teamConfig, localConfig)).toBe(true);
+    await expect(new SkillsHandler().pullItem(item, teamConfig, localConfig)).rejects.toThrow();
+    expect(await fse.readFile(target, 'utf8')).toBe('Personal file.\n');
   });
 
   it('uses the operating-system home when HOME is absent, including Unicode and spaces', async () => {

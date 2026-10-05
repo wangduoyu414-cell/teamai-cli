@@ -1039,6 +1039,7 @@ async function pullForScope(
           // Revision equality says nothing about missing targets, local conflict repairs,
           // or machine-local model policy changes. Reconcile before taking the fast path.
           if (usesManagedPolicy(freshConfig, localConfig) && !await reconcileManagedSnapshot(freshConfig, localConfig, roleContext)) {
+            if (result) result.resourceSyncFailed = true;
             process.exitCode = 1;
             return;
           }

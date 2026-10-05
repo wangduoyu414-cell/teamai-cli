@@ -2,7 +2,7 @@ import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs';
 import { execFileSync } from 'node:child_process';
-import { normalizeHostId, type LocalConfig, type TeamaiConfig } from './types.js';
+import { getTeamaiHome, normalizeHostId, type LocalConfig, type TeamaiConfig } from './types.js';
 export { normalizeHostId } from './types.js';
 
 /** Hosts whose resource locations are product contracts rather than HOME-relative conventions. */
@@ -165,7 +165,13 @@ export function assertHostRootsStable(config: LocalConfig): void {
 export const DSH_EXACT_VERSION = '0.1.1-rc.1';
 export const WORKBUDDY_VALIDATED_VERSION = '5.3.13';
 
-/** Existing fork config opts into managed static-host restrictions; native upstream teams keep their host features. */
+/** An established managed lifecycle cannot silently revert to untracked writes after a config edit. */
 export function usesManagedPolicy(config?: Partial<TeamaiConfig>, local?: LocalConfig): boolean {
-  return Boolean(config?.modelPolicy || config?.builtins || config?.sharing?.instructions || local?.hostRoots);
+  if (config?.modelPolicy || config?.builtins || config?.sharing?.instructions || local?.hostRoots) return true;
+  if (!local) return false;
+  const lifecycleHome = getTeamaiHome(local.scope, local.projectRoot);
+  // Presence is enough: even an empty or corrupt ledger/journal must stay on
+  // the managed path so validation/recovery can fail closed before any write.
+  return ['managed-resources.json', 'managed-resources.journal.json']
+    .some((name) => fs.existsSync(path.join(lifecycleHome, name)));
 }

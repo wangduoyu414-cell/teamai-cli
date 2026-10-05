@@ -133,6 +133,7 @@ describe('pull reports what reached the tool directory (#585)', () => {
   });
 
   afterEach(async () => {
+    process.exitCode = 0;
     ioSpy?.mockRestore();
     ioSpy = undefined;
     vi.unstubAllEnvs();
@@ -210,6 +211,34 @@ describe('pull reports what reached the tool directory (#585)', () => {
         expect(vi.mocked(log.warn).mock.calls.flat()).toContainEqual(expect.stringContaining(`[${scope}] Failed to sync docs:`));
       }
     }
+  });
+
+  it('does not report completed when an unchanged-revision user conflict is followed by a successful project sync', async () => {
+    teamConfig.sharing.instructions = { source: 'AGENTS.md' };
+    teamConfig.sharing.docs.mode = 'index-only';
+    await fse.ensureDir(path.join(homeDir, '.claude'));
+    const userState = await loadStateForScope(localConfig);
+    await pull({ silent: true, force: true });
+    expect(userState.lastPullRev).toBe('abc1234');
+    const userSkill = path.join(homeDir, '.claude/skills/org-review/SKILL.md');
+    await fse.writeFile(userSkill, 'Keep this local edit.\n');
+
+    const projectRoot = path.join(tmpDir, 'project');
+    await fse.ensureDir(path.join(projectRoot, '.claude'));
+    const projectConfig: LocalConfig = { ...localConfig, scope: 'project', projectRoot, inheritUserScope: true };
+    const projectState = { lastPull: null, lastPullRev: null } as Awaited<ReturnType<typeof loadStateForScope>>;
+    vi.mocked(detectProjectConfig).mockResolvedValue(projectConfig);
+    vi.mocked(loadStateForScope).mockImplementation(async (cfg) => cfg.scope === 'project' ? projectState : userState);
+    vi.mocked(log.success).mockClear();
+    const outcome = { completed: false };
+
+    await pull({ silent: true }, outcome);
+
+    expect(process.exitCode).toBe(1);
+    expect(outcome.completed).toBe(false);
+    expect(await fse.readFile(userSkill, 'utf8')).toBe('Keep this local edit.\n');
+    expect(await fse.pathExists(path.join(projectRoot, '.claude/skills/org-review/SKILL.md'))).toBe(true);
+    expect(successLines()).toContain('[project] Synced 1 skills');
   });
 
   it('adds the revision a pull delivered to the checkout\'s push bases when its docs mirror fails (#823)', async () => {

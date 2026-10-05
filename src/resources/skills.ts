@@ -729,6 +729,8 @@ export class SkillsHandler extends ResourceHandler {
     const targets: DeliveryTarget[] = [];
     for (const [tool, toolPath] of Object.entries(scopedToolPaths(teamConfig, localConfig))) {
       if (isAgentExcluded(localConfig, tool)) continue;
+      if (usesManagedPolicy(teamConfig, localConfig)
+        && (!isHostSelected(localConfig, tool) || !supportsStaticResource(tool, 'skills', localConfig.scope))) continue;
 
       const dest = await skillTargetForTool(tool, toolPath.skills, localConfig, item.name, sourcePath, toolPath.probe);
       if (dest) targets.push({ tool, dest });

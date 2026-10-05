@@ -1902,7 +1902,10 @@ function assertHostRootsStable(config) {
   }
 }
 function usesManagedPolicy(config, local) {
-  return Boolean(config?.modelPolicy || config?.builtins || config?.sharing?.instructions || local?.hostRoots);
+  if (config?.modelPolicy || config?.builtins || config?.sharing?.instructions || local?.hostRoots) return true;
+  if (!local) return false;
+  const lifecycleHome = getTeamaiHome(local.scope, local.projectRoot);
+  return ["managed-resources.json", "managed-resources.journal.json"].some((name) => fs4.existsSync(path6.join(lifecycleHome, name)));
 }
 var EXPLICIT_ONLY_HOSTS, DSH_EXACT_VERSION, WORKBUDDY_VALIDATED_VERSION;
 var init_host_adapters = __esm({
@@ -20641,6 +20644,7 @@ var init_skills = __esm({
         const targets = [];
         for (const [tool, toolPath] of Object.entries(scopedToolPaths(teamConfig, localConfig))) {
           if (isAgentExcluded(localConfig, tool)) continue;
+          if (usesManagedPolicy(teamConfig, localConfig) && (!isHostSelected(localConfig, tool) || !supportsStaticResource(tool, "skills", localConfig.scope))) continue;
           const dest = await skillTargetForTool(tool, toolPath.skills, localConfig, item.name, sourcePath, toolPath.probe);
           if (dest) targets.push({ tool, dest });
         }
@@ -33214,6 +33218,7 @@ async function pullForScope(localConfig, options, reported, policy = {}, result)
         const targetSetMatches = previousTargets !== void 0 && previousTargets.length === currentTargets.length && currentTargets.every((target) => syncedTargets.has(target));
         if (targetSetMatches) {
           if (usesManagedPolicy(freshConfig, localConfig) && !await reconcileManagedSnapshot(freshConfig, localConfig, roleContext)) {
+            if (result) result.resourceSyncFailed = true;
             process.exitCode = 1;
             return;
           }

@@ -1,6 +1,6 @@
 ## 0.26.0-autocode.1
 
-- Rebase the fork's capabilities onto stable upstream v0.26.0 (`96e5331`). Keep native upstream delivery for ordinary configurations; existing `modelPolicy`, `builtins`, `sharing.instructions` or persisted host bindings activate the fork's managed-resource contracts.
+- Rebase the fork's capabilities onto stable upstream v0.26.0 (`96e5331`). Keep native upstream delivery for ordinary configurations; existing `modelPolicy`, `builtins`, `sharing.instructions` or persisted host bindings activate the fork's managed-resource contracts. An existing ownership ledger or journal keeps these protections active even after those configuration flags are removed.
 - Preserve Agent v2 host rendering, strict model bindings, quiet defaults, personal edits, local Skill runtime data and restore-on-uninstall backups. WorkBuddy/DSH static-only restrictions remain scoped to managed-policy installations.
 - Reconcile managed resources on unchanged-revision pulls, restore missing files, and return failure on offline refresh, malformed roles or unresolved conflicts. `pull --plan` / `--dry-run` previews the local snapshot without network refresh or filesystem writes.
 - Keep per-checkout ownership journals and absolute backups at their original paths during upstream project-data migration. Interrupted retirement is retryable; original personal files can still be restored on uninstall. Migration follows upstream's no-downgrade rule for project machine data.

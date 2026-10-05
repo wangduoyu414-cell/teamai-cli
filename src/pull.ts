@@ -760,6 +760,17 @@ async function pullForScope(
     return;
   }
 
+  // Use the refreshed policy before any knowledge publication or mirroring.
+  const freshConfig = await loadTeamConfig(localConfig.repo.localPath);
+  if (!freshConfig) {
+    process.exitCode = 1;
+    log.warn(`[${scopeLabel}] Team config (teamai.yaml) not found. Skipping.`);
+    return;
+  }
+  // Managed installs with Recall off only distribute static resources. Native
+  // installs retain upstream knowledge sync independently of the Recall switch.
+  const syncKnowledge = !usesManagedPolicy(freshConfig, localConfig) || isRecallEnabled(localConfig, freshConfig);
+
   // Settle the placement records against the tree just refreshed, before
   // delivery reads them: a placement whose PR has merged becomes a record, one
   // whose file the team deleted stops being one, and in legacy mode one
@@ -789,7 +800,7 @@ async function pullForScope(
   // partition sync lock across this scope and the lock is not reentrant, so
   // publishing must not try to take it again. Never let it block the pull.
   try {
-    const queue = options.dryRun ? { remaining: 0, published: [], lastError: undefined } : await publishQueuedLearnings(localConfig, localConfig.username, { holdsSyncLock: true });
+    const queue = options.dryRun || !syncKnowledge ? { remaining: 0, published: [], lastError: undefined } : await publishQueuedLearnings(localConfig, localConfig.username, { holdsSyncLock: true });
     if (options.dryRun) {
       if (queue.remaining > 0) log.info(`[${scopeLabel}] [dry-run] Would publish ${queue.remaining} queued learning(s)`);
     } else if (queue.published.length > 0) {
@@ -807,15 +818,6 @@ async function pullForScope(
     }
   } catch (e) {
     log.debug(`publishing queued learnings skipped: ${(e as Error).message}`);
-  }
-
-  // Read teamai.yaml only after the refresh: a clone that lacks it must still
-  // be able to fetch it from the remote instead of skipping forever.
-  const freshConfig = await loadTeamConfig(localConfig.repo.localPath);
-  if (!freshConfig) {
-    process.exitCode = 1;
-    log.warn(`[${scopeLabel}] Team config (teamai.yaml) not found. Skipping.`);
-    return;
   }
 
   // Resolve role-scoped instruction sources before the revision fast path so
@@ -845,6 +847,7 @@ async function pullForScope(
   let reportsReadRoot: Promise<string | undefined> | undefined;
   const resolveReportsReadRoot = (): Promise<string | undefined> => {
     reportsReadRoot ??= (async () => {
+      if (!syncKnowledge) return undefined;
       if (!usesBranchWorktree(localConfig)) return localConfig.repo.localPath;
       try {
         const { readableReportsWorktree } = await import('./utils/reports-branch.js');
@@ -887,19 +890,21 @@ async function pullForScope(
       // Bring the learnings branch up to date before reading it, or a member
       // only ever sees their own contributions. Read-only: a cold start
       // materializes a local view and never publishes the branch.
-      try {
-        const { learningsBranch } = await import('./utils/learnings-branch.js');
-        const refreshed = await learningsBranch.refresh(localConfig, { pushIfCreated: false });
-        // Busy or failed: index what is there.
-        if (refreshed.status === 'failed') log.debug(`learnings worktree unavailable: ${refreshed.reason}`);
-      } catch (e) {
-        log.debug(`learnings worktree unavailable: ${(e as Error).message}`);
+      if (syncKnowledge) {
+        try {
+          const { learningsBranch } = await import('./utils/learnings-branch.js');
+          const refreshed = await learningsBranch.refresh(localConfig, { pushIfCreated: false });
+          // Busy or failed: index what is there.
+          if (refreshed.status === 'failed') log.debug(`learnings worktree unavailable: ${refreshed.reason}`);
+        } catch (e) {
+          log.debug(`learnings worktree unavailable: ${(e as Error).message}`);
+        }
       }
 
       // Without another repository's learnings checkout, if one sits where
       // this project's would (#808): the refusal was warned, and everything
       // else this project has stays indexed.
-      const publishedRoots = await indexableLearningsRoots(localConfig);
+      const publishedRoots = syncKnowledge ? await indexableLearningsRoots(localConfig) : [];
       const docsRepoDir = path.join(localConfig.repo.localPath, 'docs');
       const rulesRepoDir = path.join(localConfig.repo.localPath, 'rules');
       const skillsRepoDir = path.join(localConfig.repo.localPath, 'skills');
@@ -944,7 +949,7 @@ async function pullForScope(
         for (const name of await countLearnings(dir)) counted.add(name);
       }
       learningsCount = counted.size;
-      if (localConfig.scope === 'user') {
+      if (syncKnowledge && localConfig.scope === 'user') {
         await mirrorLearnings(
           mirrorSources,
           getUserLearningsDir(),
@@ -980,11 +985,11 @@ async function pullForScope(
           // yet stays recallable, and a queued edit wins over the published copy.
           // Then every published root, so nothing is indexed from one directory
           // that happened to be picked.
-          learningsDirs: [
+          learningsDirs: syncKnowledge ? [
             pendingLearningsDir(localConfig),
             ...(effectiveLearningsDir ? [effectiveLearningsDir] : []),
             ...publishedRoots,
-          ],
+          ] : [],
           learningsNamespaces: activeLearningsNamespaces,
           docsDir: await pathExists(docsRepoDir) ? docsRepoDir : undefined,
           // The docs pull delivers here, not the whole docs/ tree (#707).

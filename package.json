@@ -1,6 +1,6 @@
 {
   "name": "@wangduoyu414-cell/teamai-cli",
-  "version": "0.26.0-autocode.1",
+  "version": "0.26.0-autocode.2",
   "description": "TeamAI \u2014 Make Every Team AI Native (skill sync + shared knowledge base, powered by Git)",
   "type": "module",
   "bin": {

@@ -80,9 +80,17 @@ program
   .option('--dry-run', 'Preview mode, no changes made')
   .option('-v, --verbose', 'Verbose output')
   .hook('preAction', async (thisCommand, actionCommand) => {
-    const opts = thisCommand.opts();
-    if (opts.plan) { thisCommand.setOptionValue('dryRun', true); opts.dryRun = true; }
-    if (opts.dryRun) { setFileLogging(false); return; }
+    const opts = actionCommand.optsWithGlobals();
+    if (opts.plan || opts.dryRun) {
+      thisCommand.setOptionValue('dryRun', true);
+      actionCommand.setOptionValue('dryRun', true);
+      opts.dryRun = true;
+      setFileLogging(false);
+    }
+    // Windows runtime discovery writes diagnostics. Apply the preview's
+    // read-only logging policy before discovery, but still prepare its PATH.
+    ensureBundledRuntimeOnPath();
+    if (opts.dryRun) return;
     if (opts.verbose) setVerbose(true);
 
     // Auto-migrate a legacy `<repo>/.teamai/` into the partition before the
@@ -1447,9 +1455,5 @@ async function publishMaintenance(localConfig: LocalConfig, message: string, cha
 export { program };
 
 if (!process.env.TEAMAI_COMMAND_TABLE_ONLY) {
-  // Bundled runtimes first: a hook-spawned command may not inherit our PATH
-  // (see bundled-runtime.ts) and pull shells out to git.
-  ensureBundledRuntimeOnPath();
-
   program.parse();
 }

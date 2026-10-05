@@ -58680,15 +58680,15 @@ async function notifyWebhook(event) {
 applyNonInteractiveGitEnv();
 var program = new Command();
 program.name("teamai").description("TeamAI \u2014 Make Every Team AI Native").version(version).option("--plan", "Preview lifecycle work without side effects").option("--dry-run", "Preview mode, no changes made").option("-v, --verbose", "Verbose output").hook("preAction", async (thisCommand, actionCommand) => {
-  const opts = thisCommand.opts();
-  if (opts.plan) {
+  const opts = actionCommand.optsWithGlobals();
+  if (opts.plan || opts.dryRun) {
     thisCommand.setOptionValue("dryRun", true);
+    actionCommand.setOptionValue("dryRun", true);
     opts.dryRun = true;
-  }
-  if (opts.dryRun) {
     setFileLogging(false);
-    return;
   }
+  ensureBundledRuntimeOnPath();
+  if (opts.dryRun) return;
   if (opts.verbose) setVerbose(true);
   const name = actionCommand.name();
   if (TEAMAI_HOOK_SUBCOMMANDS.includes(name)) return;
@@ -59356,7 +59356,6 @@ async function publishMaintenance(localConfig, message, changed) {
   }
 }
 if (!process.env.TEAMAI_COMMAND_TABLE_ONLY) {
-  ensureBundledRuntimeOnPath();
   program.parse();
 }
 export {

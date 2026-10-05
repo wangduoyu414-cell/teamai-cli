@@ -1,3 +1,7 @@
+## 0.26.0-autocode.2
+
+- Apply preview logging policy before bundled-runtime discovery, so Windows `--plan` and `--dry-run` do not write a startup log. Normal commands retain runtime PATH preparation and diagnostics.
+
 ## 0.26.0-autocode.1
 
 - Rebase the fork's capabilities onto stable upstream v0.26.0 (`96e5331`). Keep native upstream delivery for ordinary configurations; existing `modelPolicy`, `builtins`, `sharing.instructions` or persisted host bindings activate the fork's managed-resource contracts. An existing ownership ledger or journal keeps these protections active even after those configuration flags are removed.

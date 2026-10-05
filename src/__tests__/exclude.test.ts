@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-vi.mock('../config.js', () => ({
+vi.mock('../config.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../config.js')>()),
   detectProjectConfig: vi.fn(),
   loadStateForScope: vi.fn(),
   requireInit: vi.fn(),
@@ -50,6 +51,7 @@ describe('skill exclude commands', () => {
       pushedRules: [],
       pushedSkills: [],
       pushedEnvVars: [],
+      pendingPushes: [],
       lastUpdateCheck: null,
       availableUpdate: null,
     });
@@ -63,8 +65,7 @@ describe('skill exclude commands', () => {
     }));
     expect(saveStateForScope).toHaveBeenCalledWith(
       expect.objectContaining({ lastPullRev: null }),
-      'user',
-      undefined,
+      expect.objectContaining({ scope: 'user' }),
     );
   });
 
@@ -86,8 +87,7 @@ describe('skill exclude commands', () => {
     );
     expect(saveStateForScope).toHaveBeenCalledWith(
       expect.objectContaining({ lastPullRev: null }),
-      'project',
-      '/tmp/project',
+      expect.objectContaining({ scope: 'project', projectRoot: '/tmp/project' }),
     );
     expect(saveLocalConfig).not.toHaveBeenCalled();
   });

@@ -8,28 +8,18 @@
  *  - Fallback: return '' when detection fails (best-effort, never throws).
  */
 
-import { execFile } from 'node:child_process';
-import { access, readFile } from 'node:fs/promises';
 import os from 'node:os';
+import { readFile, access } from 'node:fs/promises';
 import path from 'node:path';
 import { log } from './utils/logger.js';
+import { probeBinary, execCommand } from './utils/exec.js';
 
 const VERSION_CACHE = new Map<string, string>();
 
-async function execVersion(
-  bin: string,
-  args: string[] = ['--version'],
-  options: { env?: NodeJS.ProcessEnv } = {},
-): Promise<string> {
-  return new Promise((resolve) => {
-    execFile(bin, args, { timeout: 5000, encoding: 'utf8', env: options.env }, (err, stdout) => {
-      if (err) {
-        resolve('');
-        return;
-      }
-      resolve(stdout.trim());
-    });
-  });
+// Launch through cross-spawn (probeBinary): on Windows npm installs these CLIs
+// as `<name>.cmd` shims, which the native execFile cannot find or start.
+async function execVersion(bin: string, args: string[] = ['--version'], options?: { env?: NodeJS.ProcessEnv }): Promise<string> {
+  return probeBinary(bin, args, options ? (cmd, argv, opts) => execCommand(cmd, argv, { ...opts, ...options }) : undefined);
 }
 
 async function fileExists(candidate: string): Promise<boolean> {
@@ -151,11 +141,6 @@ async function detectWorkbuddyVersion(): Promise<string> {
   return '';
 }
 
-async function detectDshVersion(): Promise<string> {
-  const raw = await execVersion('dsh');
-  return raw.split(/\s+/)[0]?.trim() ?? '';
-}
-
 async function detectHermesVersion(): Promise<string> {
   const raw = await execVersion('hermes');
   // hermes --version may output "(2026.8.7)\nProject: ..." — extract from parens or leading digits.
@@ -179,10 +164,18 @@ const DETECTORS: Record<string, VersionDetector> = {
   codebuddy: detectCodebuddyCliVersion,
   'codebuddy-ide': detectCodebuddyIdeVersion,
   workbuddy: detectWorkbuddyVersion,
-  dsh: detectDshVersion,
   hermes: detectHermesVersion,
   openclaw: detectOpenclawVersion,
+  // DeepSeek Harness: `dsh --version` prints e.g. "0.1.1" (optionally with a
+  // leading "v" or trailing commit info). Extract leading semver-ish digits.
+  dsh: detectDshVersion,
 };
+
+async function detectDshVersion(): Promise<string> {
+  const raw = await execVersion('dsh');
+  const match = raw.match(/v?(\d+(?:\.\d+)*)/);
+  return match?.[1] ?? '';
+}
 
 /**
  * Detect the version of a given agent. Returns '' on failure.

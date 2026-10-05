@@ -27,6 +27,10 @@ hosts:
       Implement the requested change.
 `;
 
+  it.each(['{codex: null}', '{codex: 3}', '{unknown: {instructions: test}}', '{}'])('rejects malformed v2 hosts %s before delivery', (hosts) => {
+    expect(parseAgentYaml(`schema_version: 2\nname: x\ndescription: x\ninstructions: x\nhosts: ${hosts}\n`, 'x.yaml').ok).toBe(false);
+  });
+
   it('parses host-first v2 and scopes deployment to declared hosts', () => {
     const result = parseAgentYaml(yaml, 'bounded_implementer.yaml');
     expect(result.ok).toBe(true);

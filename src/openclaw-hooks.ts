@@ -20,8 +20,9 @@
  */
 
 import path from 'node:path';
-import { writeFile, ensureDir, pathExists, readFileSafe, remove } from './utils/fs.js';
+import { writeFile, writeIfChanged, ensureDir, pathExists, readFileSafe, readJson, writeJsonAtomic, remove } from './utils/fs.js';
 import { log } from './utils/logger.js';
+import { getUserHome } from './utils/home.js';
 
 /**
  * Resolve the hooks directory for an OpenClaw-family tool.
@@ -36,7 +37,7 @@ export function resolveOpenClawHooksDir(tool: string): string {
   if (tool === 'openclaw' && process.env.OPENCLAW_STATE_DIR) {
     return path.join(process.env.OPENCLAW_STATE_DIR, 'hooks');
   }
-  const home = process.env.HOME ?? '';
+  const home = getUserHome();
   return path.join(home, `.${tool}`, 'hooks');
 }
 
@@ -95,16 +96,75 @@ export default async function handler(ctx: { event?: string } = {}): Promise<voi
 }
 
 /**
- * Inject (or refresh) the teamai OpenClaw hook into `<hooksDir>`.
- * Idempotent — rewrites the two files each time.
+ * Inject (or refresh) the teamai OpenClaw hook.
+ *
+ * Writes into the resolved OpenClaw workspace directory (the same location
+ * skills sync to and the engine reads from), NOT the HOME-relative
+ * `~/.<tool>/hooks` — writing there left the hook where the engine never
+ * looks, so status reporting silently stopped. Idempotent — writes and reports
+ * the two files only when their content changes. Skips (no-op) when the
+ * workspace dir cannot be resolved.
+ *
+ * @param workspacePath optional server-sent workspace path (highest priority)
+ * @param tool          claw variant (openclaw/qclaw/easyclaw/autoclaw)
  */
-export async function injectOpenClawHooks(hooksDir: string, tool = 'openclaw'): Promise<void> {
-  const effectiveHooksDir = resolveOpenClawHooksDir(tool);
-  const dir = path.join(effectiveHooksDir, OPENCLAW_HOOK_DIR);
-  await ensureDir(dir);
-  await writeFile(path.join(dir, 'HOOK.md'), buildHookMd(tool));
-  await writeFile(path.join(dir, 'handler.ts'), buildHandlerTs(tool));
-  log.success(`Injected teamai OpenClaw hook into ${dir}`);
+export async function injectOpenClawHooks(workspacePath?: string, tool = 'openclaw'): Promise<void> {
+  const wsDir = await resolveOpenclawWorkspaceDir(workspacePath);
+  if (!wsDir) {
+    log.debug(`openclaw: skip hook injection for ${tool} — workspace dir not found`);
+    return;
+  }
+  const dir = path.join(wsDir, 'hooks', OPENCLAW_HOOK_DIR);
+  const hookMdChanged = await writeIfChanged(path.join(dir, 'HOOK.md'), buildHookMd(tool));
+  const handlerChanged = await writeIfChanged(path.join(dir, 'handler.ts'), buildHandlerTs(tool));
+  if (hookMdChanged || handlerChanged) {
+    log.success(`Injected teamai OpenClaw hook into ${dir}`);
+  } else {
+    log.debug(`teamai OpenClaw hook already up-to-date in ${dir}`);
+  }
+  await enableOpenClawInternalHooks(tool);
+}
+
+/**
+ * Enable workspace-hook loading in the OpenClaw engine config.
+ *
+ * The engine does not load workspace hooks unless `hooks.internal.enabled` is
+ * true in `$OPENCLAW_STATE_DIR/openclaw.json`. Writing the hook files alone is
+ * therefore insufficient. This performs a deep merge: it preserves every
+ * existing field (e.g. `agents.defaults.workspace`) and only sets that one
+ * flag. No-op (debug log) when OPENCLAW_STATE_DIR is unset or not absolute.
+ * Idempotent.
+ *
+ * openclaw-only: other claw variants are not known to use this flag.
+ *
+ * @param tool claw variant; only `openclaw` uses this flag
+ */
+export async function enableOpenClawInternalHooks(tool = 'openclaw'): Promise<void> {
+  if (tool !== 'openclaw') return;
+  const stateDir = process.env.OPENCLAW_STATE_DIR;
+  if (!stateDir || !path.isAbsolute(stateDir)) {
+    log.debug('openclaw: skip enabling internal hooks — OPENCLAW_STATE_DIR unset or not absolute');
+    return;
+  }
+  const cfgPath = path.join(stateDir, 'openclaw.json');
+  try {
+    const cfg = (await readJson<Record<string, unknown>>(cfgPath)) ?? {};
+    const hooksVal = cfg.hooks;
+    const hooks = (hooksVal && typeof hooksVal === 'object') ? hooksVal as Record<string, unknown> : {};
+    const internalVal = hooks.internal;
+    const internal = (internalVal && typeof internalVal === 'object') ? internalVal as Record<string, unknown> : {};
+    if (internal.enabled === true) {
+      log.debug('openclaw: internal hooks already enabled');
+      return;
+    }
+    internal.enabled = true;
+    hooks.internal = internal;
+    cfg.hooks = hooks;
+    await writeJsonAtomic(cfgPath, cfg);
+    log.success(`Enabled OpenClaw internal hooks in ${cfgPath}`);
+  } catch (e) {
+    log.warn(`openclaw: failed to enable internal hooks: ${(e as Error).message}`);
+  }
 }
 
 /** Remove the teamai OpenClaw hook from `<hooksDir>` if present. */
@@ -231,8 +291,7 @@ export async function openclawWorkspaceCandidates(workspacePath?: string): Promi
       } catch (e) { log.debug(`openclaw: failed to parse openclaw.json: ${(e as Error).message}`); }
     }
   }
-  const home = process.env.HOME;
-  if (home) candidates.push(path.join(home, '.openclaw', 'workspace'));
+  candidates.push(path.join(getUserHome(), '.openclaw', 'workspace'));
   return candidates;
 }
 
@@ -244,6 +303,10 @@ export async function resolveOpenclawWorkspaceDir(workspacePath?: string): Promi
       return candidate;
     }
   }
-  log.warn(`openclaw: no workspace dir found (tried: ${candidates.join(', ') || 'none'})`);
+  // A missing workspace dir is the normal case when OpenClaw is not installed;
+  // callers treat null as "skip openclaw" and log their own debug line, so keep
+  // this at debug level to avoid warning noise (one line per skill/file) on
+  // machines without OpenClaw.
+  log.debug(`openclaw: no workspace dir found (tried: ${candidates.join(', ') || 'none'})`);
   return null;
 }

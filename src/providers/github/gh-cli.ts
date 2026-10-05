@@ -1,5 +1,8 @@
 import { spawnSync } from 'node:child_process';
-import { log, spinner } from '../../utils/logger.js';
+import crossSpawn from 'cross-spawn';
+import { log } from '../../utils/logger.js';
+import { resolveCliPath } from '../../utils/cli-path.js';
+import { isInteractive } from '../../utils/prompt.js';
 
 // ─── Constants ───────────────────────────────────────────
 
@@ -7,14 +10,18 @@ const GITHUB_API = 'https://api.github.com';
 
 // ─── gh CLI detection ────────────────────────────────────
 
-/** Returns the full path to gh if available on PATH, else null. */
+/**
+ * Absolute path to the `gh` executable if available on PATH, else null.
+ *
+ * Not `which gh`: on Windows that lands on Git's `which`, which prints an MSYS
+ * path (`/c/Program Files/GitHub CLI/gh`) that Node resolves as
+ * `C:\c\Program Files\...` — `spawnSync` then fails with ENOENT, i.e.
+ * `isGhInstalled()` answered "installed" while every `ghExec()` returned
+ * status 1 with an empty stderr. `resolveCliPath` uses the native `where` on
+ * Windows and accepts only a launchable path (`.exe` / `.cmd` / `.bat`).
+ */
 function getGhPath(): string | null {
-  try {
-    const result = spawnSync('gh', ['--version'], { encoding: 'utf8', windowsHide: true });
-    return result.status === 0 ? 'gh' : null;
-  } catch {
-    return null;
-  }
+  return resolveCliPath('gh');
 }
 
 /** Check whether the gh CLI is installed and on PATH. */
@@ -25,6 +32,12 @@ export function isGhInstalled(): boolean {
 /**
  * Execute a gh CLI command.
  * Returns { stdout, stderr, status }.
+ *
+ * Launches through cross-spawn rather than the native `spawnSync`, for the same
+ * reason `callClaude` does: a `gh` that npm installed is a `.cmd` shim, and Node
+ * cannot execute `.cmd` directly (EINVAL). Resolving the path alone is not
+ * enough — `pickWindowsCommand` accepts `.cmd`, so the launcher has to be able
+ * to run what it resolves.
  */
 export function ghExec(
   args: string[],
@@ -40,17 +53,18 @@ export function ghExec(
   log.debug(`gh exec: ${ghPath} ${args.join(' ')}`);
 
   if (options?.inheritStdio) {
-    const result = spawnSync(ghPath, args, {
+    const result = crossSpawn.sync(ghPath, args, {
       stdio: 'inherit',
-      env: { ...process.env, ...(options.env ?? {}) },
+      env: { ...process.env, ...options.env },
       cwd: options.cwd,
     });
     return { stdout: '', stderr: '', status: result.status ?? 1 };
   }
 
-  const result = spawnSync(ghPath, args, {
-    env: { ...process.env, ...(options?.env ?? {}) },
+  const result = crossSpawn.sync(ghPath, args, {
+    env: { ...process.env, ...options?.env },
     encoding: 'utf-8',
+    windowsHide: true,
     maxBuffer: 10 * 1024 * 1024,
     cwd: options?.cwd,
   });
@@ -201,6 +215,17 @@ export function ghAuthLogin(): void {
 export async function ensureGhAuthenticated(): Promise<string> {
   const existing = await ghAuthWhoami();
   if (existing) return existing;
+
+  // `gh auth login --web` inherits stdio and waits for a browser device flow.
+  // Without a person at a terminal that is a job stuck until gh's deadline
+  // (issue #711), so refuse up front and name the credential that would work.
+  if (!isInteractive()) {
+    throw new Error(
+      'GitHub authentication unavailable without a terminal. ' +
+        'Export GITHUB_TOKEN (or GH_TOKEN) with "repo" scope, ' +
+        'or run `gh auth login` in an interactive shell first.',
+    );
+  }
 
   // Need to log in — only possible via gh CLI
   ghAuthLogin();

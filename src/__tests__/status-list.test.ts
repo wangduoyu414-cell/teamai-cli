@@ -5,7 +5,8 @@ import fse from 'fs-extra';
 
 const mockAutoDetectInit = vi.fn();
 
-vi.mock('../config.js', () => ({
+vi.mock('../config.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../config.js')>()),
   autoDetectInit: (...args: unknown[]) => mockAutoDetectInit(...args),
   loadStateForScope: vi.fn(async () => ({})),
 }));
@@ -154,5 +155,43 @@ describe('teamai list / status resource coverage', () => {
     expect(out).toMatch(/agents:\s*1/);
     expect(out).toMatch(/hooks:\s*1/);
     expect(out).toMatch(/mcp:\s*1/);
+  });
+
+  it('status counts nested rule files', async () => {
+    await fse.ensureDir(path.join(repoPath, 'rules', 'common'));
+    await fse.writeFile(path.join(repoPath, 'rules', 'common', 'example.md'), '# Rule\n');
+    await status({});
+    const out = lines.join('\n');
+    expect(out).toMatch(/rules:\s*1/);
+  });
+
+  it('status counts nested docs and excludes hidden files at every depth', async () => {
+    for (const docPath of ['guide.md', 'ai/setup.md', 'ai/reference/api.pdf', '.gitkeep', 'ai/.draft.md', '.private/note.md']) {
+      await fse.outputFile(path.join(repoPath, 'docs', docPath), 'Documentation\n');
+    }
+
+    await status({});
+
+    expect(lines).toContain('  docs: 3');
+  });
+
+  it.each([
+    { layout: 'flat', skillPaths: ['review', 'officecli'] },
+    { layout: 'namespaced', skillPaths: ['ai/review', 'ai/planning', 'ops/review', 'ops/deploy'] },
+    {
+      layout: 'mixed with nested modules inside a skill',
+      skillPaths: ['ai/log-reader', 'ai/asset-import', 'ai/asset-replacement', 'ai/project-analysis', 'ai/unity-skills', 'ai/skills-setup', 'officecli'],
+      nestedModules: ['ai/unity-skills/skills/scene', 'ai/unity-skills/skills/camera'],
+    },
+    { layout: 'empty', skillPaths: [] },
+  ])('status counts skills in a $layout repo instead of top-level directories', async ({ skillPaths, nestedModules = [] }) => {
+    for (const skillPath of [...skillPaths, ...nestedModules]) {
+      await fse.outputFile(path.join(repoPath, 'skills', skillPath, 'SKILL.md'), '# Skill\n');
+    }
+    await fse.ensureDir(path.join(repoPath, 'skills', 'empty-namespace'));
+
+    await status({});
+
+    expect(lines).toContain(`  skills: ${skillPaths.length}`);
   });
 });

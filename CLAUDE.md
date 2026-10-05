@@ -1,68 +1,30 @@
 # TeamAI CLI
 
-## Project Overview
+CLI for syncing team skills, rules, docs, and env across AI coding tools. Package: [`teamai-cli`](https://www.npmjs.com/package/teamai-cli).
 
-TeamAI CLI — a CLI tool for syncing team skills, rules, docs, and env variables across AI coding tools (Claude Code, Cursor, Codex, CodeBuddy).
+TypeScript, Node 20+ (`npm run lint` needs ^20.19 or >=22.12), tsup (ESM), Vitest. Commands: `npm run build`, `npx tsc --noEmit`, `npm run lint`, `npx vitest run`, `npm run test:e2e`.
 
-Published as two packages with identical code:
+## Git
 
-- **Public**: `teamai-cli` on [npmjs.org](https://www.npmjs.com/package/teamai-cli) — for open-source users
-- **Internal mirror**: `@tencent/teamai-cli` on tnpm — for Tencent internal teams
+- Default branch: `main`. Worktrees and PRs based on `origin/main`.
+- PR only to `Tencent/teamai-cli`. Before push, check `git log origin/main..HEAD`; rebase or cherry-pick if unrelated commits appear.
+- **必须使用 Worktree**：改代码前先 `EnterWorktree`，禁止在主工作目录修改。
 
-## Tech Stack
+## Rules
 
-- **Language**: TypeScript
-- **Runtime**: Node.js 20+
-- **Build**: tsup (ESM output)
-- **Test**: Vitest
-- **Package Registry**: public npm + tnpm mirror (see publish process below)
-- **CI**: GitHub Actions (`.github/workflows/`) + Coding CI (`.coding-ci.yaml`) for internal tnpm
-- **Git Hosting**: GitHub (primary) + TGit (`git.woa.com`) via provider abstraction
+- CLI user-facing output must be English. No Chinese in production code. Tests assert English output.
+- Keep bilingual docs in sync (`README` / `*.zh-CN.md`, `docs/usage-guide.*`). Behavior changes must update every affected doc (including `docs/designs/`); grep old wording before opening the PR.
+- **README 精简**：尽量少改动 README，保持简洁。确需改动时，所有语言版本（`README.md` 及全部 `README.*.md`，改前先 `ls README*` 确认清单）必须全部改完并保持一致。
+- **`skill-data/` 与文档同等对待**：那是 agent 真正读到的内容。行为变更必须同步更新受影响的 skill（`core` / `setup` / `wiki` / `share`），并在 PR 前 grep 旧措辞。
+- `skill-data/core/references/commands.md` 由 Commander 命令表生成，改动命令或 flag 后运行 `npx vitest run commands-reference -u` 重新生成。
+- 部署到 agent 的只有 `skills/teamai/SKILL.md`（发现入口），保持与版本无关：新增工作流是在 `skill-data/` 下加目录 + 在 stub 里加一行，不要把内容写进 stub。
+- **奥卡姆剃刀**：避免过早添加新 CLI 命令；非必要不加；优先复用或扩展现有命令与选项。
 
-## Common Commands
+## PR 前测试
 
-```bash
-npm run build          # Build with tsup
-npx tsc --noEmit       # Type check
-npx vitest run         # Run unit tests
-npx vitest run --coverage  # Run tests with coverage
-```
+改动运行时行为的 PR（docs-only / tests-only 之外），`npm run build` 后必须用真实 CLI 对本次改动做端到端验证，不能只跑 type check / unit test；**一次代表性的 real-CLI 运行即可**，把实际通过的验证记录贴进 PR。docs-only / tests-only 的改动无需 e2e 记录。
 
-## Release Process
+不要求覆盖下面的完整 provider × agent 矩阵——额外 provider / agent 的覆盖交给 CI，或在本地环境不具备时说明即可：
 
-Publish is triggered by **tag push**. Two pipelines run in parallel:
-
-- **GitHub Actions** (`.github/workflows/release.yml`): publishes `teamai-cli` to public npm
-- **Coding CI** (`.coding-ci.yaml`): renames to `@tencent/teamai-cli` at build time and publishes to tnpm
-
-```bash
-# 1. Bump version (auto: modify package.json + git commit + git tag)
-npm version patch      # bug fix / small change
-npm version minor      # new feature, backward compatible
-npm version major      # breaking change
-
-# 2. Push code and tag together — CI auto-publishes both packages
-git push origin main --tags
-```
-
-CI stages: validate (lint + test) -> build -> e2e -> publish (tag builds only).
-
-## Git Conventions
-
-- **Default branch**: `main` (not `master`). All worktrees and PRs should be based on `origin/main`.
-- **PR target**: Always submit PRs to `Tencent/teamai-cli` (the upstream). Never push PRs to personal forks (`hsuchifeng`, `jeff-r2026`, etc.) unless explicitly told.
-- **Clean PRs**: Before pushing, verify commit scope with `git log origin/main..HEAD`. If unrelated commits appear, rebase or cherry-pick onto a fresh branch from `origin/main`.
-
-## Output Language
-
-All CLI user-facing output must be in **English**. No Chinese strings in production code. Test assertions should match English output.
-
-## Documentation
-
-- **Bilingual docs stay in sync**: docs are paired as an English main version plus a `*.zh-CN.md` Chinese version (e.g. `README.md` / `README.zh-CN.md`, `docs/usage-guide.md` / `docs/usage-guide.zh-CN.md`). When you edit one language, update the other in the same change so they never drift.
-- **Large changes must update all affected docs**: when a change alters observable behavior, a mechanism, a threshold, a command, or a workflow, update every doc that describes it — README (both languages), `docs/usage-guide.*`, and any design docs under `docs/designs/`. Grep for the old behavior/wording before opening the PR to confirm nothing stale remains. A behavior change whose docs still describe the old behavior is an incomplete PR.
-
-## Workflow Rules
-
-- **必须使用 Worktree**：每次需要修改代码前，必须先通过 `EnterWorktree` 进入一个隔离的 git worktree 进行开发，禁止直接在主工作目录修改代码。
-- **功能必须实测**：每次完成功能开发后，必须 `npm run build` 并用真实 CLI 执行端到端功能验证（不能只跑 type check 和 unit test）。PR 的 Test Plan 中列出的每一项都必须实际执行通过后才能提交。
+- Agent：Claude、Codex、CodeBuddy、OpenCode
+- Provider：`git`、`gitlab`、`github`

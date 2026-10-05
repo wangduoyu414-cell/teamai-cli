@@ -3,15 +3,12 @@ import { spawn } from 'node:child_process';
 import path from 'node:path';
 import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { createRequire } from 'node:module';
 
 // ─── Helpers ─────────────────────────────────────────────
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..', '..', '..');
 const CLI = path.join(ROOT, 'dist', 'index.js');
-
-const require = createRequire(import.meta.url);
 
 interface RunResult {
   code: number | null;
@@ -83,9 +80,19 @@ describe('CLI basics', () => {
 
   it('--help should list core commands', async () => {
     const { output } = await runCLI(['--help']);
-    for (const cmd of ['init', 'pull', 'push', 'status', 'members', 'tags', 'uninstall']) {
+    for (const cmd of ['init', 'pull', 'push', 'status', 'members', 'tags', 'packages', 'uninstall']) {
       expect(output).toContain(cmd);
     }
+  });
+
+  it('teamai packages exposes an install subcommand', async () => {
+    const pkgHelp = await runCLI(['packages', '--help']);
+    const installHelp = await runCLI(['packages', 'install', '--help']);
+    expect(pkgHelp.code).toBe(0);
+    expect(installHelp.code).toBe(0);
+    // Parent lists the install subcommand; the subcommand is reachable.
+    expect(pkgHelp.output).toContain('install');
+    expect(installHelp.output).toContain('Install team npm packages and Claude plugins');
   });
 });
 
@@ -123,7 +130,7 @@ describe('tags CLI', () => {
 
   it('teamai tags list (no init) should show error', async () => {
     // Run in a temp dir with no teamai init
-    const { output, code } = await runCLI(['tags', 'list']);
+    const { output } = await runCLI(['tags', 'list']);
     // Either shows tags or shows "not initialized" error — both valid
     expect(output.length).toBeGreaterThan(0);
   });
@@ -580,7 +587,7 @@ describe('remote commands', () => {
       // Step 1: Uninstall everything
       const uninstallResult = await runCLI(['uninstall', '--force']);
       expect(uninstallResult.code).toBe(0);
-      expect(uninstallResult.output).toContain('卸载完成');
+      expect(uninstallResult.output).toContain('teamai uninstalled');
 
       // Step 2: Verify cleanup — config.yaml should not exist
       const teamaiHome = path.join(process.env.HOME ?? '', '.teamai');
@@ -692,10 +699,13 @@ describe('remote commands', () => {
 // of the suite depends on.
 //
 // GitHub-only: TGit's `gf` CLI authenticates via ~/.netrc, which we lose
-// when we isolate $HOME to a temp dir. `gf auth login` then triggers an
-// interactive (inheritStdio) login that no amount of stdin piping can
-// satisfy → permanent hang. GitHub provider auths via GITHUB_TOKEN env,
-// so it works fine under HOME isolation.
+// when we isolate $HOME to a temp dir, and `gf auth whoami` reads only that
+// store. The TGIT_TOKEN below cannot stand in for it: the PAT is REST-only,
+// and git.woa.com's git endpoint rejects it too. Since #711 the CLI
+// refuses to start `gf auth login` without a terminal instead of hanging on
+// it, so a TGit run here would fail fast rather than block; it still cannot
+// pass. GitHub provider auths via GITHUB_TOKEN env, so it works fine under
+// HOME isolation.
 
 const PROVIDER_IS_GITHUB =
   (process.env.TEAMAI_TEST_PROVIDER ?? 'tgit').toLowerCase() === 'github';

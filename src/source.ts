@@ -1,8 +1,11 @@
+import { usesManagedPolicy } from './host-adapters.js';
+import { EXPLICIT_ONLY_HOSTS, isHostSelected, normalizeHostId } from './host-adapters.js';
 import path from 'node:path';
 import fse from 'fs-extra';
 import YAML from 'yaml';
 import { loadTeamConfig, autoDetectInit, loadLocalConfig, detectProjectConfig } from './config.js';
-import { createGit, pullRepo } from './utils/git.js';
+import { pullRepo } from './utils/git.js';
+import { parseFrontmatter } from './utils/frontmatter.js';
 import { detectProvider, getProvider } from './providers/index.js';
 import { log, spinner } from './utils/logger.js';
 import {
@@ -17,7 +20,10 @@ import {
 } from './utils/fs.js';
 import { getHandler } from './resources/index.js';
 import { ResourceHandler } from './resources/base.js';
-import { BUILTIN_SKILL_NAMES } from './builtin-skills.js';
+import { resolveSkillDestination } from './resources/skills.js';
+import { BUILTIN_SKILL_NAMES, LEGACY_BUILTIN_SKILL_NAMES } from './builtin-skills.js';
+import { getUserHome } from './utils/home.js';
+import { assertSafeResourceName, assertWithinRoot } from './utils/path-safety.js';
 import type {
   TeamaiConfig,
   LocalConfig,
@@ -25,13 +31,13 @@ import type {
   SourceInstallManifest,
   GlobalOptions,
 } from './types.js';
-import { resolveBaseDir, SOURCE_PULL_TTL_MS } from './types.js';
-import { EXPLICIT_ONLY_HOSTS, homeDir, isHostSelected, normalizeHostId, supportsStaticResource } from './host-adapters.js';
+import { resolveBaseDir, scopedToolPaths, SOURCE_PULL_TTL_MS } from './types.js';
 
 // ─── Source repo management ──────────────────────────────
 
 function getSourceDir(sourceName: string): string {
-  return path.join(homeDir(), '.teamai', 'sources', sourceName);
+  assertSafeResourceName(sourceName);
+  return path.join(getUserHome(), '.teamai', 'sources', sourceName);
 }
 
 function getSourceRepoDir(sourceName: string): string {
@@ -85,7 +91,8 @@ async function ensureSourceRepo(source: SourceConfig, force: boolean): Promise<s
     }
   }
 
-  // First time: clone via provider so private repos get an auth token
+  // First time: clone via the provider so its configured authentication path
+  // (token, credential helper, or SSH agent) is used.
   try {
     await ensureDir(path.dirname(repoDir));
     const cloneSpin = spinner(`[source:${source.name}] Cloning...`).start();
@@ -93,7 +100,10 @@ async function ensureSourceRepo(source: SourceConfig, force: boolean): Promise<s
     const providerName = detectProvider(source.repo);
     const provider = getProvider(providerName);
     const repoInfo = provider.parseRepoInput(source.repo);
-    provider.cloneRepo(`${repoInfo.owner}/${repoInfo.repo}`, repoDir);
+    const cloneTarget = provider.name === 'git'
+      ? repoInfo.httpsUrl
+      : `${repoInfo.owner}/${repoInfo.repo}`;
+    provider.cloneRepo(cloneTarget, repoDir);
 
     cloneSpin.succeed(`[source:${source.name}] Cloned`);
     return repoDir;
@@ -119,6 +129,12 @@ export async function sourceAdd(repoUrl: string, options: { name?: string } & Gl
     log.error('Could not derive source name from URL. Use --name to specify one.');
     return;
   }
+  try {
+    assertSafeResourceName(name);
+  } catch (e) {
+    log.error(`Invalid source name "${name}": ${(e as Error).message}`);
+    return;
+  }
 
   // Check for duplicates
   const existing = teamConfig.sources ?? [];
@@ -138,10 +154,13 @@ export async function sourceAdd(repoUrl: string, options: { name?: string } & Gl
     return;
   }
 
-  // Read source's teamai.yaml to verify it's a valid teamai repo
+  // Warn up front when the source cannot share anything. `pull` opts in on a
+  // source's `publicSkills` declaration, so a repo without a teamai.yaml (or
+  // with an empty publicSkills list) syncs 0 skills. Say so here, at add time,
+  // instead of letting pull skip it silently later.
   const sourceConfig = await loadTeamConfig(cloneResult);
-  if (!sourceConfig) {
-    log.warn(`Source repo has no teamai.yaml. It can still be used, but no publicSkills are declared.`);
+  for (const line of sourceSyncWarnings(name, sourceConfig)) {
+    log.warn(line);
   }
 
   if (options.dryRun) {
@@ -437,6 +456,7 @@ async function pullSingleSource(
 
   // Deploy skills to tool paths
   const deployed: string[] = [];
+  const installedPaths: Record<string, string[]> = { ...oldManifest?.installedPaths };
   let newCount = 0;
   let updatedCount = 0;
 
@@ -455,15 +475,16 @@ async function pullSingleSource(
     }
 
     // Deploy to each tool's skills directory
-    for (const [tool, toolPath] of Object.entries(teamConfig.toolPaths)) {
-      // Cross-team sources still use the legacy direct-copy lifecycle. Keep the
-      // external product roots out of that path until it is manifest-backed.
-      if (EXPLICIT_ONLY_HOSTS.has(normalizeHostId(tool))) continue;
-      if (!toolPath.skills || !isHostSelected(localConfig, tool) || !supportsStaticResource(tool, 'skills', localConfig.scope)) continue;
-      if (!await ResourceHandler.isToolInstalled(toolPath.skills, baseDir, toolPath.probe)) continue;
+    for (const [tool, toolPath] of Object.entries(scopedToolPaths(teamConfig, localConfig))) {
+    if (usesManagedPolicy(teamConfig, localConfig) && (EXPLICIT_ONLY_HOSTS.has(normalizeHostId(tool)) || !isHostSelected(localConfig, tool))) continue;
+      if (!toolPath.skills) continue;
+      if (!await ResourceHandler.isToolInstalled(toolPath.skills, baseDir)) continue;
 
-      const targetDir = path.join(baseDir, toolPath.skills, skill.name);
+      const targetDir = await resolveSkillDestination(tool, toolPath.skills, baseDir, skill.name, skill.sourcePath);
       await copyDir(skill.sourcePath, targetDir);
+      const relativeTarget = path.relative(baseDir, targetDir);
+      const skillPaths = installedPaths[skill.name] ??= [];
+      if (!skillPaths.includes(relativeTarget)) skillPaths.push(relativeTarget);
     }
 
     if (oldInstalled.has(skill.name)) {
@@ -479,8 +500,9 @@ async function pullSingleSource(
     const deployedSet = new Set(deployed);
     for (const oldSkill of oldInstalled) {
       if (!deployedSet.has(oldSkill) && !localTeamSkills.has(oldSkill)) {
-        await removeSkillFromToolPaths(oldSkill, teamConfig, localConfig);
+        await removeSkillFromToolPaths(oldSkill, teamConfig, localConfig, baseDir, oldManifest?.installedPaths?.[oldSkill]);
         log.debug(`[source:${source.name}] Removed "${oldSkill}" (no longer public)`);
+        delete installedPaths[oldSkill];
       }
     }
   }
@@ -490,6 +512,7 @@ async function pullSingleSource(
     await saveSourceManifest(source.name, {
       lastPull: new Date().toISOString(),
       installedSkills: deployed,
+      installedPaths,
     });
   }
 
@@ -505,26 +528,56 @@ async function pullSingleSource(
 // ─── Helpers ─────────────────────────────────────────────
 
 /**
+ * Explain, at `source add` time, why a source would sync 0 skills. `pull`
+ * deploys only skills a source opts into via its teamai.yaml `publicSkills`
+ * list, so a missing teamai.yaml or an empty publicSkills list means nothing
+ * is shared. Returns the warning lines to print (empty when the source is
+ * ready to share). `null` config = no teamai.yaml (or an unparseable one).
+ */
+export function sourceSyncWarnings(name: string, sourceConfig: TeamaiConfig | null): string[] {
+  if (!sourceConfig) {
+    return [
+      `Source repo "${name}" has no teamai.yaml, so it declares no public skills.`,
+      `This source will sync 0 skills until the source team adds a teamai.yaml with a publicSkills list.`,
+    ];
+  }
+  if ((sourceConfig.publicSkills?.length ?? 0) === 0) {
+    return [
+      `Source repo "${name}" has a teamai.yaml but declares no publicSkills.`,
+      `This source will sync 0 skills until the source team adds a publicSkills list to its teamai.yaml.`,
+    ];
+  }
+  return [];
+}
+
+/**
  * Derive a source name from a git remote URL.
  * Works for any host (github.com, git.woa.com, gitlab.com, etc.):
  *   - "git@github.com:teamai/skills.git"      → "teamai"
  *   - "https://github.com/teamai/skills.git"  → "teamai"
  *   - "git@git.woa.com:platform/skills.git"   → "platform"
  */
-function deriveSourceName(repoUrl: string): string | null {
-  // SSH format: git@host:owner/repo.git (or git@host:group/sub/repo.git)
-  const sshMatch = repoUrl.match(/:([^/]+)\//);
-  if (sshMatch) return sshMatch[1];
+export function deriveSourceName(repoUrl: string): string | null {
+  const trimmed = repoUrl.trim();
+  let repoPath = '';
 
-  // HTTPS format: https://host/owner/repo(.git)?
-  const httpsMatch = repoUrl.match(/\/\/[^/]+\/([^/]+)\/[^/]+?(?:\.git)?\/?$/);
-  if (httpsMatch) return httpsMatch[1];
+  if (/^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(trimmed)) {
+    try {
+      repoPath = new URL(trimmed).pathname;
+    } catch {
+      return null;
+    }
+  } else {
+    const scpMatch = trimmed.match(/^[^@\s]+@[^:\s]+:(.+)$/);
+    repoPath = scpMatch?.[1] ?? trimmed;
+  }
 
-  // Fallback: penultimate segment of the URL, stripping .git
-  const parts = repoUrl.replace(/\.git$/, '').split('/');
-  if (parts.length >= 2) return parts[parts.length - 2];
-
-  return null;
+  const segments = repoPath
+    .replace(/^\/+|\/+$/g, '')
+    .replace(/\.git$/i, '')
+    .split('/')
+    .filter(Boolean);
+  return segments.length >= 2 ? segments[0] : null;
 }
 
 /**
@@ -559,22 +612,11 @@ async function extractSkillDescription(skillDir: string): Promise<string> {
   const content = await readFileSafe(path.join(skillDir, 'SKILL.md'));
   if (!content) return '';
 
-  const match = content.match(/^---\n([\s\S]*?)\n---/);
-  if (!match) return '';
+  const { data } = parseFrontmatter(content);
+  const desc = data['description'];
+  if (!desc) return '';
 
-  const frontmatter = match[1];
-
-  // Single-line description
-  const singleMatch = frontmatter.match(/description:\s*["']?(.+?)["']?\s*$/m);
-  if (singleMatch) return singleMatch[1].trim();
-
-  // Multi-line description
-  const multiMatch = frontmatter.match(/description:\s*>-?\s*\n([\s\S]*?)(?=\n\w|\n---)/);
-  if (multiMatch) {
-    return multiMatch[1].split('\n').map((l) => l.trim()).filter((l) => l).join(' ');
-  }
-
-  return '';
+  return String(desc).replace(/\s+/g, ' ').trim();
 }
 
 /**
@@ -584,8 +626,9 @@ async function getLocalTeamSkillNames(teamConfig: TeamaiConfig, localConfig: Loc
   const handler = getHandler('skills');
   const items = await handler.scanTeamForPull(teamConfig, localConfig);
   const names = new Set(items.map((i) => i.name));
-  // Also include builtin skills
-  for (const name of BUILTIN_SKILL_NAMES) {
+  // Also include builtin skills, legacy ones too: a source-team removal must not
+  // delete a legacy tree wholesale, which only pull's ownership rule may prune.
+  for (const name of [...BUILTIN_SKILL_NAMES, ...LEGACY_BUILTIN_SKILL_NAMES]) {
     names.add(name);
   }
   return names;
@@ -594,11 +637,18 @@ async function getLocalTeamSkillNames(teamConfig: TeamaiConfig, localConfig: Loc
 /**
  * Remove a skill from all tool paths.
  */
-async function removeSkillFromToolPaths(skillName: string, teamConfig: TeamaiConfig, localConfig: LocalConfig): Promise<void> {
-  const baseDir = resolveBaseDir(localConfig);
-  for (const [tool, toolPath] of Object.entries(teamConfig.toolPaths)) {
-    if (EXPLICIT_ONLY_HOSTS.has(normalizeHostId(tool))) continue;
-    if (!toolPath.skills || !isHostSelected(localConfig, tool) || !supportsStaticResource(tool, 'skills', localConfig.scope)) continue;
+async function removeSkillFromToolPaths(skillName: string, teamConfig: TeamaiConfig, localConfig: LocalConfig, baseDir: string, installedPaths?: string[]): Promise<void> {
+  if (installedPaths) {
+    for (const installedPath of installedPaths) {
+      const skillDir = path.resolve(baseDir, installedPath);
+      assertWithinRoot(baseDir, skillDir);
+      if (await pathExists(skillDir)) await remove(skillDir);
+    }
+    return;
+  }
+
+  for (const toolPath of Object.values(scopedToolPaths(teamConfig, localConfig))) {
+    if (!toolPath.skills) continue;
     const skillDir = path.join(baseDir, toolPath.skills, skillName);
     if (await pathExists(skillDir)) {
       await remove(skillDir);
@@ -615,7 +665,7 @@ async function cleanupSourceSkills(sourceName: string, teamConfig: TeamaiConfig,
 
   const baseDir = resolveBaseDir(localConfig);
   for (const skillName of manifest.installedSkills) {
-    await removeSkillFromToolPaths(skillName, teamConfig, localConfig);
+    await removeSkillFromToolPaths(skillName, teamConfig, localConfig, baseDir, manifest.installedPaths?.[skillName]);
   }
 }
 
@@ -625,7 +675,7 @@ async function cleanupSourceSkills(sourceName: string, teamConfig: TeamaiConfig,
  */
 export async function getAllSourceSkillNames(): Promise<Set<string>> {
   const names = new Set<string>();
-  const sourcesDir = path.join(homeDir(), '.teamai', 'sources');
+  const sourcesDir = path.join(getUserHome(), '.teamai', 'sources');
   if (!await pathExists(sourcesDir)) return names;
 
   const sourceDirs = await listDirs(sourcesDir);

@@ -27,7 +27,8 @@ import {
 } from './session-collector.js';
 import { log, spinner } from './utils/logger.js';
 import { withTimeout } from './utils/async.js';
-import { SESSION_LOGS_LOCAL_DIR } from './types.js';
+import { agentSessionIdFromEnv } from './utils/session-id.js';
+import { getSessionLogsDir, usesBranchWorktree } from './types.js';
 import type { GlobalOptions, LocalConfig } from './types.js';
 
 export interface SaveSessionOptions extends GlobalOptions {
@@ -58,7 +59,7 @@ export async function saveSession(options: SaveSessionOptions): Promise<void> {
   }
 
   const sessionId =
-    options.sessionId || process.env.CLAUDE_SESSION_ID || mostRecentSessionId(events);
+    options.sessionId || (await agentSessionIdFromEnv()) || mostRecentSessionId(events);
   if (!sessionId) {
     log.error('Could not determine a session id. Pass --session-id <id>.');
     return;
@@ -75,17 +76,17 @@ export async function saveSession(options: SaveSessionOptions): Promise<void> {
     log.info(
       `[dry-run] Would record session ${sessionId.slice(0, 8)} ` +
         `(${summary.toolTotal} tools, ${summary.interventionCount} interventions, ` +
-        `valuable=${summary.valuable}) to ${SESSION_LOGS_LOCAL_DIR}/${monthKey(summary)}.md`,
+        `valuable=${summary.valuable}) to ${getSessionLogsDir()}/${monthKey(summary)}.md`,
     );
   } else {
     // Local logs live on the user's own machine, so keep the redacted prompt line.
-    const written = await appendMonthlyLog(SESSION_LOGS_LOCAL_DIR, summary, { includePrompt: true });
+    const written = await appendMonthlyLog(getSessionLogsDir(), summary, { includePrompt: true });
     if (written) {
       log.info(`Recorded session to ${written}`);
     } else {
       log.info(`Session ${sessionId.slice(0, 8)} already recorded this month.`);
     }
-    await pruneMonthlyLogs(SESSION_LOGS_LOCAL_DIR, new Date()).catch(() => []);
+    await pruneMonthlyLogs(getSessionLogsDir(), new Date()).catch(() => []);
   }
 
   if (!options.push) return;
@@ -96,20 +97,23 @@ export async function saveSession(options: SaveSessionOptions): Promise<void> {
     return;
   }
 
+  // The flag reaches the loaders: a bare load migrates the legacy role config
+  // in place, which would write under --dry-run (#850).
+  const loadOpts = { dryRun: options.dryRun };
   let localConfig: LocalConfig;
   try {
     if (options.scope === 'project') {
-      const cfg = await loadLocalConfigForScope('project', process.cwd());
+      const cfg = await loadLocalConfigForScope('project', process.cwd(), loadOpts);
       if (!cfg) {
         log.error('No project-level teamai config in the current directory.');
         return;
       }
       localConfig = cfg;
     } else if (options.scope === 'user') {
-      localConfig = (await requireInit()).localConfig;
+      localConfig = (await requireInit(loadOpts)).localConfig;
     } else {
-      const projectConfig = await detectProjectConfig();
-      localConfig = projectConfig ?? (await requireInit()).localConfig;
+      const projectConfig = await detectProjectConfig(undefined, undefined, loadOpts);
+      localConfig = projectConfig ?? (await requireInit(loadOpts)).localConfig;
     }
   } catch (e) {
     log.error(`Cannot push: ${(e as Error).message}`);
@@ -132,26 +136,31 @@ export async function saveSession(options: SaveSessionOptions): Promise<void> {
     return;
   }
 
-  // Single-repo mode: session summaries are report data → the teamai-reports
-  // orphan branch, written through an isolated worktree so main / the user's
-  // active tree is never touched.
-  if (localConfig.repo.kind === 'self') {
+  // Non-HTTP repos: session summaries are report data → the teamai-reports
+  // orphan branch, written through an isolated worktree so the default branch
+  // (and in self mode, the user's active tree) is never touched.
+  if (usesBranchWorktree(localConfig)) {
     const spin = spinner('Pushing session summary to team...').start();
     try {
-      const { ensureReportsWorktree, commitAndPushReports } = await import('./utils/reports-branch.js');
-      const wt = await ensureReportsWorktree(localConfig);
-      const teamDir = path.join(wt, 'sessions', username);
-      const written = await appendMonthlyLog(teamDir, summary, { includePrompt: options.includePrompt });
-      if (!written) {
-        spin.info('Session already present in the team log — nothing to push.');
-        return;
-      }
-      const rel = path.relative(wt, written);
+      const { updateReports } = await import('./utils/reports-branch.js');
+      let rel: string | undefined;
+      let ran = false;
       const pushed = await withTimeout(
-        commitAndPushReports(localConfig, commitMsg, [rel]),
+        updateReports(localConfig, async (wt) => {
+          ran = true;
+          const teamDir = path.join(wt, 'sessions', username);
+          const written = await appendMonthlyLog(teamDir, summary, { includePrompt: options.includePrompt });
+          if (!written) return null;
+          rel = path.relative(wt, written);
+          return { files: [rel], message: commitMsg };
+        }),
         10_000,
         'Push timeout (10s)',
       );
+      if (ran && !rel) {
+        spin.info('Session already present in the team log — nothing to push.');
+        return;
+      }
       if (pushed) spin.succeed(`Pushed: ${rel}`);
       else spin.info('Nothing new to push.');
     } catch (e) {

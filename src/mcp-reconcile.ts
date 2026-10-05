@@ -1,3 +1,6 @@
+import { usesManagedPolicy } from './host-adapters.js';
+import { EXPLICIT_ONLY_HOSTS, isHostSelected, normalizeHostId } from './host-adapters.js';
+import crypto from 'node:crypto';
 import path from 'node:path';
 import fse from 'fs-extra';
 import type {
@@ -10,8 +13,12 @@ import type {
 import {
   getMcpSharing,
   getEnvBackupPath,
+  isAgentExcluded,
+  getDataHome,
   managedMcpManifestPath,
-  resolveBaseDir,
+  managedMcpManifestKey,
+  resolveToolBaseDir,
+  scopedToolPaths,
 } from './types.js';
 import {
   detectMcpFormat,
@@ -22,9 +29,13 @@ import {
   resolvePlaceholders,
   referencedVars,
   entryHash,
+  MCP_SERVER_KEY,
   type McpFormat,
 } from './resources/mcp-format.js';
-import { parseTeamMcpServers } from './resources/mcp.js';
+import { mcpEntryReader, teamMcpToDef } from './resources/mcp.js';
+import { envEntryReader } from './resources/env.js';
+import { isToolInstalledForConfig } from './resources/base.js';
+import { reportEntryResolution, resolveEntriesFor } from './namespaced-entries.js';
 import {
   readJson,
   writeJsonAtomic,
@@ -33,7 +44,8 @@ import {
   expandHome,
 } from './utils/fs.js';
 import { log } from './utils/logger.js';
-import { EXPLICIT_ONLY_HOSTS, isHostSelected, normalizeHostId } from './host-adapters.js';
+import { loadProjectMcpManifest } from './utils/mcp-manifest.js';
+import { isOnPath, SAFE_BIN_RE, type LookPathOptions } from './utils/lookpath.js';
 
 // ─── Reconcile engine ────────────────────────────────────────
 //
@@ -57,6 +69,12 @@ export interface McpReconcileOptions {
   dryRun?: boolean;
   /** Overwrite user-owned servers that collide by name. */
   force?: boolean;
+  /**
+   * Override PATH lookup for `requires`. Production inject omits this and
+   * reads `process.env` / `process.platform`. Tests inject win32 + PATHEXT
+   * without mutating the host platform.
+   */
+  lookPath?: LookPathOptions;
 }
 
 export interface McpChange {
@@ -70,6 +88,11 @@ export interface McpReconcileResult {
   changes: McpChange[];
   /** True when any file was actually written. */
   wrote: boolean;
+  /**
+   * Set when the team's servers could not be resolved (a file that does not
+   * parse, a name twice): nothing was changed, and the reason was reported.
+   */
+  unresolved?: true;
 }
 
 // ─── Manifest ────────────────────────────────────────────────
@@ -82,10 +105,33 @@ async function readManifest(manifestPath: string): Promise<ManagedMcpManifest> {
 // ─── Secret lookup ───────────────────────────────────────────
 
 /**
- * Build the ${VAR} lookup table: process env first, then values the team's env
- * channel already wrote to <teamaiHome>/env (KEY=value per line).
+ * Build the ${VAR} lookup table: the team env variables this member receives
+ * (root plus active namespace files, the same set pull writes env.sh from),
+ * then process env on top.
+ *
+ * The installed KEY=value backup is read instead only when that set cannot be
+ * resolved (pull then keeps env.sh as it is, so MCP sees what the shell sees)
+ * or the team has no repo tree to resolve it from (HTTP mode).
  */
 export async function buildVarTable(localConfig: LocalConfig): Promise<Record<string, string>> {
+  const table: Record<string, string> = {};
+  const env = localConfig.repo.kind === 'http'
+    ? null
+    : await resolveEntriesFor(envEntryReader, localConfig);
+  if (env?.kind === 'resolved') {
+    for (const variable of env.entries) table[variable.name] = variable.entry.value;
+  } else {
+    Object.assign(table, await readEnvBackup(localConfig));
+  }
+  // process.env wins: it lets a user override a team-provided value locally.
+  for (const [k, v] of Object.entries(process.env)) {
+    if (v !== undefined) table[k] = v;
+  }
+  return table;
+}
+
+/** The KEY=value file the env channel last wrote. */
+async function readEnvBackup(localConfig: LocalConfig): Promise<Record<string, string>> {
   const table: Record<string, string> = {};
   // Must use the same path the env channel wrote (getEnvBackupPath) — self mode
   // uses env.local, not env (which is a committed directory there).
@@ -99,10 +145,6 @@ export async function buildVarTable(localConfig: LocalConfig): Promise<Record<st
       if (eq <= 0) continue;
       table[trimmed.slice(0, eq).trim()] = trimmed.slice(eq + 1).trim();
     }
-  }
-  // process.env wins: it lets a user override a team-provided value locally.
-  for (const [k, v] of Object.entries(process.env)) {
-    if (v !== undefined) table[k] = v;
   }
   return table;
 }
@@ -137,26 +179,17 @@ function policyViolation(def: McpServerDef, sharing: ReturnType<typeof getMcpSha
   return null;
 }
 
-/** An executable name — no path separators or shell metacharacters. */
-const SAFE_BIN_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
-
-/** True when every executable in `requires` is on PATH. */
-async function requirementsMet(def: McpServerDef): Promise<string | null> {
+/** True when every executable in `requires` is on PATH. Returns a reason, or null when OK. */
+function requirementsMet(def: McpServerDef, lookPath?: LookPathOptions): string | null {
   if (!def.requires?.length) return null;
-  const { execFile } = await import('node:child_process');
-  const { promisify } = await import('node:util');
-  const run = promisify(execFile);
   for (const bin of def.requires) {
-    // `requires` comes from the team repo's mcp.yaml. `command -v` runs under a
-    // shell (builtin), so an unvalidated name like `npx; rm -rf ~` would be
-    // executed. A bare executable name has no shell metacharacters, so reject
-    // anything else rather than pass it to the shell.
+    // `requires` comes from the team repo's mcp.yaml. Reject anything that is
+    // not a bare executable name so a value like `npx; rm -rf ~` is never
+    // interpolated into a PATH entry or handed to a shell.
     if (!SAFE_BIN_RE.test(bin)) {
       return `required executable "${bin}" has an invalid name`;
     }
-    try {
-      await run('command', ['-v', bin], { shell: '/bin/sh' });
-    } catch {
+    if (!isOnPath(bin, lookPath)) {
       return `required executable "${bin}" not found on PATH`;
     }
   }
@@ -185,13 +218,13 @@ export async function resolveMcpTargets(
   teamConfig: TeamaiConfig,
   localConfig: LocalConfig,
 ): Promise<McpTarget[]> {
-  const baseDir = resolveBaseDir(localConfig);
   const projectScope = localConfig.scope === 'project';
   const targets: McpTarget[] = [];
 
-  for (const [tool, paths] of Object.entries(teamConfig.toolPaths)) {
-    if (EXPLICIT_ONLY_HOSTS.has(normalizeHostId(tool))) continue;
-    if (!isHostSelected(localConfig, tool)) continue;
+  // Skills/settings/agents probe paths must reflect the active scope: OpenCode's
+  // user-scope resources live under ~/.config/opencode, not ~/.opencode.
+  for (const [tool, paths] of Object.entries(scopedToolPaths(teamConfig, localConfig))) {
+    if (usesManagedPolicy(teamConfig, localConfig) && (EXPLICIT_ONLY_HOSTS.has(normalizeHostId(tool)) || !isHostSelected(localConfig, tool))) continue;
     const format = detectMcpFormat(tool);
     if (!format) continue;
 
@@ -203,45 +236,69 @@ export async function resolveMcpTargets(
     const rel = projectScope ? paths.mcpProject : paths.mcp;
     if (!rel) continue;
 
-    const probe = paths.probe ?? paths.skills ?? paths.settings ?? paths.agents;
+    const baseDir = resolveToolBaseDir(tool, localConfig);
+    const file = path.join(baseDir, rel);
+
+    const probe = paths.skills ?? paths.settings ?? paths.agents;
     if (!probe) continue;
-    const toolRoot = path.join(baseDir, probe.split('/')[0]);
-    if (!await pathExists(toolRoot)) {
+    if (!await isToolInstalledForConfig(tool, probe, localConfig, file)) {
       log.debug(`Skipping MCP sync for ${tool}: tool not installed`);
       continue;
     }
 
-    targets.push({ tool, format, file: path.join(baseDir, rel), projectScope });
+    targets.push({ tool, format, file, projectScope });
   }
   return targets;
 }
 
 // ─── JSON target I/O ─────────────────────────────────────────
 
-interface JsonDoc {
+export interface JsonDoc {
   data: Record<string, unknown>;
   servers: Record<string, unknown>;
+  /** The existing document stores server names directly at the top level. */
+  bare: boolean;
 }
 
 /**
  * Read a JSON MCP config. Returns null when the file exists but cannot be
  * parsed — we abandon the injection rather than risk clobbering a file we do
- * not understand (it may hold the user's OAuth session).
+ * not understand (it may hold the user's OAuth session). Copilot project files
+ * additionally allow a bare top-level server map, whose shape we preserve.
  */
-async function readJsonDoc(file: string): Promise<JsonDoc | null> {
-  if (!await pathExists(file)) return { data: {}, servers: {} };
+export async function readJsonDoc(
+  file: string,
+  serverKey: string,
+  allowBare = false,
+): Promise<JsonDoc | null> {
+  if (!await pathExists(file)) return { data: {}, servers: {}, bare: false };
   const raw = await readFileSafe(file);
   if (raw === null) return null;
-  if (raw.trim() === '') return { data: {}, servers: {} };
+  if (raw.trim() === '') return { data: {}, servers: {}, bare: allowBare };
   try {
     const data = JSON.parse(raw) as Record<string, unknown>;
     if (typeof data !== 'object' || data === null || Array.isArray(data)) return null;
-    const servers = (data.mcpServers as Record<string, unknown>) ?? {};
+    const bare = allowBare && !(serverKey in data);
+    const servers = bare ? data : (data[serverKey] as Record<string, unknown>) ?? {};
     if (typeof servers !== 'object' || servers === null || Array.isArray(servers)) return null;
-    return { data, servers: { ...servers } };
+    return { data, servers: { ...servers }, bare };
   } catch {
     return null;
   }
+}
+
+/** Write a parsed JSON MCP config while preserving its original container shape. */
+export async function writeJsonDoc(
+  file: string,
+  serverKey: string,
+  doc: JsonDoc,
+): Promise<void> {
+  if (doc.bare) {
+    await writeJsonAtomic(file, doc.servers);
+    return;
+  }
+  doc.data[serverKey] = doc.servers;
+  await writeJsonAtomic(file, doc.data);
 }
 
 // ─── Codex TOML target I/O ───────────────────────────────────
@@ -251,15 +308,7 @@ async function readJsonDoc(file: string): Promise<JsonDoc | null> {
  * rest of config.toml byte-identical (comments included).
  */
 export function spliceCodexBlock(source: string, name: string, block: string | null): string {
-  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  // The block runs from its header to the next table header that is not one of
-  // its own sub-tables (e.g. [mcp_servers.<name>.env]), or to end-of-input.
-  // End-of-input must be spelled `(?![\s\S])`: JS has no \z, and under the `m`
-  // flag `$` only means end-of-line, which would truncate the match early.
-  const re = new RegExp(
-    String.raw`^\[mcp_servers\.${escaped}\]\s*$[\s\S]*?(?=^\[(?!mcp_servers\.${escaped}[.\]])|(?![\s\S]))`,
-    'm',
-  );
+  const re = codexBlockRe(name);
   const match = source.match(re);
 
   if (match) {
@@ -275,6 +324,32 @@ export function spliceCodexBlock(source: string, name: string, block: string | n
   return source + sep + block;
 }
 
+/**
+ * Matches one `[mcp_servers.<name>]` block, from its header to the next table
+ * header that is not one of its own sub-tables (e.g. [mcp_servers.<name>.env]),
+ * or to end-of-input. End-of-input must be spelled `(?![\s\S])`: JS has no `\z`,
+ * and under the `m` flag `$` only means end-of-line, which would truncate the
+ * match early.
+ */
+function codexBlockRe(name: string): RegExp {
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(
+    String.raw`^\[mcp_servers\.${escaped}\]\s*$[\s\S]*?(?=^\[(?!mcp_servers\.${escaped}[.\]])|(?![\s\S]))`,
+    'm',
+  );
+}
+
+/**
+ * The text of one `[mcp_servers.<name>]` block, trimmed to the single trailing
+ * newline `renderCodexBlock` emits so the two forms compare directly — the
+ * splice pads a written block with a blank line to separate it from the next
+ * table.
+ */
+export function codexBlockIn(source: string, name: string): string | null {
+  const match = source.match(codexBlockRe(name));
+  return match === null ? null : match[0].trimEnd() + '\n';
+}
+
 /** Extract the names of all `[mcp_servers.X]` tables present in a config.toml. */
 export function codexServerNames(source: string): string[] {
   const names = new Set<string>();
@@ -282,7 +357,149 @@ export function codexServerNames(source: string): string[] {
   return [...names];
 }
 
+// ─── Desired set ─────────────────────────────────────────────
+
+/** One team server in the rendered form that lands in a tool's own config. */
+export interface DesiredMcpEntry {
+  entry: unknown;
+  hash: string;
+  /** Codex alone stores a TOML block rather than a JSON value. */
+  block?: string;
+}
+
+/** Everything the per-server filters need, resolved once per run. */
+export interface DesiredMcpContext {
+  sharing: ReturnType<typeof getMcpSharing>;
+  excluded: Set<string>;
+  vars: Record<string, string>;
+  lookPath?: McpReconcileOptions['lookPath'];
+}
+
+export async function buildDesiredMcpContext(
+  teamConfig: TeamaiConfig,
+  localConfig: LocalConfig,
+  options: McpReconcileOptions = {},
+): Promise<DesiredMcpContext> {
+  return {
+    sharing: getMcpSharing(teamConfig),
+    excluded: new Set(localConfig.excludedSkills ?? []),
+    vars: await buildVarTable(localConfig),
+    lookPath: options.lookPath,
+  };
+}
+
+/**
+ * Which of `teamDefs` apply to `target`, rendered the way they land in the
+ * tool's config, and a skip entry naming why each of the rest does not.
+ *
+ * Exported so `doctor` can check what should have arrived without restating
+ * the filters (#624). A second copy of them is how an MCP server ends up
+ * skipped for `unresolved variable(s)` during one pull and reported as
+ * correctly delivered forever after.
+ */
+export function desiredMcpForTarget(
+  target: McpTarget,
+  teamDefs: McpServerDef[],
+  ctx: DesiredMcpContext,
+): { desired: Map<string, DesiredMcpEntry>; skipped: McpChange[] } {
+  const desired = new Map<string, DesiredMcpEntry>();
+  const skipped: McpChange[] = [];
+
+  for (const raw of teamDefs) {
+    if (raw.tools && !raw.tools.includes(target.tool)) continue;
+    if (ctx.excluded.has(raw.name)) {
+      skipped.push({ tool: target.tool, server: raw.name, action: 'skipped', reason: 'excluded by user' });
+      continue;
+    }
+    if (!supportsTransport(target.format, raw.transport)) {
+      skipped.push({
+        tool: target.tool,
+        server: raw.name,
+        action: 'skipped',
+        reason: `${target.tool} does not support ${raw.transport} transport`,
+      });
+      continue;
+    }
+    const violation = policyViolation(raw, ctx.sharing);
+    if (violation) {
+      skipped.push({ tool: target.tool, server: raw.name, action: 'skipped', reason: violation });
+      continue;
+    }
+    const missingBin = requirementsMet(raw, ctx.lookPath);
+    if (missingBin) {
+      skipped.push({ tool: target.tool, server: raw.name, action: 'skipped', reason: missingBin });
+      continue;
+    }
+
+    // Pass ${VAR} through where the tool expands it itself, so the secret
+    // never lands on disk; otherwise resolve and require every var to exist.
+    // A resolved value is written verbatim into the target file, including
+    // project-scope files that get committed — the team has opted into that
+    // by declaring the server with a ${VAR} a tool cannot expand itself.
+    const passthrough = supportsEnvExpansion(target.format, target.projectScope, raw);
+    let def = raw;
+    if (!passthrough) {
+      const { def: resolved, missing } = resolvePlaceholders(raw, ctx.vars);
+      if (missing.length > 0) {
+        skipped.push({
+          tool: target.tool,
+          server: raw.name,
+          action: 'skipped',
+          reason: `unresolved variable(s): ${missing.join(', ')}`,
+        });
+        continue;
+      }
+      def = resolved;
+    } else if (referencedVars(raw).length > 0) {
+      log.debug(`${raw.name}: passing ${referencedVars(raw).join(', ')} through to ${target.tool}`);
+    }
+
+    if (target.format === 'codex') {
+      const block = renderCodexBlock(def);
+      desired.set(raw.name, { entry: block, hash: entryHash(block), block });
+    } else {
+      const entry = renderJsonEntry(target.format, def);
+      desired.set(raw.name, { entry, hash: entryHash(entry) });
+    }
+  }
+
+  return { desired, skipped };
+}
+
+/**
+ * The MCP server entries already present in `target`'s own config file, in the
+ * same rendered form `desiredMcpForTarget` produces, or null when the file
+ * exists and cannot be parsed — the same condition that makes the write path
+ * abandon the injection rather than clobber a file it does not understand.
+ *
+ * Entries rather than names, because a name being present does not mean the
+ * team's server arrived: the appliers refuse to overwrite an entry teamai does
+ * not own, so an unrelated server of the same name leaves the key there and the
+ * team's definition undelivered. Only the value tells those two apart.
+ *
+ * Read-only. An MCP server is an entry inside a tool's config rather than a
+ * file of its own, so this, not a destination path, is what "delivered" means.
+ */
+export async function installedMcpEntries(target: McpTarget): Promise<Map<string, unknown> | null> {
+  if (target.format === 'codex') {
+    const raw = await readFileSafe(target.file);
+    if (raw === null) return new Map();
+    return new Map(codexServerNames(raw).map((name) => [name, codexBlockIn(raw, name)]));
+  }
+  const serverKey = MCP_SERVER_KEY[target.format as Exclude<McpFormat, 'codex'>];
+  const allowBare = target.format === 'copilot' && target.projectScope;
+  const doc = await readJsonDoc(target.file, serverKey, allowBare);
+  return doc === null ? null : new Map(Object.entries(doc.servers));
+}
+
 // ─── Main entry ──────────────────────────────────────────────
+
+export function mcpTargetExcluded(localConfig: LocalConfig, target: McpTarget): boolean {
+  if (!isAgentExcluded(localConfig, target.tool)) return false;
+  // tclaude has no project-scope MCP file: it reads the <root>/.mcp.json the
+  // claude target writes, so that target stays live while tclaude is enabled.
+  return !(target.projectScope && target.tool === 'claude' && !isAgentExcluded(localConfig, 'tclaude'));
+}
 
 /**
  * Reconcile one scope's tool configs to the team's desired MCP server set.
@@ -299,92 +516,66 @@ export async function reconcileMcpForConfig(
   const sharing = getMcpSharing(teamConfig);
   const removeAll = options.removeAll === true;
 
-  const teamDefs = removeAll ? [] : await parseTeamMcpServers(localConfig.repo.localPath);
+  // HTTP-mode teams have no repo tree: team MCP servers are delivered through
+  // the local-agent install_mcp channel and recorded in the same
+  // managed-mcp.json this function prunes against. Running the desired-set
+  // reconcile here would see an always-empty desired set and delete every
+  // HTTP-installed server on each session-start sync. Skip it — the explicit
+  // removeAll teardown (teamai uninstall) must still run.
+  if (localConfig.repo.kind === 'http' && !removeAll) {
+    return { changes, wrote };
+  }
+
+  let teamDefs: McpServerDef[] = [];
+  if (!removeAll) {
+    // A file that does not parse, or a server name defined twice, keeps every
+    // installed server as it is: reconciling to an empty set would remove them.
+    const resolution = await resolveEntriesFor(mcpEntryReader, localConfig);
+    reportEntryResolution(resolution);
+    if (resolution.kind === 'failed') return { changes, wrote, unresolved: true };
+    teamDefs = resolution.entries.map((entry) => teamMcpToDef(entry.entry));
+  }
   if (!removeAll && teamDefs.length > 0 && !sharing.autoApply) {
     log.info(`${teamDefs.length} team MCP server(s) available. Run \`teamai mcp inject\` to apply.`);
     return { changes, wrote };
   }
-
-  const excluded = new Set(localConfig.excludedSkills ?? []);
   const targets = await resolveMcpTargets(teamConfig, localConfig);
   if (targets.length === 0) return { changes, wrote };
 
-  const manifestPath = managedMcpManifestPath(localConfig.scope, localConfig.projectRoot);
-  const manifest = await readManifest(manifestPath);
+  const dataHome = getDataHome(localConfig);
+  const projectScope = localConfig.scope === 'project';
+  // Project scope uses a PER-WORKTREE manifest under the partition (migrating this
+  // worktree's records out of any legacy shared file on first read); user scope
+  // keeps the single global file. Either way this reconcile owns exactly one file.
+  let manifestPath: string;
+  let manifest: ManagedMcpManifest;
+  if (projectScope && localConfig.projectRoot) {
+    ({ manifestPath, manifest } = await loadProjectMcpManifest(dataHome, localConfig.projectRoot, { dryRun: options.dryRun }));
+  } else {
+    manifestPath = managedMcpManifestPath(dataHome);
+    manifest = await readManifest(manifestPath);
+  }
 
   // An empty desired set still has to run: it is how servers dropped from
   // mcp.yaml get cleaned out of the tools we previously injected them into.
   const nothingOwned = Object.values(manifest).every((r) => r.length === 0);
   if (teamDefs.length === 0 && nothingOwned) return { changes, wrote };
 
-  const vars = await buildVarTable(localConfig);
+  const desiredContext = await buildDesiredMcpContext(teamConfig, localConfig, options);
 
   for (const target of targets) {
-    const manifestKey = `${target.tool}${target.projectScope ? ':project' : ''}`;
+    // Same enabledAgents / disabledAgents gate as the other resource syncs. The
+    // manifest entry is left as is: an excluded tool is skipped, not cleaned,
+    // and `removeAll` (uninstall) still reaches every tool.
+    if (!removeAll && mcpTargetExcluded(localConfig, target)) continue;
+    const manifestKey = managedMcpManifestKey(target.tool, target.projectScope);
     const owned = manifest[manifestKey] ?? [];
     const ownedNames = new Set(owned.map((r) => r.name));
     const nextRecords: ManagedMcpRecord[] = [];
 
     // Which of this team's servers apply to this tool, and in what rendered form.
-    const desired = new Map<string, { entry: unknown; hash: string; block?: string }>();
-
-    for (const raw of teamDefs) {
-      if (raw.tools && !raw.tools.includes(target.tool)) continue;
-      if (excluded.has(raw.name)) {
-        changes.push({ tool: target.tool, server: raw.name, action: 'skipped', reason: 'excluded by user' });
-        continue;
-      }
-      if (!supportsTransport(target.format, raw.transport)) {
-        changes.push({
-          tool: target.tool,
-          server: raw.name,
-          action: 'skipped',
-          reason: `${target.tool} does not support ${raw.transport} transport`,
-        });
-        continue;
-      }
-      const violation = policyViolation(raw, sharing);
-      if (violation) {
-        changes.push({ tool: target.tool, server: raw.name, action: 'skipped', reason: violation });
-        continue;
-      }
-      const missingBin = await requirementsMet(raw);
-      if (missingBin) {
-        changes.push({ tool: target.tool, server: raw.name, action: 'skipped', reason: missingBin });
-        continue;
-      }
-
-      // Pass ${VAR} through where the tool expands it itself, so the secret
-      // never lands on disk; otherwise resolve and require every var to exist.
-      // A resolved value is written verbatim into the target file, including
-      // project-scope files that get committed — the team has opted into that
-      // by declaring the server with a ${VAR} a tool cannot expand itself.
-      const passthrough = supportsEnvExpansion(target.format, target.projectScope, raw);
-      let def = raw;
-      if (!passthrough) {
-        const { def: resolved, missing } = resolvePlaceholders(raw, vars);
-        if (missing.length > 0) {
-          changes.push({
-            tool: target.tool,
-            server: raw.name,
-            action: 'skipped',
-            reason: `unresolved variable(s): ${missing.join(', ')}`,
-          });
-          continue;
-        }
-        def = resolved;
-      } else if (referencedVars(raw).length > 0) {
-        log.debug(`${raw.name}: passing ${referencedVars(raw).join(', ')} through to ${target.tool}`);
-      }
-
-      if (target.format === 'codex') {
-        const block = renderCodexBlock(def);
-        desired.set(raw.name, { entry: block, hash: entryHash(block), block });
-      } else {
-        const entry = renderJsonEntry(target.format, def);
-        desired.set(raw.name, { entry, hash: entryHash(entry) });
-      }
-    }
+    const { desired, skipped } = desiredMcpForTarget(target, teamDefs, desiredContext);
+    changes.push(...skipped);
 
     if (target.format === 'codex') {
       wrote = await applyCodex(target, desired, ownedNames, nextRecords, changes, options) || wrote;
@@ -413,7 +604,9 @@ async function applyJson(
   changes: McpChange[],
   options: McpReconcileOptions,
 ): Promise<boolean> {
-  const doc = await readJsonDoc(target.file);
+  const serverKey = MCP_SERVER_KEY[target.format as Exclude<McpFormat, 'codex'>];
+  const allowBare = target.format === 'copilot' && target.projectScope;
+  const doc = await readJsonDoc(target.file, serverKey, allowBare);
   if (!doc) {
     log.warn(`Could not parse ${target.file} — skipping MCP injection for ${target.tool}`);
     return false;
@@ -452,8 +645,10 @@ async function applyJson(
   if (!dirty || options.dryRun) return false;
 
   // Key-level surgery: every unrelated top-level key is carried over untouched.
-  doc.data.mcpServers = doc.servers;
-  await writeJsonAtomic(target.file, doc.data);
+  // Some tools (OpenCode) key the server map under `mcp`, not `mcpServers`;
+  // writing the wrong key would strip the servers and, worse, leave a phantom
+  // empty `mcpServers` in a file the tool never reads under that name.
+  await writeJsonDoc(target.file, serverKey, doc);
   return true;
 }
 
@@ -505,4 +700,13 @@ async function applyCodex(
   await fse.chmod(tmp, 0o600);
   await fse.rename(tmp, target.file);
   return true;
+}
+
+export async function writeCodexAtomic(file: string, content: string): Promise<void> {
+  await fse.ensureDir(path.dirname(file));
+  const suffix = crypto.randomBytes(6).toString('hex');
+  const tmp = `${file}.${process.pid}.${suffix}.tmp`;
+  await fse.writeFile(tmp, content, 'utf-8');
+  await fse.chmod(tmp, 0o600);
+  await fse.rename(tmp, file);
 }

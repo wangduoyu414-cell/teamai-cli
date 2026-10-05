@@ -17,6 +17,7 @@
 export interface RepoInfo {
   owner: string;
   repo: string;
+  /** Canonical clone URL. The legacy name is retained; generic Git may return an SSH URL. */
   httpsUrl: string;
   /** URL-encoded owner/repo for API calls */
   projectId: string;
@@ -60,7 +61,7 @@ export interface OrgRepoInfo {
 }
 
 export interface GitProvider {
-  /** Provider identifier: 'github' | 'tgit' */
+  /** Registered provider identifier, e.g. 'github', 'tgit', 'cnb', or 'git'. */
   readonly name: string;
 
   // ─── URL parsing ──────────────────────────────────────
@@ -88,8 +89,9 @@ export interface GitProvider {
   // ─── Repository operations ────────────────────────────
 
   /**
-   * Clone a repo to localPath. Should embed credentials in
-   * the remote URL so subsequent git ops work without extra auth.
+   * Clone a repo to localPath. The resulting origin remote must remain usable
+   * for later pull/push operations via provider credentials, a Git credential
+   * helper, or SSH agent.
    */
   cloneRepo(repo: string, localPath: string): void;
 
@@ -131,6 +133,26 @@ export interface GitProvider {
    */
   listOrgRepos?(org: string, opts?: { maxRepos?: number }): Promise<OrgRepoInfo[]>;
 
+  /**
+   * Check whether an organization / group exists on the platform.
+   *
+   * Optional: providers whose platform exposes a cheap read-only lookup (e.g.
+   * CNB's `get-group`) implement this so `init` can detect a missing org
+   * *before* prompting to create the repo, and guide the user to create the org
+   * first. Providers that omit it fall back to the create-repo error path.
+   *
+   * @param org  organization / group path (may be a nested `group/subgroup`)
+   * @returns true if it exists, false if not found
+   * @throws Error if existence cannot be determined (e.g. network/auth failure)
+   */
+  organizationExists?(org: string): boolean;
+
+  /**
+   * Web URL where a user can create an organization on this platform, or null
+   * if there is no such page. `init` prints/opens it when the org is missing.
+   */
+  getOrganizationCreateUrl?(): string | null;
+
   // ─── Utilities ────────────────────────────────────────
 
   /**
@@ -145,5 +167,42 @@ export class RepoNotFoundError extends Error {
   constructor(repo: string) {
     super(`Repo "${repo}" not found.`);
     this.name = 'RepoNotFoundError';
+  }
+}
+
+/**
+ * Error indicating an organization / group was not found on the remote
+ * platform. Thrown by `createRepo` when the target namespace does not exist.
+ *
+ * `createUrl`, when set, is the platform's web page for creating an
+ * organization. `init` prints it so the user can create the org in the browser
+ * — CNB's CLI token cannot create organizations itself (that needs the
+ * `group-manage:rw` scope, which the device-flow login does not grant).
+ */
+export class OrganizationNotFoundError extends Error {
+  readonly org: string;
+  readonly createUrl?: string;
+  constructor(org: string, createUrl?: string) {
+    super(`Organization "${org}" not found.`);
+    this.name = 'OrganizationNotFoundError';
+    this.org = org;
+    this.createUrl = createUrl;
+  }
+}
+
+/**
+ * Error indicating the authenticated token lacks permission to create a repo
+ * (e.g. CNB requires the `group-resource:rw` scope for org repos, which the
+ * device-flow login does not grant). `createUrl`, when set, is the platform's
+ * web page for creating the repo so `init` can guide the user to the browser.
+ */
+export class RepoCreatePermissionError extends Error {
+  readonly repo: string;
+  readonly createUrl?: string;
+  constructor(repo: string, createUrl?: string) {
+    super(`No permission to create repo "${repo}".`);
+    this.name = 'RepoCreatePermissionError';
+    this.repo = repo;
+    this.createUrl = createUrl;
   }
 }

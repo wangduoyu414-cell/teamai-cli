@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
@@ -48,6 +48,35 @@ describe('builtin-rules', () => {
             const content = fs.readFileSync(deployed, 'utf-8');
             expect(content).toContain('Team Knowledge Recall');
             expect(content).toContain('teamai recall');
+        });
+
+        it('should deploy the recall rule to cursor as .mdc, not an ignored .md', async () => {
+            const cursorRulesDir = path.join(tmpDir, '.cursor', 'rules');
+            fs.mkdirSync(cursorRulesDir, { recursive: true });
+            // A copy left by the layout that predates `.mdc`.
+            fs.writeFileSync(path.join(cursorRulesDir, 'teamai-recall.md'), 'stale');
+
+            const teamConfig = {
+                toolPaths: {
+                    cursor: {
+                        skills: '.cursor/skills',
+                        rules: '.cursor/rules',
+                        settings: '.cursor/hooks.json',
+                    },
+                },
+            } as any;
+
+            const { deployBuiltinRules } = await import('../builtin-rules.js');
+            await deployBuiltinRules(teamConfig);
+
+            const mdc = path.join(cursorRulesDir, 'teamai-recall.mdc');
+            expect(fs.existsSync(mdc)).toBe(true);
+            // Cursor silently ignores a plain `.md` here, so it must not linger.
+            expect(fs.existsSync(path.join(cursorRulesDir, 'teamai-recall.md'))).toBe(false);
+            const content = fs.readFileSync(mdc, 'utf-8');
+            expect(content.startsWith('---\n')).toBe(true);
+            expect(content).toContain('alwaysApply: true');
+            expect(content).toContain('Team Knowledge Recall');
         });
 
         it('should skip tool directories that do not exist (tool not installed)', async () => {
@@ -106,6 +135,61 @@ describe('builtin-rules', () => {
         it('should contain teamai-recall', async () => {
             const { BUILTIN_RULE_NAMES } = await import('../builtin-rules.js');
             expect(BUILTIN_RULE_NAMES.has('teamai-recall')).toBe(true);
+        });
+    });
+
+    describe('enabledAgents whitelist (#510)', () => {
+        it('does not write builtin rules into an installed tool outside the whitelist', async () => {
+            const workbuddyRules = path.join(tmpDir, '.workbuddy', 'rules');
+            const hermesRules = path.join(tmpDir, '.hermes', 'rules');
+            fs.mkdirSync(workbuddyRules, { recursive: true });
+            fs.mkdirSync(hermesRules, { recursive: true });
+
+            const teamConfig = {
+                toolPaths: {
+                    workbuddy: { rules: '.workbuddy/rules' },
+                    hermes: { rules: '.hermes/rules' },
+                },
+            } as any;
+            const localConfig = {
+                repo: { localPath: path.join(tmpDir, 'repo'), remote: 'https://example.com/repo.git' },
+                username: 'testuser',
+                additionalRoles: [],
+                scope: 'user',
+                enabledAgents: ['workbuddy'],
+            } as any;
+
+            const { deployBuiltinRules } = await import('../builtin-rules.js');
+            const deployed = await deployBuiltinRules(teamConfig, localConfig);
+
+            expect(deployed).toBe(1);
+            expect(fs.existsSync(path.join(workbuddyRules, 'teamai-recall.md'))).toBe(true);
+            expect(fs.existsSync(path.join(hermesRules, 'teamai-recall.md'))).toBe(false);
+        });
+
+        it('still deploys to every installed tool when enabledAgents is unset', async () => {
+            fs.mkdirSync(path.join(tmpDir, '.workbuddy', 'rules'), { recursive: true });
+            fs.mkdirSync(path.join(tmpDir, '.hermes', 'rules'), { recursive: true });
+
+            const teamConfig = {
+                toolPaths: {
+                    workbuddy: { rules: '.workbuddy/rules' },
+                    hermes: { rules: '.hermes/rules' },
+                },
+            } as any;
+            const localConfig = {
+                repo: { localPath: path.join(tmpDir, 'repo'), remote: 'https://example.com/repo.git' },
+                username: 'testuser',
+                additionalRoles: [],
+                scope: 'user',
+            } as any;
+
+            const { deployBuiltinRules } = await import('../builtin-rules.js');
+            const deployed = await deployBuiltinRules(teamConfig, localConfig);
+
+            expect(deployed).toBe(2);
+            expect(fs.existsSync(path.join(tmpDir, '.workbuddy', 'rules', 'teamai-recall.md'))).toBe(true);
+            expect(fs.existsSync(path.join(tmpDir, '.hermes', 'rules', 'teamai-recall.md'))).toBe(true);
         });
     });
 });

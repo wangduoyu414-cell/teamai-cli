@@ -1,23 +1,182 @@
+import { prepareSelectedProjectHostRoots, normalizeHostRoots, usesManagedPolicy } from './host-adapters.js';
 import YAML from 'yaml';
 import fs from 'node:fs';
 import path from 'node:path';
-import { saveLocalConfig, loadTeamConfig, saveLocalConfigForScope, loadLocalConfigForScope, loadStateForScope, saveStateForScope } from './config.js';
-import { homeDir, prepareSelectedProjectHostRoots } from './host-adapters.js';
-import { reconcileTeamHooksForConfig } from './hooks.js';
-import { configureGitUser, initRepo, isGitRepo, getRemoteUrl } from './utils/git.js';
+import { saveLocalConfig, loadTeamConfig, saveLocalConfigForScope, loadLocalConfigForScope, loadStateForScope, saveStateForScope, resolveProjectDataHome } from './config.js';
+import { describeUnappliedTeamHooks, hasTeamaiHooks, reconcileHooks, reconcileTeamHooksForConfig } from './hooks.js';
+import { configureGitUser, initRepo, isGitRepo, getRemoteUrl, remotesMatch, redactGitCredentials, pullRepoFastForward } from './utils/git.js';
 import { pushRepoDirectly } from './utils/git.js';
-import { getProvider, detectProvider, RepoNotFoundError } from './providers/index.js';
-import { ensureDir, writeFile, pathExists, expandHome, readFileSafe, remove } from './utils/fs.js';
+import { getProvider, detectProvider, detectProviderForInit, RepoNotFoundError, OrganizationNotFoundError, RepoCreatePermissionError } from './providers/index.js';
+import { parseGenericGitExistingRemote } from './providers/git/repo-url.js';
+import { probeSelfHostedGitLab } from './providers/gitlab/probe.js';
+import { ensureDir, writeFile, writeFileAtomic, pathExists, expandHome, readFileSafe, remove } from './utils/fs.js';
+import { queueOwner, sameQueueOwner, setAsideQueueOnModeSwitch } from './utils/pending-learnings.js';
+import { dropAllSearchIndexes } from './utils/search-index.js';
+
+/**
+ * A re-init that changes the install's kind or team repository keeps the data
+ * home (git and self mode share the partition, #808; #823 item 13), and what it
+ * holds was written for the previous repository: set the queue aside and drop
+ * the search indexes, which the new install rebuilds from its own knowledge.
+ * A config that exists but cannot be read names no owner, so it counts as
+ * another. `save` writes the new config.
+ */
+async function settleModeSwitch(previous: LocalConfig | null, next: LocalConfig, save: () => Promise<void>): Promise<void> {
+  const switched = await setAsideQueueOnModeSwitch(previous, next, async () => {
+    const ownerChanged = previous
+      ? !sameQueueOwner(queueOwner(previous), queueOwner(next))
+      : fs.existsSync(path.join(getDataHome(next), 'config.yaml'));
+    if (ownerChanged) await dropAllSearchIndexes(getDataHome(previous ?? next));
+    await save();
+  });
+  if (switched.status === 'busy') {
+    log.error(
+      `Another teamai command is writing this project's queued learnings (${switched.lockPath} is held), ` +
+        'so init did not save the new config. Run init again when it finishes.',
+    );
+    process.exit(1);
+  }
+}
+
+/**
+ * Move a config that names another install out of the way, to a free
+ * `config.yaml.previous` name beside it, before init clones the new team repo
+ * where that install's clone was. If init then stops before it saves the new
+ * config, no command runs the old config against the new clone (#823 item 17):
+ * they all ask for `teamai init` instead. Nothing is deleted.
+ */
+async function moveConfigAside(configPath: string, next: LocalConfig): Promise<void> {
+  let aside = `${configPath}.previous`;
+  for (let n = 1; await pathExists(aside); n++) aside = `${configPath}.previous.${n}`;
+  await fs.promises.rename(configPath, aside);
+  log.warn(
+    `Moved ${configPath} to ${aside}: it is another install's config, and init replaces its team repo with ` +
+      `${redactGitCredentials(next.repo.remote)}. If init stops before it finishes, run it again.`,
+  );
+}
+
+/**
+ * The config {@link moveConfigAside} set aside last. An init that stopped after
+ * it (a failed clone, an unknown --role) saved no config, so the rerun reads
+ * this one for the settings a re-init carries forward instead of dropping them.
+ */
+async function loadConfigSetAside(configPath: string): Promise<LocalConfig | null> {
+  let latest: string | undefined;
+  for (let n = 0, aside = `${configPath}.previous`; await pathExists(aside); aside = `${configPath}.previous.${++n}`) latest = aside;
+  if (!latest) return null;
+  try {
+    return LocalConfigSchema.parse(YAML.parse(await readFileSafe(latest) ?? ''));
+  } catch (e) {
+    log.debug(`Not carrying settings from ${latest}: ${(e as Error).message}`);
+    return null;
+  }
+}
 import { log, spinner } from './utils/logger.js';
-import { TEAMAI_HOME, REPORTS_BRANCH, type GlobalOptions, type LocalConfig, type Scope, getTeamaiHome, getConfigPath } from './types.js';
-import { describeRoles, loadRolesManifest } from './roles.js';
-import { askQuestion, askConfirmation, askSelection, closePrompt } from './utils/prompt.js';
+import {
+  CLAUDE_TOOL_ID,
+  detectClaudeConfigRoot,
+  resolveHookScope,
+  scopedToolPaths,
+  toolRootRejection,
+  type TeamaiConfig,
+  getTeamaiHomeDir,
+  REPORTS_BRANCH,
+  type GlobalOptions,
+  type LocalConfig,
+  LocalConfigSchema,
+  ProviderNameSchema,
+  type ProviderName,
+  type Scope,
+  getTeamaiHome,
+  getConfigPath,
+  getDataHome,
+} from './types.js';
+import { getUserHome } from './utils/home.js';
+import { describeRoles, listRoleIds, loadRolesManifest, RolesManifestNotFoundError } from './roles.js';
+import { loadProjectsManifest, listProjectIds } from './projects.js';
+import { memberReadRoots, readMemberConfig, mergeMemberConfig } from './members.js';
+import { askQuestion, askConfirmation, askSelection, closePrompt, isInteractive } from './utils/prompt.js';
 import {
   normalizeAgentList,
   detectHomeInstalledAgents,
   SELF_MODE_AGENT_CHOICES,
   KNOWN_AGENTS,
 } from './known-agents.js';
+
+/**
+ * Record a relocated Claude Code configuration root into the config being
+ * written, so every later run targets the directory that Claude Code reads.
+ *
+ * `init` is the only command that reads `CLAUDE_CONFIG_DIR`. The variable lives
+ * in one shell profile, while teamai also runs from session hooks and from
+ * other terminals; resolving it on each run would make the sync target depend
+ * on who started the process. Recorded once, it is the member's own setting
+ * like `enabledAgents` — and `teamai doctor` reports it when the two drift.
+ */
+function recordClaudeConfigRoot(localConfig: LocalConfig): void {
+  // Unset is "not this shell's business"; set-but-blank is the explicit way to
+  // say the relocation is over, since nothing else can tell the two apart.
+  if (process.env.CLAUDE_CONFIG_DIR === '' && localConfig.toolRoots?.[CLAUDE_TOOL_ID]) {
+    delete localConfig.toolRoots[CLAUDE_TOOL_ID];
+    if (Object.keys(localConfig.toolRoots).length === 0) delete localConfig.toolRoots;
+    log.info('Cleared the recorded Claude Code root (CLAUDE_CONFIG_DIR is blank); Claude Code syncs to the default root again');
+    return;
+  }
+  const root = detectClaudeConfigRoot();
+  if (!root) return;
+  const rejection = toolRootRejection(root);
+  if (rejection) {
+    log.warn(`CLAUDE_CONFIG_DIR (${root}) was not recorded: ${rejection}.`);
+    return;
+  }
+  localConfig.toolRoots = { ...localConfig.toolRoots, [CLAUDE_TOOL_ID]: root };
+  log.info(`Recorded CLAUDE_CONFIG_DIR as the Claude Code root: ${root}`);
+}
+
+/**
+ * A re-init that moves the Claude root leaves the previous root's active
+ * config live: hooks keep firing in the Claude that still reads it and sync
+ * into the new root — one install split across two directories — and the
+ * managed MCP servers and the gateway credentials the local agent delivered
+ * stay in files nothing should read any more. Strip all three before the new
+ * root is saved. Skills, rules and CLAUDE.md blocks teamai wrote there are
+ * inert copies, so they are reported, not touched. Nothing happens when the
+ * root did not move, and no file is created just to be cleaned.
+ */
+async function releasePreviousClaudeRoot(
+  teamConfig: TeamaiConfig | null,
+  previous: LocalConfig | null,
+  next: LocalConfig,
+): Promise<void> {
+  if (!previous || !teamConfig) return;
+  const hookScope = resolveHookScope(next);
+  const settingsOf = (config: LocalConfig): string | undefined =>
+    scopedToolPaths(teamConfig, { ...config, scope: hookScope.scope })[CLAUDE_TOOL_ID]?.settings;
+  const before = settingsOf(previous);
+  if (!before || before === settingsOf(next)) return;
+  const oldSettings = path.join(hookScope.baseDir, before);
+  if (await pathExists(oldSettings) && await hasTeamaiHooks(oldSettings, CLAUDE_TOOL_ID, hookScope.manifestPath)) {
+    // With the manifest, so team hooks go too — removeHooks() alone keeps them.
+    await reconcileHooks(oldSettings, CLAUDE_TOOL_ID, [], { removeAll: true, manifestPath: hookScope.manifestPath });
+  }
+  if (next.scope === 'user') {
+    // The user-scope MCP file and the gateway env are addressed through the
+    // previous config, so they resolve to the old root (or ~/.claude.json).
+    const { reconcileMcpForConfig } = await import('./mcp-reconcile.js');
+    // Only Claude's file: the reconciler walks every MCP-capable tool of the
+    // config it is handed, and the other tools' servers did not move.
+    const claudeOnly = { ...teamConfig, toolPaths: { [CLAUDE_TOOL_ID]: teamConfig.toolPaths[CLAUDE_TOOL_ID] } };
+    const { changes } = await reconcileMcpForConfig(claudeOnly, previous, { removeAll: true });
+    const removed = changes.filter((c) => c.action === 'removed').length;
+    if (removed > 0) log.info(`Removed ${removed} teamai-managed MCP server(s) from the previous Claude Code root`);
+    const { releaseClaudeModelConfig } = await import('./local-agent.js');
+    await releaseClaudeModelConfig(path.dirname(oldSettings));
+  }
+  log.warn(
+    `Claude Code now syncs to ${next.toolRoots?.[CLAUDE_TOOL_ID] ?? 'the default root'}; skills, rules and CLAUDE.md `
+    + `that teamai wrote under ${path.dirname(oldSettings)} were left in place.`,
+  );
+}
 
 /** Resolve + realpath so macOS /var → /private/var (and similar) compare equal. */
 function resolveRealPath(p: string): string {
@@ -49,6 +208,13 @@ function parseRoleSelection(answer: string, max: number): number[] {
 
   return [...new Set(selections)];
 }
+
+/**
+ * The person did not pick a role at the prompt. Single-repo `init` treats this
+ * like a repo with no manifest — the role can be set later with `teamai roles
+ * set` — while every other caller lets it abort, as it always has.
+ */
+class NoRoleSelectedError extends Error {}
 
 async function promptForRoleProfile(
   repoPath: string,
@@ -88,19 +254,117 @@ async function promptForRoleProfile(
     log.info(`  ${index + 1}. ${label}`);
   });
 
-  const primaryAnswer = await askQuestion('Primary role (number): ');
-  const [primaryIndex] = parseRoleSelection(primaryAnswer, manifest.roles.length);
+  const primaryAnswer = await askQuestion('Primary role (number or comma-separated numbers, primary first): ').catch(() => {
+    throw new Error(
+      'This team repo has several roles and there is no terminal to pick one. ' +
+        `Pass --role <id> (one of: ${listRoleIds(manifest).join(', ')}).`,
+    );
+  });
+  const selectedIndexes = parseRoleSelection(primaryAnswer, manifest.roles.length);
+  const [primaryIndex, ...additionalIndexes] = selectedIndexes;
   if (!primaryIndex) {
-    throw new Error('A primary role is required.');
+    throw new NoRoleSelectedError('A primary role is required.');
   }
 
   const primaryRole = manifest.roles[primaryIndex - 1];
 
   return {
     primaryRole: primaryRole.id,
-    additionalRoles: [],
+    additionalRoles: additionalIndexes.map((index) => manifest.roles[index - 1].id),
     resourceProfileVersion: manifest.version,
   };
+}
+
+/** Reserved value for `--project`: expand to every id the manifest declares. */
+export const ALL_PROJECTS_SELECTOR = 'all';
+
+/** Dedupe while preserving order. */
+function dedupeIds(ids: readonly string[]): string[] {
+  const seen = new Set<string>();
+  return ids.filter((id) => (seen.has(id) ? false : (seen.add(id), true)));
+}
+
+/**
+ * Resolve the active logical projects for this directory from the `--project`
+ * flag. Non-interactive and non-auto: a lone project is NOT auto-activated (a
+ * member may legitimately belong to no project — see issue #375 Q1). Accepts a
+ * comma-separated list. Returns `{ projects: [] }` when no flag and no manifest,
+ * so behavior is unchanged for teams without project partitioning.
+ *
+ * The literal `all` is a reserved selector (issue #509): it expands to every id
+ * declared by `manifest/projects.yaml` and that snapshot is what gets persisted,
+ * so a monorepo keeps a single `--project all` in its onboarding docs instead of
+ * repeating the id list. It stays an EXPLICIT operator choice to activate
+ * everything, project-private learnings included — it does not introduce
+ * auto-activation, which the multi-project design deliberately avoids.
+ */
+export async function resolveActiveProjects(
+  repoPath: string,
+  projectFlag?: string,
+): Promise<Pick<LocalConfig, 'projects'>> {
+  const requested = (projectFlag ?? '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+  if (requested.length === 0) {
+    return { projects: [] };
+  }
+
+  const manifest = await loadProjectsManifest(repoPath);
+  if (!manifest) {
+    throw new Error(
+      `--project given but no projects manifest (manifest/projects.yaml) exists in the team repo.`,
+    );
+  }
+
+  const declared = listProjectIds(manifest);
+
+  if (requested.includes(ALL_PROJECTS_SELECTOR)) {
+    // `all` already covers the rest, so a mixed list is redundant at best and a
+    // typo in one of the other ids at worst — reject instead of guessing.
+    if (requested.length > 1) {
+      throw new Error(
+        `--project "${ALL_PROJECTS_SELECTOR}" already covers every declared project; ` +
+        `drop the other ids (got: ${requested.join(', ')}).`,
+      );
+    }
+
+    if (declared.length === 0) {
+      log.warn(
+        `--project "${ALL_PROJECTS_SELECTOR}" was given but manifest/projects.yaml declares no projects; ` +
+        'nothing was activated.',
+      );
+      return { projects: [] };
+    }
+
+    // A real project named `all` is shadowed by the selector. It is never
+    // silently dropped — the expansion still covers it — but it can no longer be
+    // activated on its own through this flag; `teamai projects set all` takes
+    // plain ids and still selects exactly it.
+    if (declared.includes(ALL_PROJECTS_SELECTOR)) {
+      log.warn(
+        `manifest/projects.yaml declares a project with the id "${ALL_PROJECTS_SELECTOR}", which is the ` +
+        `reserved --project selector: every project is activated (that one included). To activate only it, ` +
+        `run \`teamai projects set ${ALL_PROJECTS_SELECTOR}\`.`,
+      );
+    }
+
+    // This is a snapshot in the manifest's own order. It needs no dedupe: the
+    // manifest schema rejects duplicate ids, so listProjectIds yields each once.
+    return { projects: declared };
+  }
+
+  const validIds = new Set(declared);
+  for (const id of requested) {
+    if (!validIds.has(id)) {
+      throw new Error(
+        `Unknown project "${id}". Available projects: ${[...validIds].join(', ') || '(none)'}`,
+      );
+    }
+  }
+
+  return { projects: dedupeIds(requested) };
 }
 
 /**
@@ -193,13 +457,68 @@ export function resolveInitRepo(
   return pos ?? flag;
 }
 
+/**
+ * Validate `init --provider`: an explicit provider that replaces auto-detection
+ * (#789), so a member of a GitLab team can use plain git without a token.
+ */
+export function resolveInitProvider(raw: string | undefined): ProviderName | undefined {
+  if (raw === undefined) return undefined;
+  const parsed = ProviderNameSchema.safeParse(raw);
+  if (!parsed.success) {
+    throw new Error(
+      `Invalid --provider "${raw}". Use one of: ${ProviderNameSchema.options.join(', ')}, `
+      + 'or omit --provider to detect it from the repo URL.',
+    );
+  }
+  return parsed.data;
+}
+
+/**
+ * The provider init uses for `input`: the `--provider` choice when given, else
+ * auto-detection.
+ */
+async function selectInitProvider(input: string, forced: ProviderName | undefined): Promise<string> {
+  if (!forced) return detectProviderForInit(input);
+  // The GitLab API client targets GITLAB_URL or TEAMAI_GITLAB_HOST (default
+  // gitlab.com), not the repo URL's host, so on an unconfigured host it would
+  // send the token elsewhere.
+  if (forced === 'gitlab' && detectProvider(input) === 'git') {
+    throw new Error(
+      '--provider gitlab needs this GitLab instance configured. Set GITLAB_URL to its base URL '
+      + '(for example https://gitlab.example.com) and GITLAB_TOKEN, then run teamai init again. '
+      + 'To use your existing Git authentication without a token, pass --provider git.',
+    );
+  }
+  log.info(`Provider: ${forced} (--provider; auto-detection skipped)`);
+  return forced;
+}
+
+/**
+ * The provider a new teamai.yaml records for the whole team. `--provider git`
+ * is one member's opt-out, so the host's provider is resolved as init would
+ * without the flag. An unconfigured self-hosted GitLab stops init: recording
+ * `git` there would cost every teammate automatic merge requests.
+ */
+async function newTeamConfigProvider(input: string, providerName: string, forced: ProviderName | undefined): Promise<string> {
+  if (forced !== 'git') return providerName;
+  const detected = detectProvider(input);
+  if (detected !== 'git') return detected;
+  const gitlab = await probeSelfHostedGitLab(input);
+  if (!gitlab) return 'git';
+  throw new Error(
+    `Creating teamai.yaml records the team's provider, and ${gitlab.baseUrl} is a self-hosted GitLab `
+    + `that is not configured. Set GITLAB_URL=${gitlab.baseUrl} and run teamai init again. `
+    + '--provider git still keeps this machine on your Git authentication, without a GitLab token.',
+  );
+}
+
 function printScopeSummary(
   scope: Scope,
   projectRoot: string | undefined,
   explicit: boolean,
 ): void {
   const configPath = getConfigPath(scope, projectRoot);
-  const baseDir = scope === 'project' ? (projectRoot ?? process.cwd()) : homeDir();
+  const baseDir = scope === 'project' ? (projectRoot ?? process.cwd()) : getUserHome();
   log.info(`Scope: ${scope}${scope === 'project' ? ` (${projectRoot})` : ''}`);
   log.info(`  config    → ${configPath}`);
   log.info(`  resources → ${baseDir}/.claude/skills, ...`);
@@ -227,12 +546,10 @@ async function isInsideGitRepo(dir: string): Promise<boolean> {
  */
 export async function initHttp(
   url: string,
-  options: GlobalOptions & { scope?: string; role?: string; agent?: string | string[]; force?: boolean; token?: string; inheritUserScope?: boolean },
+  options: GlobalOptions & { scope?: string; role?: string; project?: string; agent?: string | string[]; force?: boolean; token?: string; inheritUserScope?: boolean },
 ): Promise<void> {
-  if (options.dryRun || options.plan) {
-    log.info('Plan — init would validate the HTTP source and configure local TeamAI files. No changes made.');
-    return;
-  }
+  if (options.dryRun || options.plan) { log.info('Plan — init would validate and configure TeamAI. No network or file writes performed.'); return; }
+
   const { resolveApiKey, saveApiKey, getApiKeyPath } = await import('./api-key.js');
 
   log.info('Initializing teamai (HTTP read-only consumer)...');
@@ -246,7 +563,7 @@ export async function initHttp(
     ({ scope, projectRoot, explicit, fallbackReason } = resolveInitScope(
       options.scope,
       process.cwd(),
-      homeDir(),
+      getUserHome(),
     ));
   } catch (e) {
     log.error((e as Error).message);
@@ -269,7 +586,9 @@ export async function initHttp(
   if (fallbackReason) {
     log.warn(fallbackReason);
   }
-  const teamaiHome = getTeamaiHome(scope, projectRoot);
+  const teamaiHome = scope === 'project' && projectRoot
+    ? (existingLocalConfig?.dataHome ?? await resolveProjectDataHome(projectRoot))
+    : getTeamaiHome(scope, projectRoot);
   printScopeSummary(scope, projectRoot, explicit);
 
   if (scope === 'project' && !(await isInsideGitRepo(process.cwd()))) {
@@ -277,7 +596,7 @@ export async function initHttp(
   }
 
   // Re-init guard
-  const existingConfigPath = getConfigPath(scope, projectRoot);
+  const existingConfigPath = path.join(teamaiHome, 'config.yaml');
   if (await pathExists(existingConfigPath) && !options.force) {
     const confirmed = await askConfirmation(`teamai already initialized at ${existingConfigPath}. Overwrite? [y/N] `);
     if (!confirmed) {
@@ -320,43 +639,64 @@ export async function initHttp(
     scope,
     projectRoot,
     additionalRoles: [],
+    ...(scope === 'project' ? { dataHome: teamaiHome } : {}),
     ...(inheritUserScope !== undefined ? { inheritUserScope } : {}),
-    ...(existingLocalConfig?.enabledAgents ? { enabledAgents: existingLocalConfig.enabledAgents } : {}),
-    ...(existingLocalConfig?.disabledAgents ? { disabledAgents: existingLocalConfig.disabledAgents } : {}),
-    ...(existingLocalConfig?.hostRoots ? { hostRoots: existingLocalConfig.hostRoots } : {}),
   };
   try {
     Object.assign(localConfig, await promptForRoleProfile(localPath, options.role));
   } catch (error) {
-    const msg = (error as Error).message;
-    if (!msg.includes('Roles manifest not found')) {
-      log.debug(`Role selection skipped: ${msg}`);
-    }
+    // Two cases leave the role unset on purpose: a repo with no roles manifest,
+    // and a person who skipped the prompt. Anything else — a manifest that does
+    // not parse, an unknown `--role` — must not be swallowed: a role-less config
+    // matches every role when hooks are reconciled, so it would install exactly
+    // the hooks the manifest restricts.
+    const lenient = error instanceof RolesManifestNotFoundError || error instanceof NoRoleSelectedError;
+    if (!lenient) throw error;
   }
+  Object.assign(localConfig, await resolveActiveProjects(localPath, options.project));
 
   // Persist --agent into enabledAgents (additive across runs)
   const requestedAgents = normalizeAgentList(options.agent);
   if (requestedAgents.length > 0) {
-    const prev = existingLocalConfig?.enabledAgents ?? [];
+    const existing = await loadLocalConfigForScope(scope, projectRoot);
+    const prev = existing?.enabledAgents ?? [];
     localConfig.enabledAgents = [...new Set([...prev, ...requestedAgents])];
-    localConfig.disabledAgents = (existingLocalConfig?.disabledAgents ?? []).filter((t) => !requestedAgents.includes(t));
+    localConfig.disabledAgents = (existing?.disabledAgents ?? []).filter((t) => !requestedAgents.includes(t));
   }
 
-  await ensureDir(teamaiHome);
-  prepareSelectedProjectHostRoots(localConfig);
-  if (scope === 'project') {
-    await saveLocalConfigForScope(localConfig, scope, projectRoot);
-  } else {
-    await ensureDir(TEAMAI_HOME);
-    await saveLocalConfig(localConfig);
+  // Carry the member's recorded tool roots across a re-init. `init` is
+  // re-runnable and CLAUDE_CONFIG_DIR lives in one shell profile, so a re-init
+  // from a shell that does not export it must not quietly send every later sync
+  // back to the default root. recordClaudeConfigRoot then overwrites the claude
+  // entry when the variable IS set.
+  // A project-scope config with no record of its own starts from the user-scope
+  // one: the root is a fact about this machine, and project hooks land in HOME.
+  const carriedToolRoots = existingLocalConfig?.toolRoots
+    ?? (scope === 'project' ? (await loadLocalConfigForScope('user'))?.toolRoots : undefined);
+  if (carriedToolRoots) localConfig.toolRoots = { ...carriedToolRoots };
+  if (usesManagedPolicy(await loadTeamConfig(localConfig.repo.localPath) ?? undefined, localConfig)) {
+    prepareSelectedProjectHostRoots(localConfig);
+    Object.assign(localConfig, normalizeHostRoots(localConfig));
   }
+  recordClaudeConfigRoot(localConfig);
+  await releasePreviousClaudeRoot(teamConfig, existingLocalConfig, localConfig);
+
+  await ensureDir(teamaiHome);
+  await settleModeSwitch(existingLocalConfig, localConfig, async () => {
+    if (scope === 'project') {
+      await saveLocalConfigForScope(localConfig, scope, projectRoot);
+    } else {
+      await ensureDir(getTeamaiHomeDir());
+      await saveLocalConfig(localConfig);
+    }
+  });
   log.success(`Local config saved to ${teamaiHome}/config.yaml`);
 
   // Invalidate cache so the next pull does a full sync.
   try {
-    const state = await loadStateForScope(scope, projectRoot);
+    const state = await loadStateForScope(localConfig);
     state.lastPullRev = null;
-    await saveStateForScope(state, scope, projectRoot);
+    await saveStateForScope(state, localConfig);
   } catch {
     // state may not exist yet
   }
@@ -364,7 +704,7 @@ export async function initHttp(
   // Step 5: inject hooks (built-in dispatch incl. the reporter) via the same
   // authoritative path the git init uses, so HTTP consumers behave identically.
   const filterAgents = requestedAgents.length > 0 ? requestedAgents : undefined;
-  await reconcileTeamHooksForConfig(teamConfig, localConfig, { auto: true, filterAgents });
+  await reconcileHooksForInit(teamConfig, localConfig, filterAgents);
 
   // Step 6: also initialize local-agent config so the new hook-dispatch --stdin
   // path can deliver rules/claudemd (not just skills).
@@ -381,20 +721,52 @@ export async function initHttp(
 }
 
 /**
+ * Install the hooks for a fresh init. When the team hooks do not resolve, the
+ * built-in hooks are still installed; say that the team hooks were not, so the
+ * success line that follows does not claim them.
+ */
+async function reconcileHooksForInit(
+  teamConfig: TeamaiConfig,
+  localConfig: LocalConfig,
+  filterAgents: string[] | undefined,
+): Promise<void> {
+  const reconciled = await reconcileTeamHooksForConfig(teamConfig, localConfig, { filterAgents });
+  if (!reconciled.ok) log.warn(describeUnappliedTeamHooks(reconciled));
+}
+
+/**
  * Build the .teamai/.gitignore for single-repo mode. Unlike the standalone
  * project-scope gitignore, knowledge (skills/rules/docs/learnings) is COMMITTED
- * to main here, so it must NOT be ignored. Only machine-local state, worktrees,
- * and orphan-branch report data are ignored.
+ * to main here, so it must NOT be ignored.
+ *
+ * As of P2 (issue #374) a self install's machine data (class A1 —
+ * config/state/env backup/search index/managed-mcp/resource cache) lives in the
+ * per-project partition `~/.teamai/projects/<slug>/`, NOT the repo, so it does
+ * not need ignoring at all. These entries are kept as belt-and-suspenders:
+ *  - a pre-P2 self install still has them in the repo until migration relocates
+ *    them (double-read compat window), and
+ *  - should any A1 path ever fail to route to the partition, the ignore keeps it
+ *    out of a commit rather than leaking (esp. plaintext env.local/token).
+ * `workspaces/` is NEW here — before P2 the user-scope managed-mcp.json and the
+ * per-worktree `workspaces/<id>/` tree were NOT ignored, so a self repo that ran
+ * MCP reconcile or the local agent would leak them into `git status`.
  */
 export function buildSelfModeGitignore(): string {
   return [
-    '# teamai single-repo mode — machine-local state (never commit)',
+    '# teamai single-repo mode — machine-local state (never commit).',
+    '# As of P2 this data lives in ~/.teamai/projects/<slug>/; these entries guard',
+    '# pre-P2 installs (pre-migration) and any un-relocated path.',
     'config.yaml',
+    // The temp copy an interrupted config save leaves (writeFileAtomic, #831).
+    'config.yaml.*.tmp',
     'state.json',
     'token',
+    'teamai.lock',
     '.update-lock',
     '.reports-lock',
+    '.learnings-lock',
     '.bootstrap-lock',
+    '.sync-lock',
     // NB: env/ is intentionally NOT ignored in single-repo mode — team env vars
     // (.teamai/env/env.yaml) are committed to main so `teamai push` can carry them
     // and teammates get them on clone. env.yaml holds plaintext key/value pairs, so
@@ -404,12 +776,23 @@ export function buildSelfModeGitignore(): string {
     // resolution (self mode uses this name to avoid colliding with the env/ dir).
     'env.local',
     'usage.jsonl',
+    // The usage lock, a rewrite's temp copy and the events a hook records while
+    // the lock is held (#788).
+    'usage.jsonl.*',
+    'usage.pending-*.jsonl',
     'known-skills.json',
     'search-index.json',
+    'managed-mcp.json',
+    // Per-worktree machine data (managed-mcp.json + the local-agent resource
+    // cache). Not ignored before P2 — a real leak source in self repos.
+    'workspaces/',
     'dashboard/',
-    '# git worktrees for reports (orphan branch) and knowledge PRs',
+    '# git worktrees for the reports and learnings orphan branches, and knowledge PRs',
     'reports-wt/',
+    'learnings-wt/',
     'knowledge-wt/',
+    '# contributions not published yet — machine-local until they reach the team repo',
+    'pending-learnings/',
     '# report data lives on the teamai-reports orphan branch, not on main',
     'members/',
     'sessions/',
@@ -422,14 +805,41 @@ export function buildSelfModeGitignore(): string {
   ].join('\n');
 }
 
+/** The `.gitignore` project-scope init writes beside its local config, once. */
+export function buildProjectScopeGitignore(): string {
+  return [
+    '# teamai local config (do not commit)',
+    'config.yaml',
+    // The temp copy an interrupted config save leaves (writeFileAtomic, #831).
+    'config.yaml.*.tmp',
+    'state.json',
+    'token',
+    'teamai.lock',
+    '.update-lock',
+    'env',
+    'env.sh',
+    'sessions/',
+    'dashboard/',
+    'usage.jsonl',
+    'usage.jsonl.*',
+    'usage.pending-*.jsonl',
+    'known-skills.json',
+    'learnings/',
+    'search-index.json',
+    'votes/',
+    '',
+  ].join('\n');
+}
+
 /**
- * Migrate an existing single-repo `.teamai/.gitignore` written by an older teamai
- * (≤ beta.4), which ignored `env` — that hid `.teamai/env/env.yaml` from push and
- * kept it off main. Pure (no I/O) so it can be unit-tested.
+ * Migrate an existing single-repo `.teamai/.gitignore` written by an older teamai.
+ * Early versions ignored `env`, which hid `.teamai/env/env.yaml` from push and
+ * kept it off main; later versions also predate the machine-local package lock.
+ * Pure (no I/O) so it can be unit-tested.
  *
  * Removes a standalone `env` ignore line (NOT `env.sh` / `env.local` / `env/`, and
- * not commented lines), and ensures `env.local` is ignored (the machine-local
- * backup pull now writes). Returns whether anything changed plus the new content.
+ * not commented lines), and ensures `env.local` and `teamai.lock` are ignored.
+ * Returns whether anything changed plus the new content.
  */
 export function migrateSelfModeGitignoreContent(content: string): { changed: boolean; content: string } {
   const lines = content.split('\n');
@@ -444,20 +854,30 @@ export function migrateSelfModeGitignoreContent(content: string): { changed: boo
     return true;
   });
 
-  // Ensure env.local is present (older files predate it). Insert next to env.sh if
-  // found, else append before the trailing blank/knowledge comment.
-  const hasEnvLocal = filtered.some((l) => l.trim() === 'env.local');
-  if (!hasEnvLocal) {
-    const envShIdx = filtered.findIndex((l) => l.trim() === 'env.sh');
-    if (envShIdx >= 0) {
-      filtered.splice(envShIdx + 1, 0, 'env.local');
-    } else {
-      // Append at a sensible spot: before a trailing empty line if any.
-      const lastNonEmpty = filtered.reduce((acc, l, i) => (l.trim() ? i : acc), -1);
-      filtered.splice(lastNonEmpty + 1, 0, 'env.local');
-    }
+  // Ensure an entry older files predate is present. Insert it next to the entry
+  // it belongs with when that one is there, else before a trailing blank line.
+  const ensure = (entry: string, anchor: string): void => {
+    if (filtered.some((l) => l.trim() === entry)) return;
+    const anchorIdx = filtered.findIndex((l) => l.trim() === anchor);
+    const at = anchorIdx >= 0
+      ? anchorIdx
+      : filtered.reduce((acc, l, i) => (l.trim() ? i : acc), -1);
+    filtered.splice(at + 1, 0, entry);
     changed = true;
-  }
+  };
+
+  ensure('env.local', 'env.sh');
+  ensure('teamai.lock', 'token');
+  // The learnings worktree and its lock arrived with the teamai-learnings branch
+  // (#485). Without them a contribution shows up in the business repo's git status.
+  ensure('learnings-wt/', 'reports-wt/');
+  ensure('.learnings-lock', '.reports-lock');
+  ensure('pending-learnings/', 'knowledge-wt/');
+  // The usage lock, rewrite temps and pending events arrived with the usage cap (#788).
+  ensure('usage.jsonl.*', 'usage.jsonl');
+  ensure('usage.pending-*.jsonl', 'usage.jsonl.*');
+  // config.yaml has been saved atomically, through a temp copy, since #831.
+  ensure('config.yaml.*.tmp', 'config.yaml');
 
   return { changed, content: filtered.join('\n') };
 }
@@ -477,9 +897,10 @@ export async function migrateSelfModeGitignore(localConfig: LocalConfig): Promis
     if (current === null) return; // no gitignore to migrate
     const { changed, content } = migrateSelfModeGitignoreContent(current);
     if (!changed) return;
-    await writeFile(gitignorePath, content);
+    // A full disk or a kill mid-write must not leave it partial: it also ignores `token` and `env.local`.
+    await writeFileAtomic(gitignorePath, content);
     log.info(
-      'Updated .teamai/.gitignore so team env vars (.teamai/env/env.yaml) can be shared — '
+      'Updated .teamai/.gitignore for current machine-local files — '
       + 'please `git add .teamai/.gitignore` and commit it.',
     );
   } catch (e) {
@@ -537,7 +958,7 @@ export async function promptForSelfModeAgents(options: {
   // Non-interactive when there's no TTY, or when the caller opted out of prompts
   // (--silent / --force, matching the convention in init()): mirror HOME-installed
   // tools rather than blocking on the picker.
-  if (options.silent || options.force || !process.stdin.isTTY) {
+  if (options.silent || options.force || !isInteractive()) {
     return detectHomeInstalledAgents();
   }
 
@@ -589,15 +1010,15 @@ export async function promptForSelfModeAgents(options: {
 export async function initSelfRepo(options: GlobalOptions & {
   repo?: string;
   repoPositional?: string;
+  provider?: ProviderName;
   role?: string;
+  project?: string;
   agent?: string | string[];
   force?: boolean;
   inheritUserScope?: boolean;
 }): Promise<void> {
-  if (options.dryRun || options.plan) {
-    log.info('Plan — init would prepare the single-repo TeamAI skeleton. No changes made.');
-    return;
-  }
+  if (options.dryRun || options.plan) { log.info('Plan — init would validate and configure TeamAI. No network or file writes performed.'); return; }
+
   log.info('Initializing teamai (single-repo mode)...');
 
   const cwd = process.cwd();
@@ -610,7 +1031,12 @@ export async function initSelfRepo(options: GlobalOptions & {
   }
   const businessRepoRoot = cwd;
   const teamaiHome = path.join(businessRepoRoot, '.teamai');
-  const localPath = teamaiHome; // knowledge lives under <repo>/.teamai (localPath convention)
+  const localPath = teamaiHome; // knowledge (class B) lives under <repo>/.teamai (localPath convention)
+  // P2 self slimming (issue #374): machine data (class A1 — config/state/env
+  // backup/search index/managed-mcp/resource cache) now lands in the per-project
+  // partition, NOT the repo, so `.teamai/` keeps only committed team knowledge.
+  // Attaching dataHome routes every getDataHome()-based write into the partition.
+  const partitionHome = await resolveProjectDataHome(businessRepoRoot);
 
   let inheritUserScope: boolean | undefined;
   try {
@@ -626,9 +1052,12 @@ export async function initSelfRepo(options: GlobalOptions & {
   log.info(`  knowledge → ${localPath}/{skills,rules,docs,learnings} (committed to main)`);
   log.info(`  reports   → ${REPORTS_BRANCH} orphan branch (members/sessions/votes/stats)`);
 
-  // Re-init guard
-  const existingConfigPath = getConfigPath('project', businessRepoRoot);
-  if (await pathExists(existingConfigPath)) {
+  // Re-init guard. The machine config now lives in the partition (P2), so check
+  // there; also check the legacy in-repo location so re-running init on a
+  // pre-P2 self install is still recognized as "already initialized".
+  const existingConfigPath = path.join(partitionHome, 'config.yaml');
+  const legacyConfigPath = getConfigPath('project', businessRepoRoot);
+  if ((await pathExists(existingConfigPath)) || (await pathExists(legacyConfigPath))) {
     log.warn(`teamai is already initialized (project scope) at ${existingConfigPath}`);
     if (options.force) {
       log.info('Overwriting existing config (--force)');
@@ -648,15 +1077,24 @@ export async function initSelfRepo(options: GlobalOptions & {
     process.exit(1);
     return;
   }
-  const providerName = detectProvider(remoteUrl);
+  let providerName: string;
+  try {
+    providerName = await selectInitProvider(remoteUrl, options.provider);
+  } catch (e) {
+    log.error((e as Error).message);
+    process.exit(1);
+    return;
+  }
   const provider = getProvider(providerName);
-  log.debug(`Detected provider: ${providerName} (from ${remoteUrl})`);
+  if (!options.provider) log.debug(`Detected provider: ${providerName} (from ${redactGitCredentials(remoteUrl)})`);
 
   let repoInfo;
   try {
-    repoInfo = provider.parseRepoInput(remoteUrl);
+    repoInfo = providerName === 'git'
+      ? parseGenericGitExistingRemote(remoteUrl)
+      : provider.parseRepoInput(remoteUrl);
   } catch (e) {
-    log.error(`Could not parse the business repo remote "${remoteUrl}": ${(e as Error).message}`);
+    log.error(`Could not parse the business repo remote "${redactGitCredentials(remoteUrl)}": ${(e as Error).message}`);
     process.exit(1);
     return;
   }
@@ -690,12 +1128,20 @@ export async function initSelfRepo(options: GlobalOptions & {
   // teamai.yaml carries `mode: self` so teammates auto-bootstrap after clone.
   const teamaiYamlPath = path.join(localPath, 'teamai.yaml');
   if (!await pathExists(teamaiYamlPath)) {
+    let teamProvider: string;
+    try {
+      teamProvider = await newTeamConfigProvider(remoteUrl, providerName, options.provider);
+    } catch (e) {
+      log.error((e as Error).message);
+      process.exit(1);
+      return;
+    }
     const defaultConfig = YAML.stringify({
       team: repoInfo.repo,
       mode: 'self',
       description: 'TeamAI single-repo (knowledge on main, reports on teamai-reports)',
       repo: repoInfo.httpsUrl,
-      provider: providerName,
+      provider: teamProvider,
       sharing: {
         rules: { enforced: [] },
         docs: { localDir: './.teamai/docs' },
@@ -712,43 +1158,67 @@ export async function initSelfRepo(options: GlobalOptions & {
     return;
   }
 
-  // Step 4: assemble local config (kind: self).
-  const existingLocalConfig = await loadLocalConfigForScope('project', businessRepoRoot);
+  // Step 4: assemble local config (kind: self). dataHome points at the partition
+  // so config/state and every other class-A1 write lands outside the repo (P2);
+  // repo.localPath stays <repo>/.teamai — that is the class-B knowledge anchor.
   const localConfig: LocalConfig = {
     repo: { localPath, remote: repoInfo.httpsUrl, kind: 'self', businessRepoRoot },
     username,
+    ...(options.provider ? { provider: options.provider } : {}),
     scope: 'project',
     projectRoot: businessRepoRoot,
+    dataHome: partitionHome,
     additionalRoles: [],
     ...(inheritUserScope !== undefined ? { inheritUserScope } : {}),
-    ...(existingLocalConfig?.enabledAgents ? { enabledAgents: existingLocalConfig.enabledAgents } : {}),
-    ...(existingLocalConfig?.disabledAgents ? { disabledAgents: existingLocalConfig.disabledAgents } : {}),
-    ...(existingLocalConfig?.hostRoots ? { hostRoots: existingLocalConfig.hostRoots } : {}),
   };
   try {
     Object.assign(localConfig, await promptForRoleProfile(localPath, options.role));
   } catch (error) {
-    const msg = (error as Error).message;
-    if (!msg.includes('Roles manifest not found')) {
-      log.debug(`Role selection skipped: ${msg}`);
-    }
+    // Two cases leave the role unset on purpose: a repo with no roles manifest,
+    // and a person who skipped the prompt. Anything else — a manifest that does
+    // not parse, an unknown `--role` — must not be swallowed: a role-less config
+    // matches every role when hooks are reconciled, so it would install exactly
+    // the hooks the manifest restricts.
+    const lenient = error instanceof RolesManifestNotFoundError || error instanceof NoRoleSelectedError;
+    if (!lenient) throw error;
   }
+  Object.assign(localConfig, await resolveActiveProjects(localPath, options.project));
   // Which AI tools to set up in this repo (create skills dir + inject hooks +
   // commit their settings.json). Resolved from --agent, else HOME detection
   // (non-interactive), else an interactive picker. Written to enabledAgents,
   // which drives seedSelfModeToolDirs and hook injection alike.
+  const existingSelfConfig = await loadLocalConfigForScope('project', businessRepoRoot);
   const selectedAgents = await promptForSelfModeAgents(options);
   if (selectedAgents.length > 0) {
-    const prev = existingLocalConfig?.enabledAgents ?? [];
+    const prev = existingSelfConfig?.enabledAgents ?? [];
     localConfig.enabledAgents = [...new Set([...prev, ...selectedAgents])];
-    localConfig.disabledAgents = (existingLocalConfig?.disabledAgents ?? []).filter((t) => !selectedAgents.includes(t));
+    localConfig.disabledAgents = (existingSelfConfig?.disabledAgents ?? []).filter((t) => !selectedAgents.includes(t));
   }
 
-  // Step 5: write local config + single-repo gitignore.
+  // Carry the member's recorded tool roots across a re-init. `init` is
+  // re-runnable and CLAUDE_CONFIG_DIR lives in one shell profile, so a re-init
+  // from a shell that does not export it must not quietly send every later sync
+  // back to the default root. recordClaudeConfigRoot then overwrites the claude
+  // entry when the variable IS set.
+  if (existingSelfConfig?.toolRoots) localConfig.toolRoots = { ...existingSelfConfig.toolRoots };
+  if (usesManagedPolicy(await loadTeamConfig(localConfig.repo.localPath) ?? undefined, localConfig)) {
+    prepareSelectedProjectHostRoots(localConfig);
+    Object.assign(localConfig, normalizeHostRoots(localConfig));
+  }
+  recordClaudeConfigRoot(localConfig);
+
+  // Step 5: write local config (into the partition via dataHome) + single-repo
+  // gitignore. ensureDir both the knowledge dir (class B, in the repo) and the
+  // partition (class A1 machine data). saveLocalConfigForScope writes through
+  // getDataHome, which now resolves to the partition.
   await ensureDir(teamaiHome);
-  prepareSelectedProjectHostRoots(localConfig);
-  await saveLocalConfigForScope(localConfig, 'project', businessRepoRoot);
-  log.success(`Local config saved to ${teamaiHome}/config.yaml`);
+  await ensureDir(partitionHome);
+  await settleModeSwitch(existingSelfConfig, localConfig, () =>
+    saveLocalConfigForScope(localConfig, 'project', businessRepoRoot));
+  log.success(`Local config saved to ${partitionHome}/config.yaml`);
+  // (Pre-P2 this retired any stale partition config so detection fell back to the
+  // in-repo self config. P2 makes self USE the partition, so there is nothing to
+  // retire — the config we just wrote there is the authoritative one.)
 
   const gitignorePath = path.join(teamaiHome, '.gitignore');
   await writeFile(gitignorePath, buildSelfModeGitignore());
@@ -771,7 +1241,7 @@ export async function initSelfRepo(options: GlobalOptions & {
   // settings file exists on disk and can be committed to main below. This is what
   // makes a teammate's fresh clone carry the session-start hook that triggers the
   // self-heal bootstrap — the core of "clone = initialized".
-  await reconcileTeamHooksForConfig(teamConfig, localConfig, { auto: true, filterAgents });
+  await reconcileHooksForInit(teamConfig, localConfig, filterAgents);
 
   // Step 5.5: commit the .teamai/ knowledge skeleton + selected tools' hook
   // settings to the current branch. Single-repo mode keeps knowledge on main, and
@@ -818,23 +1288,37 @@ export async function initSelfRepo(options: GlobalOptions & {
     }
   }
 
-  // Step 6: register member on the reports orphan branch (never touches main / active tree).
-  if (!options.dryRun && teamConfig.sharing.registration?.autoRegister !== false) {
+  // Step 6: registration respects the team's existing privacy policy.
+  if (!options.dryRun && (await loadTeamConfig(localConfig.repo.localPath))?.sharing.registration?.autoRegister !== false) {
     try {
-      const { ensureReportsWorktree, commitAndPushReports } = await import('./utils/reports-branch.js');
-      const wt = await ensureReportsWorktree(localConfig);
-      const memberDir = path.join(wt, 'members');
-      await ensureDir(memberDir);
-      const memberPath = path.join(memberDir, `${username}.yaml`);
-      if (!await pathExists(memberPath)) {
-        await writeFile(memberPath, YAML.stringify({
+      const { updateReports } = await import('./utils/reports-branch.js');
+      let isNewSelfMember = false;
+      let selfMemberChanged = false;
+      const pushed = await updateReports(localConfig, async (wt) => {
+        const memberDir = path.join(wt, 'members');
+        await ensureDir(memberDir);
+        const memberPath = path.join(memberDir, `${username}.yaml`);
+        isNewSelfMember = !await pathExists(memberPath);
+        const existingSelfMember = await readMemberConfig(memberReadRoots(wt, localConfig), username);
+        const merged = mergeMemberConfig(existingSelfMember, {
           username,
-          displayName: username,
-          registeredAt: new Date().toISOString(),
-        }));
-        const pushed = await commitAndPushReports(localConfig, `[teamai] Register member: ${username}`, ['members/']);
+          projects: localConfig.projects,
+        });
+        selfMemberChanged = merged.changed;
+        if (!merged.changed) return null;
+        await writeFile(memberPath, YAML.stringify(merged.config));
+        return {
+          files: ['members/'],
+          message: isNewSelfMember
+            ? `[teamai] Register member: ${username}`
+            : `[teamai] Update member roster: ${username}`,
+        };
+      });
+      if (selfMemberChanged) {
         if (pushed) {
-          log.success('Member registered on the teamai-reports branch');
+          log.success(isNewSelfMember
+            ? 'Member registered on the teamai-reports branch'
+            : 'Member roster updated on the teamai-reports branch');
         } else {
           log.warn('Member registration could not be pushed (no write access?). You are still set up locally.');
         }
@@ -846,9 +1330,9 @@ export async function initSelfRepo(options: GlobalOptions & {
 
   // Step 6.5: invalidate pull cache so next pull does a full sync.
   try {
-    const state = await loadStateForScope('project', businessRepoRoot);
+    const state = await loadStateForScope(localConfig);
     state.lastPullRev = null;
-    await saveStateForScope(state, 'project', businessRepoRoot);
+    await saveStateForScope(state, localConfig);
   } catch {
     // state may not exist yet
   }
@@ -869,20 +1353,52 @@ export async function initSelfRepo(options: GlobalOptions & {
   closePrompt();
 }
 
+/**
+ * Tell the user a resource (organization or repo) must be created on the
+ * platform's website, then let the caller exit. The CLI token often can't
+ * perform these writes (e.g. CNB needs `group-manage:rw` for orgs and
+ * `group-resource:rw` for repos, neither granted by the login flow), so we
+ * print the create page URL and stop rather than failing obscurely.
+ *
+ * @param kind  human-readable resource name, e.g. "organization" or "repo"
+ * @param name  the resource identifier being created (org path or owner/repo)
+ * @param url   the platform's web create page, or null if none is known
+ */
+function guideWebCreation(kind: string, name: string, url: string | null): void {
+  log.info(`${kind} "${name}" can't be created from the CLI (insufficient token permission).`);
+  if (url) {
+    log.info(`Create it here, then re-run this command:`);
+    log.info(`  ${url}`);
+  } else {
+    log.info(`Create the ${kind} on the platform, then re-run this command.`);
+  }
+}
+
 export async function init(options: GlobalOptions & {
   repo?: string;
   repoPositional?: string;
   scope?: string;
   role?: string;
+  project?: string;
   agent?: string | string[];
   force?: boolean;
   http?: string;
   token?: string;
   inheritUserScope?: boolean;
   self?: boolean;
+  provider?: string;
 }): Promise<void> {
-  if (options.dryRun || options.plan) {
-    log.info('Plan — init would validate the repository and configure TeamAI. No changes made.');
+  if (options.dryRun || options.plan) { log.info('Plan — init would validate and configure TeamAI. No network or file writes performed.'); return; }
+
+  let forcedProvider: ProviderName | undefined;
+  try {
+    forcedProvider = resolveInitProvider(options.provider);
+    if (forcedProvider && options.http) {
+      throw new Error('--provider cannot be combined with --http: an HTTP team repo has no git provider.');
+    }
+  } catch (e) {
+    log.error((e as Error).message);
+    process.exit(1);
     return;
   }
   if (options.http) {
@@ -893,7 +1409,7 @@ export async function init(options: GlobalOptions & {
   // the teamai-reports orphan branch. No separate team repo is cloned.
   const repoArg = (options.repoPositional ?? options.repo ?? '').trim();
   if (options.self || repoArg === '.') {
-    return initSelfRepo(options);
+    return initSelfRepo({ ...options, provider: forcedProvider });
   }
   log.info('Initializing teamai...');
 
@@ -906,7 +1422,7 @@ export async function init(options: GlobalOptions & {
     ({ scope, projectRoot, explicit, fallbackReason } = resolveInitScope(
       options.scope,
       process.cwd(),
-      homeDir(),
+      getUserHome(),
     ));
   } catch (e) {
     log.error((e as Error).message);
@@ -914,12 +1430,20 @@ export async function init(options: GlobalOptions & {
     return;
   }
   const existingLocalConfig = await loadLocalConfigForScope(scope, projectRoot);
+  const teamaiHome = scope === 'project' && projectRoot
+    ? (existingLocalConfig?.dataHome ?? await resolveProjectDataHome(projectRoot))
+    : getTeamaiHome(scope, projectRoot);
+  const existingConfigPath = path.join(teamaiHome, 'config.yaml');
+  // The settings this re-init carries forward: the live config's, or, when an
+  // init stopped after moving it aside, the one it set aside (#823 item 17).
+  const carriedConfig = existingLocalConfig
+    ?? (await pathExists(existingConfigPath) ? null : await loadConfigSetAside(existingConfigPath));
   let inheritUserScope: boolean | undefined;
   try {
     inheritUserScope = resolveInheritUserScope(
       scope,
       options.inheritUserScope,
-      existingLocalConfig?.inheritUserScope,
+      carriedConfig?.inheritUserScope,
     );
   } catch (e) {
     log.error((e as Error).message);
@@ -929,7 +1453,6 @@ export async function init(options: GlobalOptions & {
   if (fallbackReason) {
     log.warn(fallbackReason);
   }
-  const teamaiHome = getTeamaiHome(scope, projectRoot);
   printScopeSummary(scope, projectRoot, explicit);
 
   if (scope === 'project' && !(await isInsideGitRepo(process.cwd()))) {
@@ -937,7 +1460,6 @@ export async function init(options: GlobalOptions & {
   }
 
   // Step 0.5: Re-init guard — warn if config already exists
-  const existingConfigPath = getConfigPath(scope, projectRoot);
   if (await pathExists(existingConfigPath)) {
     log.warn(`teamai is already initialized for ${scope} scope at ${existingConfigPath}`);
     if (options.force) {
@@ -961,17 +1483,27 @@ export async function init(options: GlobalOptions & {
     return;
   }
   if (!repoInput) {
-    repoInput = await askQuestion('Team repo (e.g. yourteam/yourproject or https://github.com/org/repo): ');
+    // Without a terminal the prompt rejects; fall through to the error below.
+    repoInput = await askQuestion(
+      'Team repo (e.g. yourteam/yourproject or https://github.com/org/repo): ',
+    ).catch(() => '');
   }
   if (!repoInput) {
-    log.error('Repo is required');
+    log.error('Repo is required. Pass it as the argument (`teamai init <owner/repo | url>`) or with --repo.');
     process.exit(1);
   }
 
   // Step 1b: Detect and initialize provider from URL
-  const providerName = detectProvider(repoInput);
+  let providerName: string;
+  try {
+    providerName = await selectInitProvider(repoInput, forcedProvider);
+  } catch (e) {
+    log.error((e as Error).message);
+    process.exit(1);
+    return;
+  }
   const provider = getProvider(providerName);
-  log.debug(`Detected provider: ${providerName}`);
+  if (!forcedProvider) log.debug(`Detected provider: ${providerName}`);
 
   let repoInfo;
   try {
@@ -984,16 +1516,17 @@ export async function init(options: GlobalOptions & {
   // Step 2: Ensure provider tools are installed and authenticate
   await provider.ensureInstalled();
 
-  const authSpin = spinner('Checking authentication...').start();
+  const isGenericGit = provider.name === 'git';
+  const authSpin = spinner(isGenericGit ? 'Checking Git identity...' : 'Checking authentication...').start();
   let username: string;
   try {
     if (provider.isAuthenticated()) {
       username = await provider.authenticate();
-      authSpin.succeed(`Authenticated as ${username}`);
+      authSpin.succeed(isGenericGit ? `Using Git identity ${username}` : `Authenticated as ${username}`);
     } else {
-      authSpin.info('Not logged in — starting authentication');
+      authSpin.info(isGenericGit ? 'Resolving Git identity' : 'Not logged in — starting authentication');
       username = await provider.authenticate();
-      log.success(`Authenticated as ${username}`);
+      log.success(isGenericGit ? `Using Git identity ${username}` : `Authenticated as ${username}`);
     }
   } catch (e) {
     authSpin.fail(`Authentication failed: ${(e as Error).message}`);
@@ -1003,10 +1536,78 @@ export async function init(options: GlobalOptions & {
   // Step 3: Clone or link repo
   const defaultLocalPath = path.join(teamaiHome, 'team-repo');
   const localPath = expandHome(defaultLocalPath);
+  // The clone init uses is another install's than the config beside it, whether
+  // it clones it now or reuses one an earlier init left: settle that install
+  // now, as the config save below would, instead of leaving its config to run
+  // against this clone should init stop first.
+  const settleReplacedInstall = async (): Promise<void> => {
+    const next: LocalConfig = {
+      repo: { localPath, remote: repoInfo.httpsUrl },
+      username,
+      scope,
+      projectRoot,
+      additionalRoles: [],
+      ...(scope === 'project' ? { dataHome: teamaiHome } : {}),
+    };
+    const replacesAnother = existingLocalConfig
+      ? !sameQueueOwner(queueOwner(existingLocalConfig), queueOwner(next))
+      : await pathExists(existingConfigPath);
+    if (replacesAnother) await settleModeSwitch(existingLocalConfig, next, () => moveConfigAside(existingConfigPath, next));
+  };
 
   if (await pathExists(localPath)) {
     if (await isGitRepo(localPath)) {
-      log.info(`Repo already exists at ${localPath}, using existing clone`);
+      // Reuse only when the existing clone points at the SAME repo. A leftover
+      // clone from a different team repo would otherwise be reused silently,
+      // surfacing the wrong roles/skills (issue: re-init against a new --repo
+      // kept serving the old clone's manifest). Compare ignoring credentials,
+      // protocol, and .git suffix.
+      const existingRemote = await getRemoteUrl(localPath);
+      if (existingRemote && !remotesMatch(existingRemote, repoInfo.httpsUrl)) {
+        log.warn(
+          `Existing clone at ${localPath} points at a different repo ` +
+          `(${redactGitCredentials(existingRemote)}), not ${repoInfo.httpsUrl}.`,
+        );
+        if (options.force) {
+          log.info('Replacing it with a fresh clone (--force)');
+          await remove(localPath);
+        } else {
+          const confirmed = await askConfirmation(
+            'Remove it and clone the requested repo? [y/N] ',
+          );
+          if (!confirmed) {
+            log.error(
+              'Aborted. The cached clone belongs to a different repo. ' +
+              `Remove ${localPath} manually or re-run with --force to replace it.`,
+            );
+            process.exit(1);
+            return;
+          }
+          await remove(localPath);
+        }
+      } else {
+        log.info(`Repo already exists at ${localPath}, using existing clone`);
+        await settleReplacedInstall();
+        // Refresh before resolveActiveProjects so selectors like `--project all`
+        // expand against the current remote manifest, not a stale local snapshot
+        // (re-running init after a new project is added would otherwise keep the
+        // old project list — see PR #518 review).
+        try {
+          // Non-destructive refresh only: never reset --hard from init (would
+          // discard local commits / tracked edits on an ordinary re-init).
+          const pullResult = await pullRepoFastForward(localPath);
+          if (pullResult !== 'already up to date') {
+            log.info(`Refreshed existing clone (${pullResult})`);
+          }
+        } catch (e) {
+          log.error(
+            `Failed to refresh existing clone at ${localPath}: ${(e as Error).message}. ` +
+            'The local clone was left unchanged. Fix network/auth or resolve ' +
+            `divergence (commit/stash local edits), or remove ${localPath} manually to start fresh.`,
+          );
+          process.exit(1);
+        }
+      }
     } else {
       // The path exists but isn't a git repo — typically a leftover from a
       // previous non-git source (e.g. an HTTP repo). Reusing it would make the
@@ -1020,13 +1621,41 @@ export async function init(options: GlobalOptions & {
   }
 
   if (!await pathExists(localPath)) {
+    await settleReplacedInstall();
+
     const cloneSpin = spinner('Cloning team repo...').start();
+    const cloneTarget = provider.name === 'git'
+      ? repoInfo.httpsUrl
+      : `${repoInfo.owner}/${repoInfo.repo}`;
     try {
-      provider.cloneRepo(`${repoInfo.owner}/${repoInfo.repo}`, localPath);
+      provider.cloneRepo(cloneTarget, localPath);
       cloneSpin.succeed('Team repo cloned');
     } catch (e) {
       if (e instanceof RepoNotFoundError) {
         cloneSpin.info(`Repo ${repoInfo.owner}/${repoInfo.repo} does not exist`);
+        // Before offering to create the repo, check the owning organization
+        // exists. Creating a repo under a missing org fails anyway, and the CLI
+        // token cannot create an org, so detect it up front and guide the user
+        // to the web UI instead of a confusing create-repo failure.
+        if (typeof provider.organizationExists === 'function') {
+          let orgMissing = false;
+          try {
+            orgMissing = !provider.organizationExists(repoInfo.owner);
+          } catch (checkErr) {
+            // Existence couldn't be determined (network/auth) — fall through to
+            // the normal create flow rather than blocking on an unknown.
+            log.debug(`Organization check failed: ${(checkErr as Error).message}`);
+          }
+          if (orgMissing) {
+            cloneSpin.info(`Organization "${repoInfo.owner}" does not exist`);
+            guideWebCreation(
+              'organization',
+              repoInfo.owner,
+              provider.getOrganizationCreateUrl?.() ?? null,
+            );
+            process.exit(1);
+          }
+        }
         const confirmed = await askConfirmation(
           `Create repo ${repoInfo.owner}/${repoInfo.repo}? [Y/n] `,
           true,
@@ -1040,6 +1669,20 @@ export async function init(options: GlobalOptions & {
           await provider.createRepo(repoInfo.owner, repoInfo.repo);
           createSpin.succeed(`Repo ${repoInfo.owner}/${repoInfo.repo} created`);
         } catch (ce) {
+          if (ce instanceof OrganizationNotFoundError) {
+            // Reached when org existence couldn't be pre-checked (provider has no
+            // check, or the check errored). Guide to the web UI and stop.
+            createSpin.fail(`Organization "${ce.org}" does not exist`);
+            guideWebCreation('organization', ce.org, ce.createUrl ?? null);
+            process.exit(1);
+          }
+          if (ce instanceof RepoCreatePermissionError) {
+            // The token cannot create the repo (e.g. CNB group-resource:rw).
+            // Guide the user to create it in the browser instead.
+            createSpin.fail(`No permission to create repo "${ce.repo}" from the CLI`);
+            guideWebCreation('repo', ce.repo, ce.createUrl ?? null);
+            process.exit(1);
+          }
           const msg = (ce as Error).message;
           if (/already been taken|already exists/i.test(msg)) {
             // Repo already exists — not fatal; fall through to retry the clone.
@@ -1052,7 +1695,7 @@ export async function init(options: GlobalOptions & {
         // Retry clone after creation
         const retryCloneSpin = spinner('Cloning newly created repo...').start();
         try {
-          provider.cloneRepo(`${repoInfo.owner}/${repoInfo.repo}`, localPath);
+          provider.cloneRepo(cloneTarget, localPath);
           retryCloneSpin.succeed('Team repo cloned');
         } catch (ce) {
           retryCloneSpin.fail(`Clone failed: ${(ce as Error).message}`);
@@ -1086,13 +1729,22 @@ export async function init(options: GlobalOptions & {
   // Remote teamai.yaml.scope (if present) is ignored — local install location
   // is decided only by --scope / default (issue #250).
   const teamConfig = await loadTeamConfig(localPath);
+  const createdSkeleton = !teamConfig;
   if (!teamConfig) {
     log.warn('teamai.yaml not found in repo. Creating default config...');
+    let teamProvider: string;
+    try {
+      teamProvider = await newTeamConfigProvider(repoInput, providerName, forcedProvider);
+    } catch (e) {
+      log.error((e as Error).message);
+      process.exit(1);
+      return;
+    }
     const defaultConfig = YAML.stringify({
       team: 'my-team',
       description: 'TeamAI shared resources',
       repo: repoInfo.httpsUrl,
-      provider: providerName,
+      provider: teamProvider,
       sharing: {
         rules: { enforced: [] },
         docs: { localDir: scope === 'project' ? './.teamai/docs' : '~/.teamai/docs' },
@@ -1101,7 +1753,8 @@ export async function init(options: GlobalOptions & {
     });
     await writeFile(path.join(localPath, 'teamai.yaml'), defaultConfig);
 
-    // Create standard directories
+    // Knowledge-tree skeleton on the default branch so an empty remote has a
+    // committable HEAD. Member YAML files go to teamai-reports, not here.
     for (const dir of ['members', 'skills', 'rules', 'docs', 'env']) {
       await ensureDir(path.join(localPath, dir));
       const gitkeep = path.join(localPath, dir, '.gitkeep');
@@ -1111,45 +1764,100 @@ export async function init(options: GlobalOptions & {
     }
   }
 
-  // Step 5: Create member file unless registration is explicitly disabled.
-  const registrationEnabled = teamConfig?.sharing.registration?.autoRegister !== false;
-  const memberPath = path.join(localPath, 'members', `${username}.yaml`);
-  const isNewMember = registrationEnabled && !await pathExists(memberPath);
-  if (registrationEnabled && isNewMember) {
-    const memberYaml = YAML.stringify({
-      username,
-      displayName: username,
-      registeredAt: new Date().toISOString(),
-    });
-    await writeFile(memberPath, memberYaml);
-    log.success(`Registered as team member: ${username}`);
+  // Resolve active projects (non-interactive: --project flag only) so the roster
+  // records project membership. Role selection stays in its original place below
+  // (it may prompt) — the member file's project membership is the P3 goal here.
+  let resolvedProjects: string[] = [];
+  try {
+    resolvedProjects = (await resolveActiveProjects(localPath, options.project)).projects ?? [];
+  } catch (error) {
+    // A bad --project is a user error on the main init path: fail loudly.
+    log.error((error as Error).message);
+    process.exit(1);
+  }
 
-    if (!options.dryRun) {
-      try {
-        await pushRepoDirectly(localPath, `[teamai] Register member: ${username}`, [
-          'members/',
-          'teamai.yaml',
-          'skills/.gitkeep',
-          'rules/.gitkeep',
-          'docs/.gitkeep',
-          'env/.gitkeep',
-        ]);
-        log.success('Member registration pushed to team repo');
-      } catch (e) {
-        log.warn(`Push failed (you can push manually later): ${(e as Error).message}`);
-      }
+  const reportsConfig: LocalConfig = {
+    repo: { localPath, remote: repoInfo.httpsUrl },
+    username,
+    scope,
+    projectRoot,
+    additionalRoles: [],
+  };
+
+  // Empty-repo exception: a one-time skeleton push of teamai.yaml + gitkeeps may
+  // still land on the default branch so the knowledge tree exists. Member files
+  // after that go to teamai-reports.
+  if (createdSkeleton && !options.dryRun) {
+    try {
+      await pushRepoDirectly(localPath, '[teamai] Initialize team repo skeleton', [
+        'teamai.yaml',
+        'skills/.gitkeep',
+        'rules/.gitkeep',
+        'docs/.gitkeep',
+        'env/.gitkeep',
+        'members/.gitkeep',
+      ]);
+    } catch (e) {
+      log.warn(`Push failed (you can push manually later): ${(e as Error).message}`);
     }
-  } else if (registrationEnabled) {
-    log.info(`Member ${username} already registered`);
+  }
+
+  // Step 5: member roster on the teamai-reports orphan branch (never the
+  // default branch). The clone's leftover members/ is a read-only inherited
+  // root: the merge below absorbs the member's pre-switch file.
+  let isNewMember = true;
+  if (!options.dryRun && (await loadTeamConfig(localPath))?.sharing.registration?.autoRegister !== false) {
+    try {
+      const { updateReports } = await import('./utils/reports-branch.js');
+      let memberChanged = false;
+      let memberProjects: string[] | undefined;
+      const pushed = await updateReports(reportsConfig, async (wt) => {
+        const memberDir = path.join(wt, 'members');
+        await ensureDir(memberDir);
+        const memberPath = path.join(memberDir, `${username}.yaml`);
+        isNewMember = !await pathExists(memberPath);
+        const existingMember = await readMemberConfig(memberReadRoots(wt, reportsConfig), username);
+        const merged = mergeMemberConfig(existingMember, {
+          username,
+          projects: resolvedProjects,
+        });
+        memberChanged = merged.changed;
+        memberProjects = merged.config.projects;
+        if (!merged.changed) return null;
+        await writeFile(memberPath, YAML.stringify(merged.config));
+        return {
+          files: ['members/'],
+          message: isNewMember
+            ? `[teamai] Register member: ${username}`
+            : `[teamai] Update member roster: ${username}`,
+        };
+      });
+      if (memberChanged) {
+        log.success(isNewMember
+          ? `Registered as team member: ${username}`
+          : `Updated member roster: ${username}${memberProjects ? ` (projects: ${memberProjects.join(', ')})` : ''}`);
+        if (pushed) {
+          log.success(isNewMember
+            ? 'Member registered on the teamai-reports branch'
+            : 'Member roster updated on the teamai-reports branch');
+        } else {
+          log.warn('Member registration could not be pushed (no write access?). You are still set up locally.');
+        }
+      } else if (!isNewMember) {
+        log.info(`Member ${username} already registered`);
+      }
+    } catch (e) {
+      log.warn(`Member registration skipped (non-blocking): ${(e as Error).message}`);
+    }
   } else {
-    log.info('Team member registration disabled by team policy');
+    log.info(`[dry-run] Would register member ${username} on the teamai-reports branch`);
   }
 
   // Step 5.5: Configure default MR reviewers (only for fresh setup with no reviewers yet).
   // --force implies non-interactive: skip reviewer prompts entirely (can be configured later).
   const currentConfig = await loadTeamConfig(localPath);
   const hasReviewers = currentConfig?.reviewers && currentConfig.reviewers.length > 0;
-  if (registrationEnabled && isNewMember && !hasReviewers && !options.force) {
+  if (isNewMember && !hasReviewers && !options.force) {
     const wantReviewers = await askConfirmation(
       '\nWould you like to configure default MR reviewers? [y/N] ',
     );
@@ -1188,13 +1896,12 @@ export async function init(options: GlobalOptions & {
   const localConfig: LocalConfig = {
     repo: { localPath, remote: repoInfo.httpsUrl },
     username,
+    ...(forcedProvider ? { provider: forcedProvider } : {}),
     scope,
     projectRoot,
     additionalRoles: [],
+    ...(scope === 'project' ? { dataHome: teamaiHome } : {}),
     ...(inheritUserScope !== undefined ? { inheritUserScope } : {}),
-    ...(existingLocalConfig?.enabledAgents ? { enabledAgents: existingLocalConfig.enabledAgents } : {}),
-    ...(existingLocalConfig?.disabledAgents ? { disabledAgents: existingLocalConfig.disabledAgents } : {}),
-    ...(existingLocalConfig?.hostRoots ? { hostRoots: existingLocalConfig.hostRoots } : {}),
   };
 
   try {
@@ -1209,73 +1916,96 @@ export async function init(options: GlobalOptions & {
     }
   }
 
+  // Projects were already resolved (non-interactively) before member registration.
+  localConfig.projects = resolvedProjects;
+
   // Persist --agent into enabledAgents (additive across runs)
   const requestedAgents = normalizeAgentList(options.agent);
   if (requestedAgents.length > 0) {
-    const prev = existingLocalConfig?.enabledAgents ?? [];
+    // As loaded before the clone: that config may have been moved aside since.
+    const prev = carriedConfig?.enabledAgents ?? [];
     localConfig.enabledAgents = [...new Set([...prev, ...requestedAgents])];
-    localConfig.disabledAgents = (existingLocalConfig?.disabledAgents ?? []).filter((t) => !requestedAgents.includes(t));
+    localConfig.disabledAgents = (carriedConfig?.disabledAgents ?? []).filter((t) => !requestedAgents.includes(t));
+  } else {
+    // No --agent: the lists stand as they were, `uninstall --agent`'s exclusion included.
+    if (carriedConfig?.enabledAgents) localConfig.enabledAgents = [...carriedConfig.enabledAgents];
+    if (carriedConfig?.disabledAgents) localConfig.disabledAgents = [...carriedConfig.disabledAgents];
   }
 
+  // Carry the member's recorded tool roots across a re-init. `init` is
+  // re-runnable and CLAUDE_CONFIG_DIR lives in one shell profile, so a re-init
+  // from a shell that does not export it must not quietly send every later sync
+  // back to the default root. recordClaudeConfigRoot then overwrites the claude
+  // entry when the variable IS set.
+  // A project-scope config with no record of its own starts from the user-scope
+  // one: the root is a fact about this machine, and project hooks land in HOME.
+  const carriedToolRoots = carriedConfig?.toolRoots
+    ?? (scope === 'project' ? (await loadLocalConfigForScope('user'))?.toolRoots : undefined);
+  if (carriedToolRoots) localConfig.toolRoots = { ...carriedToolRoots };
+  if (usesManagedPolicy(await loadTeamConfig(localConfig.repo.localPath) ?? undefined, localConfig)) {
+    prepareSelectedProjectHostRoots(localConfig);
+    Object.assign(localConfig, normalizeHostRoots(localConfig));
+  }
+  recordClaudeConfigRoot(localConfig);
+  await releasePreviousClaudeRoot(currentConfig, carriedConfig, localConfig);
+
   await ensureDir(teamaiHome);
-  prepareSelectedProjectHostRoots(localConfig);
+  if (scope !== 'project') await ensureDir(getTeamaiHomeDir());
+  await settleModeSwitch(existingLocalConfig, localConfig, () =>
+    scope === 'project' ? saveLocalConfigForScope(localConfig, scope, projectRoot) : saveLocalConfig(localConfig));
 
   if (scope === 'project') {
-    await saveLocalConfigForScope(localConfig, scope, projectRoot);
     log.success(`Local config saved to ${teamaiHome}/config.yaml`);
 
     // Generate .gitignore for project scope to prevent local config from being committed
     const gitignorePath = path.join(teamaiHome, '.gitignore');
     if (!await pathExists(gitignorePath)) {
-      const gitignoreContent = [
-        '# teamai local config (do not commit)',
-        'config.yaml',
-        'state.json',
-        'token',
-        '.update-lock',
-        'env',
-        'env.sh',
-        'sessions/',
-        'dashboard/',
-        'usage.jsonl',
-        'known-skills.json',
-        'learnings/',
-        'search-index.json',
-        'votes/',
-        '',
-      ].join('\n');
-      await writeFile(gitignorePath, gitignoreContent);
+      await writeFile(gitignorePath, buildProjectScopeGitignore());
       log.debug('Generated .teamai/.gitignore for project scope');
     }
   } else {
-    await ensureDir(TEAMAI_HOME);
-    await saveLocalConfig(localConfig);
-    log.success(`Local config saved to ${TEAMAI_HOME}/config.yaml`);
+    log.success(`Local config saved to ${getTeamaiHomeDir()}/config.yaml`);
   }
 
   // Step 6.5: Invalidate pull cache so next pull does full sync with cleanup
   // This handles re-init scenarios where the user changes their role
   try {
-    const state = await loadStateForScope(scope, projectRoot);
+    const state = await loadStateForScope(localConfig);
     state.lastPullRev = null;
-    await saveStateForScope(state, scope, projectRoot);
+    await saveStateForScope(state, localConfig);
   } catch {
     // Non-critical: state file may not exist yet on first init
   }
 
   // Step 7: Inject built-in + team hooks into AI tools
   const reloadedTeamConfig = await loadTeamConfig(localPath);
+  // Only a stub that actually landed is announced as ready in the IDE.
+  let stubDeployed = 0;
   if (reloadedTeamConfig) {
     const filterAgents = requestedAgents.length > 0 ? requestedAgents : undefined;
-    await reconcileTeamHooksForConfig(reloadedTeamConfig, localConfig, { auto: true, filterAgents });
+    await reconcileHooksForInit(reloadedTeamConfig, localConfig, filterAgents);
+
+    // Step 7.5: Deploy the built-in discovery stub immediately so the teamai
+    // skill is available in the IDE right after init, without waiting for the
+    // first pull. Its workflows are served by `teamai skill get`.
+    try {
+      const { deployBuiltinSkills } = await import('./builtin-skills.js');
+      stubDeployed = await deployBuiltinSkills(reloadedTeamConfig, localConfig);
+      if (stubDeployed > 0) {
+        log.debug(`Deployed ${stubDeployed} built-in skill(s)`);
+      }
+    } catch (e) {
+      log.warn(`The built-in teamai skill was not deployed: ${(e as Error).message}`);
+    }
   }
 
   log.success('teamai initialized successfully!');
-  if (reloadedTeamConfig?.sharing.hooks?.autoApply === false) {
-    log.info('Automatic hook sync is disabled by team policy. Run `teamai pull` manually when you want to sync.');
+  if (stubDeployed > 0) {
+    log.info('The built-in teamai skill is ready in your IDE; it loads its workflows with `teamai skill get`.');
   } else {
-    log.info('Skills, rules, env and docs will auto-sync on each session start (via hooks).');
+    log.warn('The built-in teamai skill was not deployed to any AI tool, so agents cannot find TeamAI yet. The reason is printed above or recorded in ~/.teamai/debug.log; the usual one is that none of the selected tools is installed. Run `teamai pull` once it is fixed.');
   }
+  log.info('Skills, rules, env and docs auto-sync on each session start when the selected agent has active TeamAI hooks.');
   log.info('Run `teamai status` to check current config.');
 
   // Close the readline singleton so the process can exit cleanly.

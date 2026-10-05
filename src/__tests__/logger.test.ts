@@ -10,7 +10,7 @@ vi.mock('chalk', () => ({
   default: { blue: (s: string) => s, green: (s: string) => s, yellow: (s: string) => s, red: (s: string) => s, gray: (s: string) => s, dim: (s: string) => s },
 }));
 
-import { log, setVerbose, setSilent, setStderrOnly, setFileLogging, MAX_LOG_BYTES, _setLogFilePath, _resetState } from '../utils/logger.js';
+import { setFileLogging, log, setVerbose, setSilent, setStderrOnly, _setLogFilePath, _resetState } from '../utils/logger.js';
 
 let tmpDir: string;
 let logFile: string;
@@ -38,11 +38,47 @@ describe('file transport', () => {
     expect(fs.readFileSync(logFile, 'utf-8')).toContain('[DEBUG] hello from debug');
   });
 
+  it.each(['absent', 'existing'])('shows transient startup diagnostics without touching an %s log', (state) => {
+    if (state === 'existing') log.debug('normal command');
+    const before = fs.existsSync(logFile) ? fs.readFileSync(logFile, 'utf8') : null;
+    const spy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    try {
+      setVerbose(true);
+      log.debug('runtime discovery', { persist: false });
+      expect(spy).toHaveBeenCalledWith(expect.stringContaining('runtime discovery'));
+      expect(fs.existsSync(logFile) ? fs.readFileSync(logFile, 'utf8') : null).toBe(before);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
   it('writes error to file', () => {
     const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
     log.error('something broke');
     spy.mockRestore();
     expect(fs.readFileSync(logFile, 'utf-8')).toContain('[ERROR] something broke');
+  });
+
+  it('persists to file only, never the console, even when silent', () => {
+    // A detached SessionStart pull runs silent with its output discarded; the
+    // failures it cannot show still leave a record, printed nowhere twice.
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    setVerbose(true);
+    setSilent(true);
+    log.persist('stub not deployed');
+    expect(logSpy).not.toHaveBeenCalled();
+    expect(errorSpy).not.toHaveBeenCalled();
+    logSpy.mockRestore();
+    errorSpy.mockRestore();
+    expect(fs.readFileSync(logFile, 'utf-8')).toContain('[WARN] stub not deployed');
+  });
+
+  it('keeps warn on the console only', () => {
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    log.warn('shown, not stored');
+    logSpy.mockRestore();
+    expect(fs.existsSync(logFile) ? fs.readFileSync(logFile, 'utf-8') : '').not.toContain('shown, not stored');
   });
 
   it('includes timestamp', () => {

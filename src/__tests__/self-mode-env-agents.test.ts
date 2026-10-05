@@ -93,6 +93,18 @@ describe('single-repo mode: env + agents direct .teamai scan', () => {
     expect(committed).toContain('key: X');
   });
 
+  it('env: detects a namespace env file and pushes it to the same path (#707)', async () => {
+    const active = path.join(bizRoot, '.teamai', 'env', 'checkout', 'env.yaml');
+    await fse.outputFile(active, 'variables:\n  - key: API_BASE\n    value: https://checkout.example.com\n');
+    const items = await new EnvHandler().scanLocalForPush(teamConfig, localConfig);
+    expect(items.map((item) => item.relativePath)).toEqual(['env/checkout/env.yaml']);
+    const [item] = items;
+    if (!item) throw new Error('expected one item');
+    await new EnvHandler().pushItem(item, teamConfig, localConfig);
+    expect(await fse.readFile(path.join(worktreeTeamai, 'env', 'checkout', 'env.yaml'), 'utf8')).toContain('checkout.example.com');
+    expect(await fse.pathExists(path.join(worktreeTeamai, 'env', 'env.yaml'))).toBe(false);
+  });
+
   // Regression: a teammate who clones a self-mode repo has .teamai/env/ as a
   // committed DIRECTORY (holding env.yaml). pullItem must NOT try to write its
   // KEY=value backup at <teamaiHome>/env (that path is the dir → EISDIR). It must
@@ -146,6 +158,17 @@ describe('single-repo mode: env + agents direct .teamai scan', () => {
     expect(item).toBeDefined();
     expect(item!.legacy).toBe(true);
     expect(item!.relativePath).toBe('agents/helper.md');
+  });
+
+  it('agents: picks up a namespaced canonical file and keeps its namespace path', async () => {
+    await fse.ensureDir(path.join(worktreeTeamai, 'agents', 'frontend'));
+    await fse.writeFile(path.join(worktreeTeamai, 'agents', 'frontend', 'vr.yaml'), 'name: vr\ndescription: old\n');
+    await fse.ensureDir(path.join(bizRoot, '.teamai', 'agents', 'frontend'));
+    await fse.writeFile(path.join(bizRoot, '.teamai', 'agents', 'frontend', 'vr.yaml'), 'name: vr\ndescription: edited\n');
+    const items = await new AgentsHandler().scanLocalForPush(teamConfig, localConfig);
+    const item = items.find((i) => i.name === 'vr');
+    expect(item?.status).toBe('modified');
+    expect(item?.relativePath).toBe('agents/frontend/vr.yaml');
   });
 
   it('agents: skips a canonical file identical to the baseline', async () => {

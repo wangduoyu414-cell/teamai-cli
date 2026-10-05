@@ -1,9 +1,10 @@
 import path from 'node:path';
-import YAML from 'yaml';
 import { listDirs, pathExists, readFileSafe } from './utils/fs.js';
 import { detectInstalledAgents, type ResolvedAgent } from './known-agents.js';
-import { BUILTIN_SKILL_NAMES } from './builtin-skills.js';
+import { isCliOwnedSkillName } from './builtin-skills.js';
 import type { LocalConfig, TeamaiConfig } from './types.js';
+import { getUserHome } from './utils/home.js';
+import { parseFrontmatter } from './utils/frontmatter.js';
 
 // ─── Local agent skill scanning ─────────────────────────
 //
@@ -13,8 +14,6 @@ import type { LocalConfig, TeamaiConfig } from './types.js';
 //  from the team repo, which are CLI built-ins, which were
 //  pulled from a cross-team source, and which are local-only
 //  drafts that have not been pushed yet.
-
-const FRONTMATTER_REGEX = /^---\n([\s\S]*?)\n---/;
 
 export type SkillSource =
   | { kind: 'team'; namespace?: string }
@@ -54,7 +53,7 @@ export async function buildClassifyContext(localConfig: LocalConfig): Promise<Cl
 
   const sourceSkills = new Map<string, string>();
   try {
-    const sourcesDir = path.join(process.env.HOME ?? '', '.teamai', 'sources');
+    const sourcesDir = path.join(getUserHome(), '.teamai', 'sources');
     if (await pathExists(sourcesDir)) {
       const sourceNames = await listDirs(sourcesDir);
       for (const sourceName of sourceNames) {
@@ -108,7 +107,9 @@ async function collectTeamRepoSkills(repoPath: string): Promise<Map<string, { na
 
 /** Resolve a skill name to its source tag using the prebuilt context. */
 export function classifySkill(name: string, ctx: ClassifyContext): SkillSource {
-  if (BUILTIN_SKILL_NAMES.has(name)) return { kind: 'builtin' };
+  // Same rule as the push scan and uninstall: a name a pre-stub release deployed
+  // is ours until the next pull prunes it, not a member's local-only skill.
+  if (isCliOwnedSkillName(name)) return { kind: 'builtin' };
   if (ctx.teamSkills.has(name)) {
     return { kind: 'team', namespace: ctx.teamSkills.get(name)?.namespace };
   }
@@ -194,17 +195,8 @@ export async function scanInstalledAgents(
 export async function readSkillDescription(skillMdPath: string): Promise<string> {
   const content = await readFileSafe(skillMdPath);
   if (!content) return '';
-  const fm = content.match(FRONTMATTER_REGEX);
-  if (!fm) return '';
-
-  let parsed: unknown;
-  try {
-    parsed = YAML.parse(fm[1]);
-  } catch {
-    return '';
-  }
-  if (!parsed || typeof parsed !== 'object') return '';
-  const desc = (parsed as Record<string, unknown>).description;
+  const { data } = parseFrontmatter(content);
+  const desc = data['description'];
   if (typeof desc !== 'string') return '';
 
   // Normalize whitespace: collapse newlines + indentation into single spaces

@@ -1,8 +1,8 @@
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import chalk from 'chalk';
 import ora, { type Ora } from 'ora';
+import { getUserHome } from './home.js';
 
 let verboseEnabled = false;
 let silentMode = false;
@@ -11,7 +11,7 @@ let fileLoggingEnabled = true;
 
 // ─── File transport ─────────────────────────────────────
 //
-//  All log.debug() and log.error() calls are persisted to
+//  All log.debug(), log.error() and log.persist() calls are persisted to
 //  ~/.teamai/debug.log via synchronous append.  This ensures
 //  hook processes (short-lived, stdout swallowed by Claude Code)
 //  leave a durable trace for troubleshooting.
@@ -34,7 +34,7 @@ let _writing = false;
 
 function getLogFilePath(): string {
   if (!_logFilePath) {
-    _logFilePath = path.join(os.homedir(), '.teamai', 'debug.log');
+    _logFilePath = path.join(getUserHome(), '.teamai', 'debug.log');
   }
   return _logFilePath;
 }
@@ -116,6 +116,10 @@ export function setSilent(s: boolean): void {
   silentMode = s;
 }
 
+export function isSilent(): boolean {
+  return silentMode;
+}
+
 /** Disable debug/error file writes for read-only plan commands. */
 export function setFileLogging(enabled: boolean): void {
   fileLoggingEnabled = enabled;
@@ -123,10 +127,13 @@ export function setFileLogging(enabled: boolean): void {
 
 /**
  * Route non-error log output to stderr. Used by hook-dispatch commands to
- * keep stdout as a clean JSON channel for the AI tool.
+ * keep stdout as a clean JSON channel for the AI tool. Returns the previous
+ * mode, so a caller that needs it for one step can put it back.
  */
-export function setStderrOnly(s: boolean): void {
+export function setStderrOnly(s: boolean): boolean {
+  const previous = stderrMode;
   stderrMode = s;
+  return previous;
 }
 
 /** Write a "non-error" log line. Goes to stderr in hook mode, stdout otherwise. */
@@ -151,12 +158,22 @@ export const log = {
     if (silentMode) return;
     writeInfoLine(`${chalk.yellow('⚠')} ${msg}`);
   },
+  /**
+   * Record a failure in debug.log only, never on the console: for a warning
+   * already shown where a detached hook process (stdout and stderr discarded,
+   * silent) would lose it, without printing it twice under --verbose.
+   */
+  persist(msg: string): void {
+    writeToFile('WARN', msg);
+  },
   error(msg: string): void {
     console.error(chalk.red('✖'), msg);
     writeToFile('ERROR', msg);
   },
-  debug(msg: string): void {
-    writeToFile('DEBUG', msg);
+  // Startup discovery runs before command-specific write guards. Such traces
+  // may be shown with --verbose without creating a durable log first.
+  debug(msg: string, options: { persist?: boolean } = {}): void {
+    if (options.persist !== false) writeToFile('DEBUG', msg);
     if (!verboseEnabled || silentMode) return;
     writeInfoLine(`${chalk.gray('  [debug]')} ${msg}`);
   },

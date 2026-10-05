@@ -1,11 +1,16 @@
+import { usesManagedPolicy } from './host-adapters.js';
+import { isBuiltinEnabled } from './types.js';
+import { isHostSelected, supportsStaticResource } from './host-adapters.js';
 import path from 'node:path';
 import { ensureDir, writeFile, pathExists } from './utils/fs.js';
 import { log } from './utils/logger.js';
-import { ResourceHandler } from './resources/base.js';
+import { isToolInstalledForConfig, ResourceHandler } from './resources/base.js';
+import { ruleFileExtensionForTool, usesCursorMdcRules } from './resources/rule-format.js';
+import { teamRuleToCursorMdc } from './resources/cursor-mdc.js';
 import type { TeamaiConfig, LocalConfig } from './types.js';
-import { resolveBaseDir, isBuiltinEnabled } from './types.js';
-import { homeDir, isHostSelected, supportsStaticResource } from './host-adapters.js';
+import { resolveToolBaseDir, isAgentExcluded, scopedToolPaths } from './types.js';
 import fs from 'node:fs/promises';
+import { getUserHome } from './utils/home.js';
 
 // ─── Built-in rules deployment ──────────────────────────
 //
@@ -49,22 +54,28 @@ export async function deployBuiltinRules(
     localConfig?: LocalConfig,
     options?: { skipRecall?: boolean },
 ): Promise<number> {
-    const baseDir = localConfig ? resolveBaseDir(localConfig) : homeDir();
+  if (teamConfig.builtins?.rules?.mode === 'disabled') return 0;
+
+    const defaultBaseDir = getUserHome();
     let deployed = 0;
 
     const builtinRules: Array<{ name: string; content: string }> = [
         { name: 'teamai-recall', content: TEAMAI_RECALL_RULE_CONTENT },
     ].filter(r => !(options?.skipRecall && r.name === 'teamai-recall'));
 
-    for (const [tool, toolPath] of Object.entries(teamConfig.toolPaths)) {
+    for (const [tool, toolPath] of Object.entries(scopedToolPaths(teamConfig, localConfig ?? {}))) {
         if (!toolPath.rules) continue;
+        const baseDir = localConfig ? resolveToolBaseDir(tool, localConfig) : defaultBaseDir;
 
         // Skip tools that are not installed
-        if (!await ResourceHandler.isToolInstalled(toolPath.rules, baseDir)) {
+        const installed = localConfig
+            ? await isToolInstalledForConfig(tool, toolPath.rules, localConfig)
+            : await ResourceHandler.isToolInstalled(toolPath.rules, baseDir);
+        if (!installed) {
             log.debug(`Skipping built-in rules for ${tool}: tool not installed`);
             continue;
         }
-        if (localConfig && (!isHostSelected(localConfig, tool) || !supportsStaticResource(tool, 'rules', localConfig.scope))) continue;
+        if (localConfig && (isAgentExcluded(localConfig, tool) || (usesManagedPolicy(teamConfig, localConfig) && (!isHostSelected(localConfig, tool) || !supportsStaticResource(tool, 'rules', localConfig.scope))))) continue;
 
         const rulesDir = path.join(baseDir, toolPath.rules);
         if (!await pathExists(rulesDir)) continue;
@@ -72,22 +83,39 @@ export async function deployBuiltinRules(
         try {
             await ensureDir(rulesDir);
 
-            // Deploy current built-in rules
+            // Deploy current built-in rules. Cursor-compatible tools use `.mdc`
+            // with derived frontmatter; every other tool gets canonical `.md`.
+            const ext = ruleFileExtensionForTool(tool);
             for (const rule of builtinRules) {
                 if (!isBuiltinEnabled(teamConfig, 'rules', rule.name)) continue;
-                const destFile = path.join(rulesDir, `${rule.name}.md`);
-                await writeFile(destFile, rule.content);
+                const destFile = path.join(rulesDir, `${rule.name}${ext}`);
+                const content = usesCursorMdcRules(tool)
+                    ? teamRuleToCursorMdc(rule.content)
+                    : rule.content;
+                await writeFile(destFile, content);
                 log.debug(`Deployed built-in rule ${rule.name} → ${tool}`);
+
+                // Drop the `.md` copy an older layout left in an `.mdc` rules dir.
+                if (ext !== '.md') {
+                    try {
+                        await fs.unlink(path.join(rulesDir, `${rule.name}.md`));
+                        log.debug(`Removed legacy .md built-in rule ${rule.name} from ${tool}`);
+                    } catch {
+                        // File doesn't exist — that's fine
+                    }
+                }
             }
 
-            // Clean up legacy rules no longer deployed
+            // Clean up legacy rules no longer deployed (both extensions)
             for (const legacyName of LEGACY_RULE_NAMES) {
-                const legacyFile = path.join(rulesDir, `${legacyName}.md`);
-                try {
-                    await fs.unlink(legacyFile);
-                    log.debug(`Removed legacy built-in rule ${legacyName} from ${tool}`);
-                } catch {
-                    // File doesn't exist — that's fine
+                for (const legacyExt of new Set<string>([ext, '.md'])) {
+                    const legacyFile = path.join(rulesDir, `${legacyName}${legacyExt}`);
+                    try {
+                        await fs.unlink(legacyFile);
+                        log.debug(`Removed legacy built-in rule ${legacyName} from ${tool}`);
+                    } catch {
+                        // File doesn't exist — that's fine
+                    }
                 }
             }
 
@@ -103,6 +131,10 @@ export async function deployBuiltinRules(
 // ─── Rule content ──────────────────────────────────────
 
 const TEAMAI_RECALL_RULE_CONTENT = `# Team Knowledge Recall (teamai)
+
+> **Self-exemption (must read first):** If you ARE the \`teamai-recall\` subagent yourself, this rule does NOT apply to you — do not invoke \`teamai-recall\` (or any recall) again. Proceed directly to performing the knowledge search that is your task. This prevents infinite subagent recursion in tools (e.g. Cursor) whose always-apply rules leak into subagent sessions.
+>
+> **自豁免（务必先读）：** 如果你自己就是 \`teamai-recall\` subagent，本规则对你不适用——不要再调用 \`teamai-recall\`（或任何 recall），直接执行你本职的知识检索任务。此举防止在（如 Cursor 等）会把 always-apply 规则泄漏进 subagent 会话的工具中发生无限递归。
 
 ## 规则：任务开始前检索团队知识库（推荐）
 
@@ -129,23 +161,16 @@ teamai recall "<关键词1> <关键词2> ..."
 
 从任务描述中提取 3-6 个高信号关键词进行检索。
 
+If the output contains \`Nothing was searched:\`, this project's teamai config cannot be
+read and no team knowledge was searched: show that line to the user rather than
+concluding the team has no knowledge, and do not move the file or run \`teamai init\`
+without their consent. If it contains \`Recall skips the older index\`, that scope was not
+searched: relay that warning rather than conclude the team has no knowledge there.
+
 **务必中英双语检索（跨语言召回）**：知识库中英文混杂，检索是纯词法匹配，
 中文 query 无法命中纯英文文档，反之亦然。因此每个领域术语都应**同时给出中英两种写法**
 一起检索，例如「重启推理集群」应扩展为 \`重启 推理 集群 restart inference cluster\`；
 只翻译中英确实不同的术语；任何**语言无关的 token**（中英写法相同、或无实际译法者）一律保持原样，
 例如专有名词、品牌与产品名、缩写、代码标识符与符号、错误码、版本号、文件路径、命令与 API 名
 （\`AppID\`、\`Kubernetes\`、\`GPU\`、\`RuntimeError\`、\`v2.1.3\`、\`oauth\`）——翻译它们只会损害匹配。
-
-### 检索后要求（用于评估知识被采纳情况，请务必执行）
-
-teamai-recall subagent 的返回里已列出本次检索到的候选 doc-id（见其 recalled-doc-ids 列表）。
-你**不需要凭记忆重建列表**——只需在**最终回复末尾**追加下面这行，
-从候选里**保留你实际用到的**（照抄了命令、或概念上参考了，都算用到），删掉没用到的：
-
-\`\`\`
-<!-- teamai:referenced-doc-ids: [你实际用到的-doc-id] -->
-\`\`\`
-
-一个都没用到就留空：\`<!-- teamai:referenced-doc-ids: [] -->\`。
-若直接用 \`teamai recall\` 命令（未走 subagent），从召回结果的 File 路径推出 doc-id 自行填入。
 `;

@@ -7,8 +7,11 @@ import type { CacheCmdOptions } from '../cache-cmd.js';
 
 describe('cache-cmd', () => {
     let consoleSpy: ReturnType<typeof vi.spyOn>;
+    let originalExitCode: typeof process.exitCode;
 
     beforeEach(() => {
+        originalExitCode = process.exitCode;
+        process.exitCode = undefined;
         consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
         vi.spyOn(process, 'exit').mockImplementation((code?: number | string | null) => {
             throw new Error(`process.exit called with code ${code}`);
@@ -16,6 +19,7 @@ describe('cache-cmd', () => {
     });
 
     afterEach(() => {
+        process.exitCode = originalExitCode;
         vi.restoreAllMocks();
     });
 
@@ -115,12 +119,64 @@ describe('cache-cmd', () => {
             expect(parsed).toHaveProperty('removed');
         });
 
+        it('passes complete positive integers to gcCache', async () => {
+            const mockResult: cacheIndexModule.GcResult = {
+                before: { totalBytes: 0, entryCount: 0 },
+                after: { totalBytes: 0, entryCount: 0 },
+                removed: [],
+                skipped: [],
+            };
+            const gcSpy = vi.spyOn(cacheIndexModule, 'gcCache').mockResolvedValue(mockResult);
+
+            const { cacheCmd } = await import('../cache-cmd.js');
+            await cacheCmd({
+                dryRun: true,
+                verbose: false,
+                gc: true,
+                maxBytes: '+001024',
+                staleDays: '007',
+            });
+
+            expect(gcSpy).toHaveBeenCalledWith({
+                maxBytes: 1024,
+                staleDays: 7,
+                dryRun: true,
+            });
+            expect(process.exitCode).toBeUndefined();
+        });
+
+        it.each([
+            ['--max-bytes', { maxBytes: '12abc' }],
+            ['--max-bytes', { maxBytes: 'abc12' }],
+            ['--max-bytes', { maxBytes: '1.5' }],
+            ['--max-bytes', { maxBytes: '1e3' }],
+            ['--max-bytes', { maxBytes: '0' }],
+            ['--max-bytes', { maxBytes: '-1' }],
+            ['--max-bytes', { maxBytes: '9007199254740992' }],
+            ['--stale-days', { staleDays: '30days' }],
+            ['--stale-days', { staleDays: '1.5' }],
+        ])('rejects an invalid %s value before running GC', async (_option, invalidOpts) => {
+            const gcSpy = vi.spyOn(cacheIndexModule, 'gcCache');
+            vi.spyOn(console, 'error').mockImplementation(() => {});
+
+            const { cacheCmd } = await import('../cache-cmd.js');
+            await cacheCmd({
+                dryRun: false,
+                verbose: false,
+                gc: true,
+                ...invalidOpts,
+            });
+
+            expect(gcSpy).not.toHaveBeenCalled();
+            expect(process.exitCode).toBe(2);
+        });
+
         it('skipped 非空时退出码为 1', async () => {
             const mockResult: cacheIndexModule.GcResult = {
                 before: { totalBytes: 1000, entryCount: 1 },
                 after: { totalBytes: 1000, entryCount: 1 },
                 removed: [],
-                skipped: [{ key: 'github/owner/broken', reason: '删除失败: EPERM' }],
+                skipped: [{ key: 'github/owner/broken', reason: 'failed to delete: Error: EPERM' }],
             };
             vi.spyOn(cacheIndexModule, 'gcCache').mockResolvedValue(mockResult);
 
@@ -134,13 +190,108 @@ describe('cache-cmd', () => {
                 before: { totalBytes: 1000, entryCount: 1 },
                 after: { totalBytes: 1000, entryCount: 1 },
                 removed: [],
-                skipped: [{ key: 'github/owner/broken', reason: '删除失败' }],
+                skipped: [{ key: 'github/owner/broken', reason: 'failed to delete' }],
             };
             vi.spyOn(cacheIndexModule, 'gcCache').mockResolvedValue(mockResult);
 
             const { cacheCmd } = await import('../cache-cmd.js');
             const opts: CacheCmdOptions = { dryRun: false, verbose: false, gc: true, json: true };
             await expect(cacheCmd(opts)).rejects.toThrow('process.exit called with code 1');
+        });
+    });
+
+    // ─── English output ──────────────────────────────────
+
+    describe('human-readable output', () => {
+        const CJK = /[\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]/;
+
+        function captureOutput(): string[] {
+            const lines: string[] = [];
+            consoleSpy.mockImplementation((...args: unknown[]) => {
+                lines.push(args.map(String).join(' '));
+            });
+            return lines;
+        }
+
+        it('prints an empty cache status in English', async () => {
+            vi.spyOn(cacheIndexModule, 'getCacheStatus').mockResolvedValue({
+                root: '/mock/cache', totalBytes: 0, entryCount: 0, entries: [],
+            });
+            const lines = captureOutput();
+
+            const { cacheCmd } = await import('../cache-cmd.js');
+            await cacheCmd({ dryRun: false, verbose: false });
+
+            expect(lines).toContain('(no cache entries)');
+            expect(lines.join('\n')).not.toMatch(CJK);
+        });
+
+        it('prints the cache status total in English', async () => {
+            vi.spyOn(cacheIndexModule, 'getCacheStatus').mockResolvedValue({
+                root: '/mock/cache',
+                totalBytes: 1024,
+                entryCount: 1,
+                entries: [{ key: 'github/owner/repo', size_bytes: 1024, last_used: '2025-01-01T00:00:00.000Z', last_synced_sha: 'abcdef12' }],
+            });
+            const lines = captureOutput();
+
+            const { cacheCmd } = await import('../cache-cmd.js');
+            await cacheCmd({ dryRun: false, verbose: false });
+
+            expect(lines.some((line) => line.startsWith('Total: 1 repo(s), '))).toBe(true);
+            expect(lines.join('\n')).not.toMatch(CJK);
+        });
+
+        it('prints the GC summary, removed and skipped lists in English', async () => {
+            vi.spyOn(cacheIndexModule, 'gcCache').mockResolvedValue({
+                before: { totalBytes: 1000, entryCount: 3 },
+                after: { totalBytes: 500, entryCount: 2 },
+                removed: [{ key: 'github/owner/old', size_bytes: 500, reason: 'stale' }],
+                skipped: [{ key: 'github/owner/broken', reason: 'failed to delete: Error: EPERM' }],
+            });
+            const lines = captureOutput();
+
+            const { cacheCmd } = await import('../cache-cmd.js');
+            await expect(cacheCmd({ dryRun: true, verbose: false, gc: true })).rejects.toThrow('process.exit called with code 1');
+
+            expect(lines.some((line) => line.endsWith('GC result'))).toBe(true);
+            expect(lines.some((line) => line.startsWith('Before: 3 repo(s), '))).toBe(true);
+            expect(lines.some((line) => line.startsWith('After: 2 repo(s), '))).toBe(true);
+            expect(lines).toContain('Would remove (1):');
+            expect(lines).toContain('Skipped (1, needs manual review):');
+            expect(lines.join('\n')).not.toMatch(CJK);
+        });
+
+        it('lists what a real GC run removed', async () => {
+            vi.spyOn(cacheIndexModule, 'gcCache').mockResolvedValue({
+                before: { totalBytes: 1000, entryCount: 2 },
+                after: { totalBytes: 500, entryCount: 1 },
+                removed: [{ key: 'github/owner/old', size_bytes: 500, reason: 'stale' }],
+                skipped: [],
+            });
+            const lines = captureOutput();
+
+            const { cacheCmd } = await import('../cache-cmd.js');
+            await cacheCmd({ dryRun: false, verbose: false, gc: true });
+
+            expect(lines).toContain('Removed (1):');
+            expect(lines.join('\n')).not.toMatch(CJK);
+        });
+
+        it('says there is nothing to clean up in English', async () => {
+            vi.spyOn(cacheIndexModule, 'gcCache').mockResolvedValue({
+                before: { totalBytes: 0, entryCount: 0 },
+                after: { totalBytes: 0, entryCount: 0 },
+                removed: [],
+                skipped: [],
+            });
+            const lines = captureOutput();
+
+            const { cacheCmd } = await import('../cache-cmd.js');
+            await cacheCmd({ dryRun: false, verbose: false, gc: true });
+
+            expect(lines).toContain('Nothing to clean up');
+            expect(lines.join('\n')).not.toMatch(CJK);
         });
     });
 });

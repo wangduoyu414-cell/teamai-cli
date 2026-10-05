@@ -1,14 +1,44 @@
 import path from 'node:path';
-import os from 'node:os';
-import type { ResourceType, ResourceItem, ResourceDiff, TeamaiConfig, LocalConfig } from '../types.js';
+import { COPILOT_TOOL_ID, getCopilotHome, resolveToolBaseDir, toolInstallRoot } from '../types.js';
+import type { ResourceType, ResourceItem, ResourceDiff, DeliveryTarget, TeamaiConfig, LocalConfig } from '../types.js';
 import { readFileSafe, writeFile, ensureDir, pathExists } from '../utils/fs.js';
+import { getUserHome } from '../utils/home.js';
 
 const TOMBSTONE_FILE = '.removed';
+
+/** Detect an installed tool while respecting tool-specific user roots. */
+export async function isToolInstalledForConfig(
+  tool: string,
+  toolPath: string,
+  localConfig: LocalConfig,
+  exactConfigPath?: string,
+  probePath?: string,
+): Promise<boolean> {
+  const baseDir = resolveToolBaseDir(tool, localConfig);
+  if (tool === COPILOT_TOOL_ID) {
+    return localConfig.enabledAgents?.includes(COPILOT_TOOL_ID) === true
+      || (exactConfigPath !== undefined && await pathExists(exactConfigPath))
+      || pathExists(getCopilotHome());
+  }
+  return ResourceHandler.isToolInstalled(toolPath, baseDir, probePath);
+}
 
 /**
  * Abstract base class for resource handlers.
  * Each resource type (skills, rules, docs, env, agents, hooks, mcp) implements this.
  */
+/**
+ * What `push` knows before it scans. Only the destination an explicit
+ * `--role`/`--project` names, and only agents read it: their scan has to
+ * decide which team file a local edit is an edit OF, and that answer changes
+ * when the user has named a namespace (see `AgentsHandler.scanLocalForPush`).
+ * Rules and skills are placed after selection, so their scan needs nothing.
+ */
+export interface ScanForPushOptions {
+  /** The namespace `--role <ns>` / `--project <id>` resolved to, if any. */
+  namespace?: string;
+}
+
 export abstract class ResourceHandler {
   abstract readonly type: ResourceType;
 
@@ -19,6 +49,7 @@ export abstract class ResourceHandler {
   abstract scanLocalForPush(
     teamConfig: TeamaiConfig,
     localConfig: LocalConfig,
+    options?: ScanForPushOptions,
   ): Promise<ResourceItem[]>;
 
   /**
@@ -59,19 +90,50 @@ export abstract class ResourceHandler {
   ): Promise<string[]>;
 
   /**
+   * The name this resource is published under, when the user typed a different
+   * one. `remove` matches what the user types against the team repo, where a
+   * placed resource lives at `<root>/<ns>/<name>`; the author's local copy is
+   * still at the resource root, so they know it by its bare name and `remove`
+   * would answer "not found". Handlers that keep a placement record resolve it
+   * here. Returns null when there is nothing to translate.
+   */
+  async publishedNameFor(_name: string, _localConfig: LocalConfig): Promise<string | null> {
+    return null;
+  }
+
+  /**
+   * Where `item` lands for each tool that can receive it on this machine.
+   *
+   * Read-only by contract: resolving a destination must never write, so the
+   * same answer serves the sync and the checks that verify it. Two resolvers
+   * for one destination is how "Synced N skills" ends up true while a tool
+   * receives nothing (#598, #624).
+   *
+   * A tool that cannot receive the item is absent from the result: not
+   * installed, no configured path, or outside the item's own targets.
+   *
+   * The default is empty, which also covers a resource with no per-tool file
+   * destination at all. Docs land in one directory, env in one shell profile,
+   * and hooks and MCP are entries inside a tool's own config file, so those
+   * keep checks of their own instead of a sentinel tool.
+   */
+  async deliveryTargets(
+    _teamConfig: TeamaiConfig,
+    _localConfig: LocalConfig,
+    _item: ResourceItem,
+  ): Promise<DeliveryTarget[]> {
+    return [];
+  }
+
+  /**
    * Check if an AI tool is installed by verifying its root directory exists.
    * e.g. for toolPath ".codebuddy/skills", checks if ~/.codebuddy/ exists.
    * This prevents creating directories for tools the user hasn't installed.
    * @param baseDir - Override base directory (defaults to HOME). Used for project scope.
    */
-  static async isToolInstalled(
-    toolPath: string,
-    baseDir?: string,
-    probePath?: string,
-    rootOverride?: string,
-  ): Promise<boolean> {
-    const base = baseDir ?? os.homedir();
-    const toolRoot = rootOverride ?? path.join(base, (probePath ?? toolPath).split('/')[0]);
+  static async isToolInstalled(toolPath: string, baseDir?: string, probePath?: string, rootOverride?: string): Promise<boolean> {
+    const base = baseDir ?? getUserHome();
+    const toolRoot = rootOverride ?? path.join(base, toolInstallRoot(probePath ?? toolPath));
     return pathExists(toolRoot);
   }
 

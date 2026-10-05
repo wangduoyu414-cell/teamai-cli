@@ -296,6 +296,8 @@ function isNarrowHostTarget(
   if (!hostRoot || !path.isAbsolute(hostRoot)) return false;
   const root = path.resolve(hostRoot);
   const targetPath = path.resolve(target);
+  if (tool === 'copilot') return (type === 'skills' && isWithin(path.join(root, 'skills'), targetPath)) || (type === 'agents' && isWithin(path.join(root, 'agents'), targetPath));
+  if (tool === 'hermes') return type === 'skills' && isWithin(path.join(root, 'skills'), targetPath);
   if (tool === 'workbuddy') return type === 'skills' && isWithin(path.join(root, 'skills'), targetPath);
   if (tool === 'dsh') {
     return (type === 'skills' && isWithin(path.join(root, 'skills'), targetPath))

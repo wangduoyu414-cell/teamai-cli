@@ -2,9 +2,10 @@ import path from 'node:path';
 import { writeFile, mkdir } from 'node:fs/promises';
 import { callClaudeParallel, getAICliName } from './utils/ai-client.js';
 import { log } from './utils/logger.js';
+import { assertSafeResourceName } from './utils/path-safety.js';
 import type { CodeFact } from './wiki-engine/adapters/index.js';
 import type { InterfaceInventory } from './wiki-engine/interface-scanner.js';
-import type { CodebaseOutputManifestV2, ManifestComponentV2, ManifestEdgeV2 } from './wiki-engine/manifest-schema.js';
+import type { CodebaseOutputManifestV2, ManifestComponentV2, ManifestEdgeV2, ManifestEdgeSource } from './wiki-engine/manifest-schema.js';
 
 export interface EnrichContext {
   project: string;
@@ -118,6 +119,84 @@ function resolveImportToModule(importerFile: string, importPath: string): string
   return first;
 }
 
+/** Group non-relation facts by top-level directory (same buckets as AI enrich). */
+export function groupFactsByModule(facts: CodeFact[]): Map<string, CodeFact[]> {
+  const modules = new Map<string, CodeFact[]>();
+  for (const fact of facts) {
+    if (fact.kind === 'relation') continue;
+    const mod = fact.file.split('/')[0] || '_root';
+    const existing = modules.get(mod) ?? [];
+    existing.push(fact);
+    modules.set(mod, existing);
+  }
+  return modules;
+}
+
+function isSafeSlug(name: string): boolean {
+  try {
+    assertSafeResourceName(name);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Deterministic evidence manifest when AI enrich yields nothing.
+ *
+ * Component granularity matches deep-enrich: one slug per top-level module.
+ * If that list is empty, fall back to `kind === 'component'` fact names so a
+ * one-file repo still produces a consumable `components[]`.
+ */
+export function buildFallbackManifest(ctx: {
+  project: string;
+  facts: CodeFact[];
+  modules: Map<string, CodeFact[]>;
+}): CodebaseOutputManifestV2 | null {
+  const moduleNames = [...ctx.modules.keys()].filter(isSafeSlug);
+  const componentNames = [...new Set(
+    ctx.facts.filter(f => f.kind === 'component').map(f => f.name),
+  )].filter(isSafeSlug);
+  const slugs = moduleNames.length > 0 ? moduleNames : componentNames;
+  if (slugs.length === 0) return null;
+
+  const components: ManifestComponentV2[] = slugs.map((name) => {
+    const moduleFacts = ctx.modules.get(name) ?? ctx.facts.filter(f => f.name === name);
+    const entrypoints = moduleFacts
+      .filter(f => f.kind === 'component')
+      .filter(f => /handler|route|controller|endpoint|main|server|app/i.test(f.name))
+      .slice(0, 5)
+      .map(f => `${f.name} (${f.file}:${f.lineStart})`);
+    return {
+      slug: name,
+      docPath: `evidence/code/${ctx.project}/${name}.md`,
+      title: name,
+      category: 'component',
+      confidence: 'EXTRACTED',
+      ...(entrypoints.length > 0 ? { entrypoints } : {}),
+    };
+  });
+
+  return {
+    schemaVersion: 'team-wiki.codebase-output-manifest.v2',
+    project: ctx.project,
+    generatedAt: new Date().toISOString(),
+    components,
+    edges: [],
+  };
+}
+
+export function describeEvidenceManifest(source: 'ai' | 'fallback' | 'none', componentCount: number): string | undefined {
+  if (source === 'fallback') {
+    const noun = componentCount === 1 ? 'component' : 'components';
+    return `Wrote fallback _manifest.json (${componentCount} ${noun}, no AI enrich)`;
+  }
+  if (source === 'none') {
+    return 'AI enrich produced no manifest; deep-enrich will have no components';
+  }
+  return undefined;
+}
+
 export async function enrichWithAI(ctx: EnrichContext): Promise<EnrichResult | null> {
   const moduleEntries = [...ctx.modules.entries()].filter(([, facts]) => facts.length >= 5);
 
@@ -193,24 +272,32 @@ export async function enrichWithAI(ctx: EnrichContext): Promise<EnrichResult | n
 
   const edges: ManifestEdgeV2[] = [];
   for (const { name } of moduleResults) {
-    // Cross-module edges based on import facts
+    // Cross-module edges based on import/relation facts. AST-derived facts encode
+    // their real relation and source in `detail` ("<RELATION> → <target> (code-ast)");
+    // regex heuristic facts carry a raw source line, so they keep the defaults.
     const moduleImports = ctx.facts.filter(f => f.kind === 'relation' && f.file.startsWith(name + '/'));
-    const targetModules = new Set<string>();
+    const targetEdges = new Map<string, { relation: string; source: ManifestEdgeSource }>();
     for (const imp of moduleImports) {
       const resolved = resolveImportToModule(imp.file, imp.name);
-      if (resolved && resolved !== name) {
-        targetModules.add(resolved);
+      if (!resolved || resolved === name) {
+        continue;
+      }
+      const provenance = parseEdgeProvenance(imp.detail);
+      const existing = targetEdges.get(resolved);
+      // Deterministic winner regardless of fact order: highest provenance rank wins.
+      if (!existing || edgeProvenanceRank(provenance) > edgeProvenanceRank(existing)) {
+        targetEdges.set(resolved, provenance);
       }
     }
-    for (const target of targetModules) {
+    for (const [target, provenance] of targetEdges) {
       if (moduleResults.some(m => m.name === target)) {
         edges.push({
           from: name,
           to: target,
-          relation: 'DEPENDS_ON',
+          relation: provenance.relation,
           confidence: 'EXTRACTED',
-          source: 'code-heuristic',
-          reason: `${name} imports from ${target}`,
+          source: provenance.source,
+          reason: edgeReason(name, target, provenance.relation),
         });
       }
     }
@@ -225,6 +312,61 @@ export async function enrichWithAI(ctx: EnrichContext): Promise<EnrichResult | n
   };
 
   return { manifest, domains, repoDomain, repoDescription, repoKeywords };
+}
+
+/**
+ * Parse edge relation and source from a relation fact's detail string.
+ *
+ * AST-derived facts encode `"<RELATION> → <target> (code-ast)"`; anything else
+ * (regex heuristic facts, whose detail is a raw source line) falls back to a
+ * DEPENDS_ON / code-heuristic default.
+ */
+export function parseEdgeProvenance(detail: string): { relation: string; source: ManifestEdgeSource } {
+  if (detail.includes('(code-ast)')) {
+    const relation = detail.startsWith('REFERENCES')
+      ? 'REFERENCES'
+      : detail.startsWith('IMPLEMENTS')
+        ? 'IMPLEMENTS'
+        : 'DEPENDS_ON';
+    return { relation, source: 'code-ast' };
+  }
+  return { relation: 'DEPENDS_ON', source: 'code-heuristic' };
+}
+
+/**
+ * Rank an edge provenance so a deterministic winner emerges when several facts
+ * describe the same module pair (independent of fact ordering).
+ *
+ * AST provenance always outranks heuristic. Among AST edges the import
+ * dependency (DEPENDS_ON) is the canonical module-level relation and wins,
+ * keeping the edge consistent with the "imports from" reason.
+ */
+export function edgeProvenanceRank(provenance: { relation: string; source: ManifestEdgeSource }): number {
+  if (provenance.source !== 'code-ast') {
+    return 0;
+  }
+  switch (provenance.relation) {
+    case 'DEPENDS_ON':
+      return 3;
+    case 'REFERENCES':
+      return 2;
+    case 'IMPLEMENTS':
+      return 1;
+    default:
+      return 1;
+  }
+}
+
+/** Build a human-readable edge reason that matches the resolved relation. */
+export function edgeReason(from: string, to: string, relation: string): string {
+  switch (relation) {
+    case 'REFERENCES':
+      return `${from} references ${to}`;
+    case 'IMPLEMENTS':
+      return `${from} implements ${to}`;
+    default:
+      return `${from} imports from ${to}`;
+  }
 }
 
 export async function writeManifest(manifest: CodebaseOutputManifestV2, outputDir: string): Promise<string> {

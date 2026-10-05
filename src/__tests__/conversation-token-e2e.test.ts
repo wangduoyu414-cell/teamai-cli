@@ -33,6 +33,23 @@ beforeEach(() => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-ct-e2e-'));
   originalHome = process.env.HOME ?? '';
   process.env.HOME = tmpDir;
+  // A configured user scope: the payload cwd below is a fixture path that need
+  // not exist, and resolveConfigForDir then falls back to this config — the
+  // installed-team case the legacy dashboard-report gate lets through (#768).
+  fs.mkdirSync(path.join(tmpDir, '.teamai'), { recursive: true });
+  fs.writeFileSync(
+    path.join(tmpDir, '.teamai', 'config.yaml'),
+    [
+      'username: jeff',
+      'scope: user',
+      'repo:',
+      '  kind: git',
+      `  localPath: ${path.join(tmpDir, '.teamai', 'team-repo')}`,
+      '  remote: https://example.test/acme/team.git',
+      'additionalRoles: []',
+      '',
+    ].join('\n'),
+  );
 });
 
 afterEach(() => {
@@ -65,11 +82,11 @@ function writeTranscript(): string {
   const lines = [
     JSON.stringify({ type: 'user', message: { content: [{ type: 'text', text: 'create hello.txt' }] } }),
     // Turn 1: one message id, two content-block lines (text + tool_use), same usage repeated.
-    JSON.stringify({ type: 'assistant', message: { id: 'msg_A', usage: usage1, content: [{ type: 'text', text: 'sure' }] } }),
-    JSON.stringify({ type: 'assistant', message: { id: 'msg_A', usage: usage1, content: [{ type: 'tool_use', id: 'toolu_1', name: 'Write' }] } }),
+    JSON.stringify({ type: 'assistant', timestamp: '2026-09-01T23:59:00Z', message: { id: 'msg_A', model: 'claude-sonnet-5', usage: usage1, content: [{ type: 'text', text: 'sure' }] } }),
+    JSON.stringify({ type: 'assistant', timestamp: '2026-09-01T23:59:00Z', message: { id: 'msg_A', model: 'claude-sonnet-5', usage: usage1, content: [{ type: 'tool_use', id: 'toolu_1', name: 'Write' }] } }),
     JSON.stringify({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_1', content: 'ok' }] } }),
     // Turn 2: different message id.
-    JSON.stringify({ type: 'assistant', message: { id: 'msg_B', usage: usage2, content: [{ type: 'text', text: 'done' }] } }),
+    JSON.stringify({ type: 'assistant', timestamp: '2026-09-02T00:01:00Z', message: { id: 'msg_B', model: 'claude-sonnet-5', usage: usage2, content: [{ type: 'text', text: 'done' }] } }),
   ];
   fs.writeFileSync(p, lines.join('\n') + '\n');
   return p;
@@ -93,6 +110,13 @@ describe('conversation + token metric — end to end', () => {
     const stopEvent = events.find((e) => e.type === 'stop')!;
     // msg_A counted once (not twice) + msg_B:
     expect(stopEvent.tokens).toEqual({ input: 120, output: 130, cacheRead: 2500, cacheCreation: 200 });
+    expect(stopEvent.requestMetrics).toMatchObject({ pricedRequests: 2, priceVersion: 'anthropic-2026-09-09' });
+    expect(stopEvent.requestDaily).toMatchObject({
+      '2026-09-01': { pricedRequests: 1 },
+      '2026-09-02': { pricedRequests: 1 },
+    });
+    const requestLines = fs.readFileSync(path.join(tmpDir, '.teamai', 'dashboard', 'requests.jsonl'), 'utf-8').trim().split('\n');
+    expect(requestLines).toHaveLength(2);
 
     // Dashboard rebuild surfaces prompt count + tokens on the card.
     const sessions = rebuildSessions(events);

@@ -15,17 +15,50 @@ npm install
 ```bash
 npm run build          # Build with tsup → dist/
 npx tsc --noEmit       # Type check
+npm run lint           # oxlint; CI fails on any warning
 npx vitest run         # Run unit tests
 npx vitest run --coverage
 npm run test:e2e       # E2E tests (optional, requires a live test repo)
 ```
 
+`npm run lint` needs Node ^20.19 or >=22.12 (oxlint's requirement); the CLI itself still supports Node 20.
+
 ### Running your local build
 
 ```bash
-npm link
+npm run build && npm link
 teamai --version
 ```
+
+### Dogfood against a public team repo
+
+All contributors should exercise pull, hooks, and recall while developing the CLI. Create a **regular** (not template) public team repo under [teamai-hub](https://github.com/teamai-hub), e.g. `https://github.com/teamai-hub/teamai-cli-dev`, with `main` branch protection (PR + review). Put only public-safe skills / rules / docs there.
+
+In the **CLI clone** (not as `teamai init .`):
+
+```bash
+npm run build && npm link
+teamai init https://github.com/teamai-hub/teamai-cli-dev --scope project --role dev
+teamai pull
+git status   # nothing under .teamai/ or tool dirs should be staged for this repo
+```
+
+Pitfalls:
+
+- Init the **canonical hub URL**, not a personal fork. `teamai init <url>` treats that URL as the team repo; a fork diverges immediately, and GitHub push/PR today targets the configured remote (no fork-to-upstream flow).
+- Do **not** run `teamai init .`. That is single-repo mode: it turns the CLI source tree into the team repo and writes scaffolding at the repo root (easy to commit by mistake).
+- `Push failed (you can push manually later)` on member registration is **expected** without write access. Local config is still saved; `teamai pull` still works.
+
+#### Write access and team stats
+
+`digest` / `dashboard` read `stats/`, `sessions/`, and `members/` from the team repo. Those files are written via git, so **no write ⇒ not in team stats**.
+
+Giving every internet contributor write on the hub repo is not acceptable.
+
+| Who | Hub repo access | Required setup | In team digest |
+|-----|-----------------|----------------|----------------|
+| Contributors | read | `init` + `pull` | no |
+| Collaborators (after a few PRs) | write, `main` protected | full, including reports | yes |
 
 ## Project Layout
 
@@ -43,11 +76,13 @@ See [docs/providers.md](../docs/providers.md) for how to add a new git provider.
 
 ## Making a Change
 
-1. Fork the repo and create a feature branch from `master`.
+1. Fork the repo and create a feature branch from the latest `origin/main`. Prefer a git worktree for code changes when practical.
 2. Write tests for your change (we target 80%+ coverage).
-3. Run `npx vitest run` and `npx tsc --noEmit` — both must pass.
+3. Run `npx vitest run`, `npx tsc --noEmit` and `npm run lint` — all must pass.
 4. Use conventional commits where possible: `feat:`, `fix:`, `chore:`, `docs:`, `refactor:`, `test:`.
 5. Open a PR with a clear description: what's the problem, what's the fix, anything reviewers should pay attention to.
+
+Your PR also gets an informational `Code Erosion` report (SlopCodeBench verbosity/erosion metrics) posted as a comment — it never blocks the merge and is just there to flag creeping complexity. See [docs/ci-code-erosion.md](../docs/ci-code-erosion.md).
 
 ## Coding Style
 

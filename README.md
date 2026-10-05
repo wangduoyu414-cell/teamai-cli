@@ -1,26 +1,76 @@
 <p align="center">
-  <img src="assets/teamai-cli-logo.svg" alt="teamai-cli" width="430">
+  <img src="assets/teamai-cli-logo.svg" alt="teamai-cli">
 </p>
 
-# TeamAI — The team harness for AI agents
+<h1 align="center">TeamAI — Make Every Team AI Native</h1>
 
-> [English](README.md) | [简体中文](README.zh-CN.md)
+<p align="center">
+  <a href="https://trendshift.io/repositories/123184?utm_source=repository-badge&amp;utm_medium=badge&amp;utm_campaign=badge-repository-123184" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/repositories/123184" alt="Tencent%2Fteamai-cli | Trendshift" width="250" height="55"/></a>
+</p>
 
-[![CI](https://github.com/wangduoyu414-cell/teamai-cli/actions/workflows/ci.yml/badge.svg)](https://github.com/wangduoyu414-cell/teamai-cli/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+<p align="center">
+  <a href="README.md">English</a> | <a href="README.zh-CN.md">中文</a> | <a href="README.ja.md">日本語</a> | <a href="README.ko.md">한국어</a> | <a href="README.th.md">ไทย</a>
+</p>
 
-[![User Chat](https://img.shields.io/badge/User_Chat-Discord-5865F2?logo=discord&logoColor=white)](https://discord.gg/gervEZm58g)
-[![Developer Chat](https://img.shields.io/badge/Developer_Chat-Discord-5865F2?logo=discord&logoColor=white)](https://discord.gg/DeHHxPnfZF)
+<p align="center">
+  <a href="https://github.com/Tencent/teamai-cli/actions/workflows/ci.yml"><img src="https://github.com/Tencent/teamai-cli/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://www.npmjs.com/package/teamai-cli"><img src="https://img.shields.io/npm/v/teamai-cli.svg" alt="npm version"></a>
+  <a href="https://www.npmjs.com/package/teamai-cli"><img src="https://img.shields.io/npm/dm/teamai-cli.svg" alt="npm downloads"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT"></a>
+</p>
 
-Make every AI coding agent work by the same harness.
+**The shared foundation for how your team works, learns, and improves with AI.**
 
-Git-native management of skills, rules, and docs across Claude Code / Codex / CodeBuddy / WorkBuddy and more.
+TeamAI turns individual AI capabilities into shared team capabilities — across agents, machines, and team members.
 
-For you or your whole team.
+## Why TeamAI
 
-> This fork is the pinned TeamAI Core used by the Autocode resource repository. It keeps upstream v0.20.0 behavior while adding strict host-aware Agent rendering and manifest-backed resource lifecycle safety. Version `0.20.0-autocode.5` adds explicit-only WorkBuddy/DeepSeek Harness static-resource adapters, persisted host-root drift protection, machine-readable diagnostics with stable check IDs and reliable exit codes, and WorkBuddy version discovery on macOS and Windows. It is installed from an immutable commit archive, not from npm.
+<p align="center">
+  <img src="assets/use-cases.png" alt="Eight everyday scenarios, before and after TeamAI" width="100%">
+</p>
+
+> This fork is based on stable upstream **v0.26.0**. It keeps autocode’s managed-resource, model-policy and static-host contracts; ordinary upstream configurations retain native delivery. See [the fork changelog](CHANGELOG.md) for migration and preview behavior. Installed from an immutable commit archive, not npm.
 
 ## Quick Start
+
+Send this one line to your AI tool:
+
+```text
+Install the teamai skill: https://github.com/Tencent/teamai-cli/tree/main/skills/teamai , load the teamai skill, then set up TeamAI for my team from scratch.
+```
+
+Once TeamAI is set up, just talk to the `/teamai` skill in your AI tool:
+
+**Set up a team from scratch**
+
+```text
+/teamai Help me set up TeamAI for my team from scratch
+```
+
+**Join a team**
+
+```text
+/teamai Help me join my team's TeamAI, repo URL is https://github.com/your-org/your-repo
+```
+
+**Share with the team**
+
+Skills, rules, MCP servers, and other agent resources can all be shared:
+
+```text
+/teamai Share my xxx skill with the team
+```
+
+**Open the dashboard**
+
+```text
+/teamai Open the TeamAI dashboard
+```
+
+Once a teammate is set up, they just open their agent and already have the team's full set of AI assets.
+
+<details>
+<summary>Command-line install</summary>
 
 ### Install
 
@@ -31,212 +81,91 @@ npm install -g "https://github.com/wangduoyu414-cell/teamai-cli/archive/${TEAMAI
 
 ### Team admin / solo user
 
-Create a shared-experience repo on your git host (GitHub, TGit, or CNB), **grant write access to team members**, then have them run `teamai init https://github.com/yourorg/yourrepo`.
+Create a shared-experience repo on your git host (GitHub, GitLab, GitCode, CNB, TGit, or a private Git service), **grant write access to team members**, then run `teamai init https://github.com/your-org/your-repo`.
 
-> Solo use needs no separate repo setup: `teamai init` checks the target repo and creates it automatically if it doesn't exist.
-
-> **No team repo yet?** Start from a template pre-loaded with production-ready skills, rules, and review agents. Browse the [teamai-hub](https://github.com/teamai-hub) org, click **Use this template**, then `teamai init` against your new repo.
+> **No team repo yet?** Start from a template pre-loaded with production-ready skills, rules, and review agents. Browse the [teamai-hub](https://github.com/teamai-hub) org, click **Fork**, then `teamai init` against your new repo.
 
 ### Team members
 
 ```bash
+# Choose one, depending on where you want resources installed
+
 # Project-scope init (default, resources installed under the project directory)
 cd /path/to/my-project
-teamai init https://github.com/yourorg/yourrepo
+teamai init https://github.com/your-org/your-repo
 
-# User-scope init (resources installed under ~/)
-teamai init https://github.com/yourorg/yourrepo --scope user
-
-# Optional layered setup: keep a project repo active while inheriting safe
-# resources and searchable knowledge from an initialized user-scope repo
-cd /path/to/my-project
-teamai init https://github.com/yourorg/project-repo --inherit-user-scope
+# Or, user-scope init (resources installed under ~/)
+teamai init https://github.com/your-org/your-repo --scope user
 ```
 
 Once initialized, every AI session automatically pulls the latest skills / rules and other Harness updates published by admins — no manual sync needed.
 
-### Single-repo mode (the business repo *is* the team repo)
+</details>
 
-No separate team repo. Run `teamai init .` inside an existing project and its own git repo becomes the team repo:
+## Product Overview
 
-```bash
-cd /path/to/my-project
-teamai init .                        # interactive: pick which AI tools to set up
-teamai init . --agent claude,codex   # non-interactive: Claude Code + Codex
-```
+Three layers of capability, built on Git:
 
-- **Knowledge** (skills / rules / docs / learnings) is committed to your repo's **main branch** under `.teamai/`, so a plain `git clone` already carries the whole team setup.
-- **Reports** (member registrations, session summaries, votes, usage stats) go to a separate **`teamai-reports` orphan branch** — they never touch main.
-- **You choose which AI tools to set up.** `--agent claude,codex` (repeatable/comma-separated), an interactive picker when omitted, or — in non-interactive contexts — whichever tools you already use under `~/`. teamai creates each selected tool's dir, injects hooks, and commits its settings.
-- **Clone = initialized.** When a teammate clones the repo, the next `teamai` command (or AI session) auto-detects the `mode: self` marker in `.teamai/teamai.yaml` and finishes local setup automatically — no need to re-type repo/role.
-- All of teamai's git operations run in isolated worktrees, so your working tree and current branch are never touched.
+- **Team Execution** — make every agent work the team's way: skills, rules, docs, env, agents, hooks, MCP, models.
+- **Team Context** (beta) — make every agent understand the team: learnings, codebase graph, teamwiki.
+- **Team Improvement** (beta) — make every execution improve the team: usage, sessions, dashboard.
 
-`teamai init .` commits `.teamai/` (skills, rules, docs, learnings, `teamai.yaml`, `.gitignore`) plus each selected tool's settings (e.g. `.claude/settings.json`, `.codex/hooks.json`) for you; just push main so teammates get auto-initialized on clone.
+<table>
+  <thead>
+    <tr>
+      <th rowspan="2">Agent</th>
+      <th colspan="8">Team Execution</th>
+      <th colspan="3">Team Context (beta)</th>
+      <th colspan="3">Team Improvement (beta)</th>
+    </tr>
+    <tr>
+      <th>skills</th><th>rules</th><th>docs</th><th>env</th><th>agents</th><th>hooks</th><th>mcp</th><th>models</th>
+      <th>learnings</th><th>codebase</th><th>teamwiki</th>
+      <th>usage</th><th>sessions</th><th>dashboard</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr><td>Claude Code</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td></tr>
+    <tr><td>Codex</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td></tr>
+    <tr><td>Cursor</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">—</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td></tr>
+    <tr><td>GitHub Copilot CLI</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">—</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td></tr>
+    <tr><td>CodeBuddy</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td></tr>
+    <tr><td>WorkBuddy</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">—</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td></tr>
+    <tr><td>OpenCode</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">—</td><td align="center">—</td><td align="center">—</td></tr>
+    <tr><td>Pi Coding Agent</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">—</td><td align="center">—</td><td align="center">✓</td><td align="center">—</td><td align="center">—</td><td align="center">—</td><td align="center">—</td><td align="center">—</td><td align="center">—</td><td align="center">—</td><td align="center">—</td></tr>
+    <tr><td>OpenClaw</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">—</td><td align="center">—</td><td align="center">—</td><td align="center">—</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">—</td><td align="center">—</td><td align="center">—</td></tr>
+    <tr><td>Hermes</td><td align="center">✓</td><td align="center">—</td><td align="center">✓</td><td align="center">✓</td><td align="center">—</td><td align="center">—</td><td align="center">—</td><td align="center">—</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">—</td><td align="center">—</td><td align="center">—</td></tr>
+    <tr><td>DeepSeek Harness</td><td align="center">✓</td><td align="center">—</td><td align="center">✓</td><td align="center">—</td><td align="center">—</td><td align="center">—</td><td align="center">—</td><td align="center">—</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">—</td><td align="center">—</td><td align="center">—</td></tr>
+    <tr><td>Qoder</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">—</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td></tr>
+    <tr><td>Qoder CN</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">—</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td></tr>
+    <tr><td>Kiro</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">—</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td></tr>
+    <tr><td>ZCode</td><td align="center">✓</td><td align="center">—</td><td align="center">✓</td><td align="center">—</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">—</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td></tr>
+    <tr><td>Oh My Pi</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">—</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">—</td><td align="center">—</td><td align="center">—</td></tr>
+  </tbody>
+</table>
 
-> **Full usage guide:** [docs/usage-guide.md](docs/usage-guide.md) ([中文版](docs/usage-guide.zh-CN.md)) — covers everything from team creation to day-to-day use.
+## Learn More
 
-## Harness Management & Distribution
+- [Usage Guide](docs/usage-guide.md) ([中文版](docs/usage-guide.zh-CN.md)) — setup, onboarding, daily workflows, and commands
+- [Product Overview](docs/product-overview.md) ([中文版](docs/product-overview.zh-CN.md)) — architecture, distribution controls, and capability details
+- [Git Providers](docs/providers.md) — supported repository providers
+- [Windows Setup](docs/windows-hooks.md) ([中文版](docs/windows-hooks.zh-CN.md)) — hooks and shell configuration
+- [Technical Designs](docs/designs/) — design documents and proposals
 
-TeamAI keeps skills, rules, docs, and hooks in a shared git repo and distributes them to every member's local AI tools through a "push → review & merge → pull" flow — with support for subscribing to other teams' Harness.
+## Contributors
 
-### How It Works
+Thanks to everyone who has contributed to TeamAI!
 
-```
-teamai push → create branch + MR → reviewer approves + merges
-                                         ↓
-              SessionStart hook → teamai pull → synced to local AI tools
-```
+<a href="https://github.com/Tencent/teamai-cli/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=Tencent/teamai-cli" alt="Contributors" />
+</a>
 
-Members push changes via `teamai push`, which opens a Merge Request for review. Once merged, `teamai pull` (triggered automatically on session start via the SessionStart hook) syncs the latest resources locally. Skills sync to `~/.claude/skills/`, `~/.codex/skills/`, `~/.cursor/skills/`, `~/.codebuddy/skills/`, etc.
+Made with [contrib.rocks](https://contrib.rocks).
 
-### Team Hooks
+## Contributing
 
-Declare custom hooks in `hooks/hooks.yaml` and `teamai pull` delivers them to every AI tool:
-
-```yaml
-hooks:
-  - id: block-secret
-    description: Scan for secrets before commit
-    event: PreToolUse
-    matcher: Bash
-    command: 'bash -lc "~/.teamai/team-scripts/scan-secret.sh" || true'
-    tools: [claude, cursor]
-```
-
-```bash
-teamai hooks list      # list effective hooks
-teamai hooks inject    # re-reconcile into every installed tool
-teamai hooks remove    # remove all teamai-managed hooks
-```
-
-### Team MCP Servers
-
-Declare once in `mcp/mcp.yaml`; `teamai pull` writes each tool's native config. Use `${VAR}` for secrets.
-
-```yaml
-servers:
-  - name: gpu-analysis
-    transport: http            # stdio | http | sse
-    url: https://example.com/api/mcp
-    headers:
-      Authorization: Bearer ${GPU_ANALYSIS_TOKEN}
-```
-
-```bash
-teamai mcp list | inject | remove
-```
-
-### Cross-team Skill Subscription
-
-Subscribe to other teams' public skill repos:
-
-```bash
-teamai source add https://github.com/other-team/teamai-public.git --name other-team
-teamai source list
-teamai source browse other-team    # browse available skills
-teamai source remove other-team
-```
-
-Subscribed skills sync automatically on `teamai pull`.
-
-## Knowledge Base
-
-Beyond distributing the Harness, TeamAI organizes accumulated team experience and code structure into a searchable knowledge base that the AI recalls automatically when needed.
-
-### Automatic Experience Sharing
-
-When a session ends, the Stop hook scores it by **friction** — signals that the session hit something worth remembering: you interrupted or corrected the AI, denied a tool call, or the AI had to retry failing tools. A long-but-routine session (lots of tool calls, no friction) does not trigger; a session where you actually fought a problem does. If the score is high enough, the AI suggests:
-
-```
-[teamai] This session may contain a problem worth documenting: you interrupted the AI twice, the AI retried failing tools 8 times.
-
-Task: Fix duplicate project-level Hook injection
-
-Consider running /teamai-share-learnings to summarize what you learned and share it with your team.
-```
-
-The hint names the non-zero friction signals that triggered it and, when available, includes a redacted, single-line summary of the first task. The `/teamai-share-learnings` skill summarizes the session and pushes a learning document directly to the team repo. Each session is prompted at most once.
-
-### Team Knowledge Recall
-
-Let the AI automatically search accumulated team knowledge before a task. This feature is **off by default** and must be enabled explicitly — teams can set `sharing.recall.enabled: true` in `teamai.yaml` as the default, and members can override locally:
-
-```bash
-teamai recall enable     # on: deploy the teamai-recall subagent + inject guidance rules
-teamai recall disable    # off: remove the subagent and rules
-teamai recall status     # show effective state (team default + user override)
-```
-
-**Search runs via a subagent**: once enabled, `teamai pull` deploys the built-in `teamai-recall` subagent into each AI tool's `agents/` directory. The AI invokes it before a task — the subagent extracts keywords, runs the search, reads the matched source files, and returns a structured summary of team knowledge. The subagent first runs a relevance precheck (`teamai recall --check`) and skips retrieval entirely when the task is unrelated to team knowledge. Under the hood it shells out to the `teamai recall` command, which you can also run manually:
-
-```bash
-$ teamai recall "port conflict"
-[1/2] MR review caught a port-conflict bug ★1 [user]
-Author: member-a | Score: 18.5 | Tags: troubleshooting, networking
-
-[2/2] Deployment configuration best practices [project]
-Author: member-b | Score: 12.0 | Tags: deploy, config
-Matched: conflict | Missing: port
-```
-
-A `Matched: … | Missing: …` line appears whenever a hit does not cover every
-query term (omitted when all terms matched). Recall returns its top matches by
-score without filtering on coverage: a hit missing all of your distinctive
-terms is topically adjacent, not an answer. Judging that is the caller's job —
-the score alone cannot express it. Entries matching on title, date, author and
-content are collapsed, so the same learning shared twice does not occupy two
-slots.
-
-**Coverage spans two parts:**
-
-- **Shared search index** (`search-index.json`): four categories — learnings (session experience), docs (team docs), rules (coding rules), and skills (each `SKILL.md`) — sourced from the corresponding team-repo directories, (re)built on `teamai pull` / `teamai contribute`.
-- **Codebase knowledge graph** (`teamwiki/`): produced by `teamai import`, queried live at search time.
-
-Ranking uses BM25 + graph-boost. When the current working directory contains a project-scope config, Recall searches that project; if the project enables `--inherit-user-scope`, it then searches user knowledge, tags each result with its origin, and lets an identical project entry override the user entry. Without a project config in the current directory, Recall searches the user scope. Active-scope hits are implicitly upvoted; inherited user hits remain read-only while the project is active.
-
-### Codebase Knowledge Graph
-
-`teamai import` parses source repos into a structured graph under `teamwiki/`, enabling structurally-aware retrieval:
-
-```bash
-teamai import --from-repo https://github.com/org/repo
-teamai import --from-org myorg              # batch import all repos
-teamai codebase --lint                      # health check
-```
-
-The graph stores components, interfaces, configs, and cross-repo import edges. `teamai recall` uses it for graph-boosted re-ranking.
-When a recall hit comes from a codebase page, the result includes a `Sources:` line listing the relevant source file paths — giving agents a direct starting point for code changes instead of re-exploring the repo.
-
-## Commands
-
-| Command | Description |
-|---------|-------------|
-| `teamai init` | Initialize: OAuth login, link repo, register member, inject hooks |
-| `teamai pull` | Pull team resources and inject into local AI tools |
-| `teamai push` | Push local resources to a branch and open a Merge Request |
-| `teamai status` | Show local vs team repo diff |
-| `teamai contribute` | Share session experience to team repo |
-| `teamai recall <query>` | Search the team knowledge base (BM25 + graph-boost) |
-| `teamai recall enable/disable/status` | Toggle or check recall state |
-| `teamai import` | Import knowledge (`--dir`, `--from-repo`, `--from-org`, `--from-repo-list`, `--from-mr`, `--from-iwiki`) |
-| `teamai codebase --lint` | Knowledge graph health check |
-| `teamai ci extract-mr --url <url>` | CI: extract knowledge from MR, post comments, write after merge |
-| `teamai members` | List team members |
-| `teamai roles` | Manage team roles and namespaces |
-| `teamai skill exclude add/remove/list` | Manage skills excluded from local sync ([usage guide](docs/usage-guide.md#excluding-skills-you-dont-need)) |
-| `teamai source` | Manage cross-team skill subscriptions |
-| `teamai remove <type> <name>` | Remove a resource and open MR |
-| `teamai session save` | Record a privacy-scrubbed session summary to a monthly log (`--push` feeds `digest`) |
-| `teamai digest` | Generate weekly team usage digest |
-| `teamai doctor [--json]` | Diagnose configuration issues; JSON mode is suitable for automation and exits nonzero on failure |
-| `teamai uninstall` | Remove all teamai resources and hooks |
-
-Global options: `--dry-run` / `--plan` (zero-side-effect lifecycle preview), `--verbose`
+Join the conversation, or open an issue or PR. See [CONTRIBUTING.md](.github/CONTRIBUTING.md) for how to contribute.
 
 ## License
 
 [MIT](LICENSE)
-
-## Contributing
-
-PRs are welcome! Please read [CONTRIBUTING.md](.github/CONTRIBUTING.md) first.

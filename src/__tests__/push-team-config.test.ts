@@ -1,0 +1,409 @@
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import fs from 'node:fs';
+import path from 'node:path';
+import os from 'node:os';
+import { simpleGit } from 'simple-git';
+
+// Integration test for the "push carries teamai.yaml" fix.
+//
+// Regression: `teamai source add` writes sources/publicSkills into the team repo's
+// teamai.yaml WITHOUT committing, then tells the user to run `teamai push`. Before
+// the fix, push would (1) `git reset --hard` the working tree in resetToCleanMaster
+// and destroy that edit, and (2) never include teamai.yaml in the commit even if it
+// survived. This test drives the real push() against real local git repos (a bare
+// "remote" + a working clone), mocking only the provider's PR creation.
+
+const mockCreatePullRequest = vi.fn().mockResolvedValue('https://example.test/pr/1');
+const mockAutoDetectInit = vi.fn();
+const mockLoadStateForScope = vi.fn();
+const mockSaveStateForScope = vi.fn();
+
+vi.mock('../providers/index.js', () => ({
+  getProvider: () => ({
+    name: 'github',
+    parseRepoInput: (input: string) => ({ owner: 'acme', repo: 'team', httpsUrl: input }),
+    createPullRequest: (...args: unknown[]) => mockCreatePullRequest(...args),
+  }),
+}));
+
+vi.mock('../config.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../config.js')>()),
+  autoDetectInit: (...args: unknown[]) => mockAutoDetectInit(...args),
+  loadStateForScope: (...args: unknown[]) => mockLoadStateForScope(...args),
+  saveStateForScope: (...args: unknown[]) => mockSaveStateForScope(...args),
+}));
+
+vi.mock('../read-only.js', () => ({ assertNotReadOnly: vi.fn() }));
+
+// Pre-push sync reads/writes tool dirs we don't care about here — no-op it.
+vi.mock('../utils/pre-push-sync.js', () => ({ syncTeamUpdatesToLocal: vi.fn() }));
+
+vi.mock('../utils/prompt.js', () => ({
+  isInteractive: vi.fn(() => true),
+  askQuestion: vi.fn(() => Promise.resolve('')),
+  askConfirmation: vi.fn(() => Promise.resolve(true)),
+  askSelection: vi.fn((_p: string, n: number, all?: boolean) =>
+    Promise.resolve(all ? Array.from({ length: n }, (_x, i) => i) : null)),
+  parseSelection: vi.fn(),
+  closePrompt: vi.fn(),
+}));
+
+async function initTeamRepos(root: string): Promise<string> {
+  const remote = path.join(root, 'remote.git');
+  const seed = path.join(root, 'seed');
+  const teamRepo = path.join(root, 'team-repo');
+
+  // Pin the bare repo's default branch to main. Without this, a runner whose
+  // git defaults to `master` (init.defaultBranch) leaves the bare HEAD pointing
+  // at a branch we never push, so `git clone` lands on an unborn HEAD and the
+  // working clone has no local `main` — `.branch().current` then reads '' and
+  // the "switches back to the default branch" assertion sees '' instead of main.
+  await simpleGit().init(['--bare', '--initial-branch=main', remote]);
+
+  fs.mkdirSync(path.join(seed, 'skills', 'ns'), { recursive: true });
+  fs.writeFileSync(path.join(seed, 'teamai.yaml'), 'version: 1\npublicSkills: []\n');
+  const seedGit = simpleGit(seed);
+  await seedGit.init();
+  await seedGit.addConfig('user.email', 't@t.com');
+  await seedGit.addConfig('user.name', 't');
+  await seedGit.add('.');
+  await seedGit.commit('init');
+  await seedGit.branch(['-M', 'main']);
+  await seedGit.addRemote('origin', remote);
+  await seedGit.push(['-u', 'origin', 'main']);
+
+  await simpleGit().clone(remote, teamRepo);
+  const trGit = simpleGit(teamRepo);
+  await trGit.addConfig('user.email', 't@t.com');
+  await trGit.addConfig('user.name', 't');
+  return teamRepo;
+}
+
+/** Read teamai.yaml as committed on the branch that push created + pushed to remote. */
+async function committedYamlOnPushedBranch(teamRepo: string): Promise<string> {
+  const git = simpleGit(teamRepo);
+  const branches = await git.branch();
+  const pushBranch = branches.all.find((b) => b.startsWith('teamai/') || b.includes('push'))
+    ?? branches.current;
+  return (await git.show([`${pushBranch}:teamai.yaml`]));
+}
+
+describe('push carries teamai.yaml (source add regression)', () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-push-cfg-'));
+    vi.clearAllMocks();
+    mockCreatePullRequest.mockResolvedValue('https://example.test/pr/1');
+    mockLoadStateForScope.mockResolvedValue({
+      lastPush: null, pushedSkills: [], pushedRules: [], pushedEnvVars: [],
+    });
+    mockSaveStateForScope.mockResolvedValue(undefined);
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('config-only: source add edit survives reset and is pushed', async () => {
+    const teamRepo = await initTeamRepos(tmpDir);
+
+    // Simulate `teamai source add`: edit teamai.yaml in the working tree, no commit.
+    const yamlPath = path.join(teamRepo, 'teamai.yaml');
+    fs.writeFileSync(yamlPath, 'version: 1\npublicSkills: []\nsources:\n  - name: dev\n    repo: https://git.example/dev\n');
+
+    mockAutoDetectInit.mockResolvedValue({
+      localConfig: {
+        repo: { localPath: teamRepo, remote: path.join(tmpDir, 'remote.git'), kind: undefined },
+        username: 'alice',
+        scope: 'project',
+        projectRoot: teamRepo,
+      },
+      teamConfig: { repo: 'acme/team', toolPaths: {} },
+    });
+
+    const { push } = await import('../push.js');
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    await push({ all: true });
+    logSpy.mockRestore();
+
+    // A PR was created for the config change...
+    expect(mockCreatePullRequest).toHaveBeenCalledTimes(1);
+    // ...and the pushed branch's teamai.yaml contains the source (survived reset --hard).
+    const pushed = await committedYamlOnPushedBranch(teamRepo);
+    expect(pushed).toContain('sources:');
+    expect(pushed).toContain('https://git.example/dev');
+  });
+
+  it('rejects invalid package declarations before creating a PR', async () => {
+    const teamRepo = await initTeamRepos(tmpDir);
+    const yamlPath = path.join(teamRepo, 'teamai.yaml');
+    fs.writeFileSync(yamlPath, [
+      'version: 1',
+      'publicSkills: []',
+      'packages:',
+      '  claude:',
+      '    marketplaces: []',
+      '    plugins:',
+      '      - name: review@missing',
+      '',
+    ].join('\n'));
+    mockAutoDetectInit.mockResolvedValue({
+      localConfig: {
+        repo: { localPath: teamRepo, remote: path.join(tmpDir, 'remote.git'), kind: undefined },
+        username: 'alice',
+        scope: 'project',
+        projectRoot: teamRepo,
+      },
+      teamConfig: { repo: 'acme/team', toolPaths: {} },
+    });
+    const originalExitCode = process.exitCode;
+
+    try {
+      const { push } = await import('../push.js');
+      const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+      await push({ all: true });
+      errorSpy.mockRestore();
+
+      expect(process.exitCode).toBe(1);
+      expect(mockCreatePullRequest).not.toHaveBeenCalled();
+      expect(fs.readFileSync(yamlPath, 'utf8')).toContain('review@missing');
+    } finally {
+      process.exitCode = originalExitCode;
+    }
+  });
+
+  it('rejects an invalid model catalog introduced by the latest pull', async () => {
+    const teamRepo = await initTeamRepos(tmpDir);
+    const seed = path.join(tmpDir, 'seed');
+    fs.mkdirSync(path.join(seed, 'models'));
+    fs.writeFileSync(path.join(seed, 'models', 'models.yaml'), [
+      'profiles:',
+      '  - id: gateway',
+      '    name: Gateway',
+      '    base_url: https://example.test?api_key=sk-secret',
+      '    api_key: ${API_KEY}',
+      '    model_groups:',
+      '      - protocols: [anthropic]',
+      '        models: [claude]',
+      '',
+    ].join('\n'));
+    const seedGit = simpleGit(seed);
+    await seedGit.add('.');
+    await seedGit.commit('add invalid catalog');
+    await seedGit.push('origin', 'main');
+    expect(fs.existsSync(path.join(teamRepo, 'models', 'models.yaml'))).toBe(false);
+    mockAutoDetectInit.mockResolvedValue({
+      localConfig: {
+        repo: { localPath: teamRepo, remote: path.join(tmpDir, 'remote.git'), kind: undefined },
+        username: 'alice', scope: 'project', projectRoot: teamRepo,
+      },
+      teamConfig: { repo: 'acme/team', toolPaths: {} },
+    });
+    const previousExitCode = process.exitCode;
+    try {
+      const { push } = await import('../push.js');
+      const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+      await push({ all: true });
+      errorSpy.mockRestore();
+      expect(process.exitCode).toBe(1);
+      expect(mockCreatePullRequest).not.toHaveBeenCalled();
+      expect(fs.existsSync(path.join(teamRepo, 'models', 'models.yaml'))).toBe(true);
+    } finally {
+      process.exitCode = previousExitCode;
+    }
+  });
+
+  it('config-only: returns a non-zero exit code when PR creation fails', async () => {
+    const teamRepo = await initTeamRepos(tmpDir);
+    const yamlPath = path.join(teamRepo, 'teamai.yaml');
+    fs.writeFileSync(yamlPath, 'version: 1\npublicSkills:\n  - beta-proof\n');
+    mockCreatePullRequest.mockRejectedValue(new Error('PR API unavailable'));
+    mockAutoDetectInit.mockResolvedValue({
+      localConfig: {
+        repo: { localPath: teamRepo, remote: path.join(tmpDir, 'remote.git'), kind: undefined },
+        username: 'alice',
+        scope: 'project',
+        projectRoot: teamRepo,
+      },
+      teamConfig: { repo: 'acme/team', toolPaths: {} },
+    });
+    const originalExitCode = process.exitCode;
+
+    try {
+      const { push } = await import('../push.js');
+      const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+      await push({ all: true });
+      logSpy.mockRestore();
+
+      expect(process.exitCode).toBe(1);
+    } finally {
+      process.exitCode = originalExitCode;
+    }
+  });
+
+  it('no changes at all: reports nothing to push, no PR', async () => {
+    const teamRepo = await initTeamRepos(tmpDir);
+
+    mockAutoDetectInit.mockResolvedValue({
+      localConfig: {
+        repo: { localPath: teamRepo, remote: path.join(tmpDir, 'remote.git'), kind: undefined },
+        username: 'alice',
+        scope: 'project',
+        projectRoot: teamRepo,
+      },
+      teamConfig: { repo: 'acme/team', toolPaths: {} },
+    });
+
+    const { push } = await import('../push.js');
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    await push({ all: true });
+    logSpy.mockRestore();
+
+    expect(mockCreatePullRequest).not.toHaveBeenCalled();
+  });
+
+  it('config-only: switches back to the default branch when the push throws', async () => {
+    const teamRepo = await initTeamRepos(tmpDir);
+    const yamlPath = path.join(teamRepo, 'teamai.yaml');
+    fs.writeFileSync(yamlPath, 'version: 1\npublicSkills:\n  - beta-proof\n');
+    mockAutoDetectInit.mockResolvedValue({
+      localConfig: {
+        repo: { localPath: teamRepo, remote: path.join(tmpDir, 'remote.git'), kind: undefined },
+        username: 'alice',
+        scope: 'project',
+        projectRoot: teamRepo,
+      },
+      teamConfig: { repo: 'acme/team', toolPaths: {} },
+    });
+
+    // Force pushRepoBranch to throw AFTER it has moved the repo onto a push
+    // branch, so the catch path is the only thing that can restore the default
+    // branch. We simulate the mid-push failure by leaving the repo on a stray
+    // branch and rejecting from pushRepoBranch.
+    const git = simpleGit(teamRepo);
+    const gitMod = await import('../utils/git.js');
+    const spy = vi.spyOn(gitMod, 'pushRepoBranch').mockImplementation(async () => {
+      await git.checkoutLocalBranch('teamai/push/alice/stuck-branch');
+      throw new Error('network failure mid-push');
+    });
+    const originalExitCode = process.exitCode;
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+    try {
+      const { push } = await import('../push.js');
+      await push({ all: true });
+
+      // The catch path must land the repo back on the default branch, not just
+      // off the stuck branch (the seed repo's default branch is 'main').
+      const branch = (await git.branch()).current;
+      expect(branch).toBe('main');
+      expect(process.exitCode).toBe(1);
+    } finally {
+      logSpy.mockRestore();
+      spy.mockRestore();
+      process.exitCode = originalExitCode;
+    }
+  });
+});
+
+// Codex review finding 4: the push webhook fired unconditionally after push()
+// returned, so dry-run / no-change / handled-failure runs sent a misleading
+// "Push Complete". push() now reports real completion via an out-param the CLI
+// gates the webhook on.
+describe('push completion signal gates the webhook (#702 follow-up)', () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-push-done-'));
+    vi.clearAllMocks();
+    mockCreatePullRequest.mockResolvedValue('https://example.test/pr/1');
+    mockLoadStateForScope.mockResolvedValue({
+      lastPush: null, pushedSkills: [], pushedRules: [], pushedEnvVars: [],
+    });
+    mockSaveStateForScope.mockResolvedValue(undefined);
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  function mockConfig(teamRepo: string): void {
+    mockAutoDetectInit.mockResolvedValue({
+      localConfig: {
+        repo: { localPath: teamRepo, remote: path.join(tmpDir, 'remote.git'), kind: undefined },
+        username: 'alice',
+        scope: 'project',
+        projectRoot: teamRepo,
+      },
+      teamConfig: { repo: 'acme/team', toolPaths: {} },
+    });
+  }
+
+  it('reports completed=true when a real config push happens', async () => {
+    const teamRepo = await initTeamRepos(tmpDir);
+    fs.writeFileSync(path.join(teamRepo, 'teamai.yaml'),
+      'version: 1\npublicSkills: []\nsources:\n  - name: dev\n    repo: https://git.example/dev\n');
+    mockConfig(teamRepo);
+
+    const { push } = await import('../push.js');
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const outcome = { completed: false };
+    await push({ all: true }, outcome);
+    logSpy.mockRestore();
+
+    expect(mockCreatePullRequest).toHaveBeenCalledTimes(1);
+    expect(outcome.completed).toBe(true);
+  });
+
+  it('does NOT report completed on dry-run', async () => {
+    const teamRepo = await initTeamRepos(tmpDir);
+    fs.writeFileSync(path.join(teamRepo, 'teamai.yaml'),
+      'version: 1\npublicSkills: []\nsources:\n  - name: dev\n    repo: https://git.example/dev\n');
+    mockConfig(teamRepo);
+
+    const { push } = await import('../push.js');
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const outcome = { completed: false };
+    await push({ all: true, dryRun: true }, outcome);
+    logSpy.mockRestore();
+
+    expect(mockCreatePullRequest).not.toHaveBeenCalled();
+    expect(outcome.completed).toBe(false);
+  });
+
+  it('does NOT report completed when there is nothing to push', async () => {
+    const teamRepo = await initTeamRepos(tmpDir);
+    mockConfig(teamRepo);
+
+    const { push } = await import('../push.js');
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const outcome = { completed: false };
+    await push({ all: true }, outcome);
+    logSpy.mockRestore();
+
+    expect(mockCreatePullRequest).not.toHaveBeenCalled();
+    expect(outcome.completed).toBe(false);
+  });
+
+  it('does NOT report completed when PR creation fails', async () => {
+    const teamRepo = await initTeamRepos(tmpDir);
+    fs.writeFileSync(path.join(teamRepo, 'teamai.yaml'), 'version: 1\npublicSkills:\n  - beta-proof\n');
+    mockCreatePullRequest.mockRejectedValue(new Error('PR API unavailable'));
+    mockConfig(teamRepo);
+    const originalExitCode = process.exitCode;
+
+    try {
+      const { push } = await import('../push.js');
+      const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+      const outcome = { completed: false };
+      await push({ all: true }, outcome);
+      logSpy.mockRestore();
+
+      expect(process.exitCode).toBe(1);
+      expect(outcome.completed).toBe(false);
+    } finally {
+      process.exitCode = originalExitCode;
+    }
+  });
+});

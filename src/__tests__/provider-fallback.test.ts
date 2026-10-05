@@ -36,7 +36,6 @@ vi.mock('../package-info.js', () => {
   };
 });
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
 const pkgInfo = (await import('../package-info.js')) as any;
 const setPackageName = pkgInfo.__setPackageName as (name: string) => void;
 
@@ -83,7 +82,7 @@ describe('getDefaultProvider (fallback)', () => {
 
   it('ignores unknown TEAMAI_DEFAULT_PROVIDER values', () => {
     setPackageName('teamai-cli');
-    process.env.TEAMAI_DEFAULT_PROVIDER = 'gitlab';
+    process.env.TEAMAI_DEFAULT_PROVIDER = 'bitbucket';
     // Falls through to package-name-based default (public npm → github).
     expect(getDefaultProvider()).toBe('github');
   });
@@ -112,9 +111,23 @@ describe('detectProvider with package-name fallback', () => {
     expect(detectProvider('HyperAI/teamai')).toBe('tgit');
   });
 
-  it('unknown host → tgit when installed from internal tnpm', () => {
+  it('unknown full URL → generic git even when installed from internal tnpm', () => {
     setPackageName('@tencent/teamai-cli');
-    expect(detectProvider('https://gitlab.com/org/repo')).toBe('tgit');
+    expect(detectProvider('https://gitea.example.com/org/repo')).toBe('git');
+  });
+
+  it('explicit gitlab.com URL still resolves to gitlab on tnpm build', () => {
+    setPackageName('@tencent/teamai-cli');
+    expect(detectProvider('https://gitlab.com/org/repo')).toBe('gitlab');
+  });
+
+  it('explicit gitcode.com URL resolves to gitcode', () => {
+    setPackageName('@tencent/teamai-cli');
+    expect(detectProvider('https://gitcode.com/org/repo')).toBe('gitcode');
+  });
+
+  it('gitcode.com SSH URL resolves to gitcode', () => {
+    expect(detectProvider('git@gitcode.com:org/repo.git')).toBe('gitcode');
   });
 
   it('explicit github.com URL still resolves to github on tnpm build', () => {

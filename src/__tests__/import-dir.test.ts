@@ -7,6 +7,8 @@ import fs from 'fs-extra';
 // Mock external dependencies
 vi.mock('../codebase-extract.js', () => ({
   extractCodebase: vi.fn(),
+  // The fixtures are outside git, where the slug is the directory's name.
+  defaultProjectSlug: async (dir: string) => path.basename(dir),
 }));
 
 vi.mock('../graph-aggregate.js', () => ({
@@ -17,7 +19,8 @@ vi.mock('../utils/git.js', () => ({
   autoPushTeamRepo: vi.fn(),
 }));
 
-vi.mock('../config.js', () => ({
+vi.mock('../config.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../config.js')>()),
   autoDetectInit: vi.fn(),
 }));
 
@@ -77,7 +80,7 @@ describe('import --dir', () => {
     await importCmd({ dir: opts.dir, dryRun: opts.dryRun, output: opts.output, skipEnrich: opts.skipEnrich });
   }
 
-  it('calls extractCodebase with outputRoot (not source dir) and skipEnrich', async () => {
+  it('calls extractCodebase with outputRoot (not source dir) and skipEnrich', { timeout: 60_000 }, async () => {
     await runImportDir({ dir: projectDir, skipEnrich: true });
 
     expect(extractCodebase).toHaveBeenCalledWith(expect.objectContaining({

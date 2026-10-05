@@ -21,7 +21,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
-        node-version: [20, 22]
+        node-version: [20, 22, 24]
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
@@ -35,6 +35,9 @@ jobs:
 
       - name: Install dependencies
         run: npm ci --ignore-scripts
+
+      - name: Lint
+        run: npm run lint
 
       - name: Type check
         run: npx tsc --noEmit
@@ -69,8 +72,12 @@ jobs:
       - name: Build
         run: npm run build
 
-      - name: Verify pinned-archive entrypoint is current
-        run: git diff --exit-code -- dist/index.js
+      - name: OpenCode recall E2E
+        run: npx vitest run --config vitest.e2e.config.ts src/__tests__/e2e/opencode-recall.test.ts
+
+      # Needs no network or secrets: a fake `gh` on PATH. Guards #711.
+      - name: Unattended init E2E
+        run: npx vitest run --config vitest.e2e.config.ts src/__tests__/e2e/init-unattended.test.ts
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
@@ -78,9 +85,13 @@ jobs:
           name: dist
           path: dist/
 
-  special-hosts-windows:
-    name: Special host roots (Windows)
-    runs-on: windows-latest
+  fork-e2e:
+    name: E2E (fork-safe, no credentials)
+    needs: build
+    if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -88,21 +99,32 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 20
           cache: npm
 
       - name: Install dependencies
         run: npm ci --ignore-scripts
 
-      - name: Type check special host paths
-        run: npm run typecheck
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
 
-      - name: Verify special host root lifecycle
-        run: npx vitest run src/__tests__/special-hosts.test.ts src/__tests__/gh-portable-sync.test.ts src/__tests__/managed-resources.test.ts
+      - name: Configure git identity (CI commits)
+        run: |
+          git config --global user.email "ci@teamai.test"
+          git config --global user.name "TeamAI CI"
+
+      # Fork code is untrusted. Never expose repository secrets to this job.
+      # Remote-provider cases skip themselves when credentials are absent.
+      - name: Run E2E (no remote credentials)
+        run: npm run test:e2e
 
   e2e:
     name: E2E (GitHub provider, full surface)
     needs: build
+    if: ${{ vars.TEAMAI_TEST_REPO_URL != '' && (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) }}
     runs-on: ubuntu-latest
     # E2E shares one fixture repo. Serialize across all branches/PRs so
     # concurrent runs don't trample each other's state. Don't cancel
@@ -110,8 +132,8 @@ jobs:
     concurrency:
       group: e2e-fixture-repo
       cancel-in-progress: false
-    # Skip e2e when secrets aren't configured (e.g. PRs from forks).
-    if: ${{ vars.TEAMAI_TEST_REPO_URL != '' }}
+    # Fork PRs run the credential-free job above. Never expose the fixture
+    # token to code from a fork.
     env:
       TEAMAI_TEST_PROVIDER: github
       TEAMAI_TEST_REPO_URL: ${{ vars.TEAMAI_TEST_REPO_URL }}

@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { parse as parseToml } from 'smol-toml';
 import path from 'node:path';
 import os from 'node:os';
 import fse from 'fs-extra';
@@ -28,10 +29,15 @@ import {
   renderForCodex,
   renderForCodexInternal,
   renderForCursor,
+  renderForJoycode,
+  renderForOpencode,
   reverseFromClaude,
   reverseFromCodebuddy,
   reverseFromCodex,
   reverseFromCursor,
+  reverseFromJoycode,
+  reverseFromOpencode,
+  renderForTool,
   mergeReverseResults,
 } from '../resources/agent-format.js';
 import type { AgentSpec, ToolName, ParseResult } from '../resources/agent-format.js';
@@ -203,6 +209,69 @@ describe('renderForCodex', () => {
     expect(ext).toBe('.toml');
     expect(content).toContain('env_override');
   });
+
+  // ─── #749: multi-line instructions must stay readable ──────────────────────
+
+  it('emits a multi-line literal string for multi-line instructions', () => {
+    const instructions = 'line one\nline two\nline three';
+    const { content } = renderForCodex(makeSpec({ instructions }));
+
+    // The rendered file has to keep real newlines — a single escaped `\n` line
+    // makes `git diff` on a rendered prompt unreadable and forces the operator
+    // to mentally un-escape what the agent will be told.
+    expect(content).toContain("developer_instructions = '''");
+    expect(content).not.toContain('\\n');
+    // Round-trips byte-for-byte: literal strings do no escape processing.
+    expect(parseToml(content).developer_instructions).toBe(instructions);
+  });
+
+  it('keeps a value that cannot be a literal string on the basic form', () => {
+    // A trailing quote closes the literal early, and `'''` inside the body ends
+    // it outright — those must fall back rather than emit broken TOML.
+    for (const instructions of ["ends with a quote'", "contains ''' inside", 'has a CR\rhere']) {
+      const { content } = renderForCodex(makeSpec({ instructions }));
+      expect(parseToml(content).developer_instructions).toBe(instructions);
+    }
+  });
+
+  it('leaves single-line and empty instructions on the basic form', () => {
+    const single = renderForCodex(makeSpec({ instructions: 'one line only' }));
+    expect(single.content).toContain('developer_instructions = "one line only"');
+    expect(single.content).not.toContain("'''");
+
+    const empty = renderForCodex(makeSpec({ instructions: '' }));
+    expect(empty.content).toContain('developer_instructions = ""');
+  });
+
+  it('applies the same treatment to tool_extras.codex strings', () => {
+    const spec = makeSpec({
+      instructions: 'single line',
+      tool_extras: { codex: { custom_prompt: 'first\nsecond\nthird' } },
+    });
+    const { content } = renderForCodex(spec);
+    expect(content).toContain("custom_prompt = '''");
+    expect(parseToml(content).custom_prompt).toBe('first\nsecond\nthird');
+  });
+
+  it('keeps $-sequences in a multi-line value verbatim', () => {
+    // The substitution must use a function replacement: a string replacement
+    // would expand the $-patterns inside the agent-authored prompt. A shell
+    // instruction carrying $$ would silently lose a dollar and no longer
+    // round-trip.
+    const instructions = 'Run this:\n  echo `"$$HOME" && echo "$&done"`';
+    const { content } = renderForCodex(makeSpec({ instructions }));
+    expect(parseToml(content).developer_instructions).toBe(instructions);
+  });
+
+  it('keeps a U+007F DEL value on a form the document still parses from', () => {
+    // TOML 1.0 bans DEL from literal strings along with C0, so the literal
+    // path must refuse it. smol-toml escapes DEL on the basic form, which is
+    // why the rendered agent file still parses and round-trips.
+    const instructions = 'line one\nline two\x7fwith DEL';
+    const { content } = renderForCodex(makeSpec({ instructions }));
+    expect(content).not.toContain("developer_instructions = '''");
+    expect(parseToml(content).developer_instructions).toBe(instructions);
+  });
 });
 
 // ─── renderForCursor ─────────────────────────────────────────────────────────
@@ -219,10 +288,57 @@ describe('renderForCursor', () => {
     expect(content).toContain('You are a helpful assistant.');
   });
 
+  it('carries the model into the frontmatter like every other renderer (#830)', () => {
+    const { content } = renderForCursor(makeSpec({ model: 'claude-opus-4' }));
+    expect(content).toContain('model: claude-opus-4');
+  });
+
+  it('omits model when the spec has none', () => {
+    const { content } = renderForCursor(makeSpec());
+    expect(content).not.toContain('model:');
+  });
+
+  it('round-trips the model through reverseFromCursor', () => {
+    const { content } = renderForCursor(makeSpec({ model: 'claude-opus-4' }));
+    const result = reverseFromCursor('/agents/test-agent.md', content);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.spec.model).toBe('claude-opus-4');
+  });
+
   it('flattens tool_extras.cursor into frontmatter', () => {
     const spec = makeSpec({ tool_extras: { cursor: { composer_mode: true } } });
     const { content } = renderForCursor(spec);
     expect(content).toContain('composer_mode: true');
+  });
+});
+
+// ─── renderForJoycode ────────────────────────────────────────────────────────
+
+describe('renderForJoycode', () => {
+  it('produces a Markdown agent with common YAML frontmatter', () => {
+    const spec = makeSpec({ tools: ['Bash'], tool_extras: { joycode: { color: 'blue' } } });
+    const { ext, content } = renderForJoycode(spec);
+    expect(ext).toBe('.md');
+    expect(content).toContain('name: test-agent');
+    expect(content).toContain('description: A test agent');
+    expect(content).toContain('- Bash');
+    expect(content).toContain('color: blue');
+    expect(content).toContain('You are a helpful assistant.');
+  });
+
+  it('is available through renderForTool', () => {
+    expect(renderForTool(makeSpec(), 'joycode').ext).toBe('.md');
+  });
+
+  it('round-trips JoyCode-private frontmatter', () => {
+    const content = renderForJoycode(
+      makeSpec({ tool_extras: { joycode: { color: 'blue' } } }),
+    ).content;
+    const result = reverseFromJoycode('/agents/test-agent.md', content);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.spec.tool_extras?.joycode).toEqual({ color: 'blue' });
   });
 });
 
@@ -359,6 +475,101 @@ describe('reverseFromCursor', () => {
     const content = `---\nagent_id: a\ndescription: b\n---\n\n`;
     const result = reverseFromCursor('/agents/a.md', content);
     expect(result.ok).toBe(false);
+  });
+});
+
+// ─── renderForOpencode ───────────────────────────────────────────────────────
+
+describe('renderForOpencode', () => {
+  it('emits description + mode:subagent and omits name', () => {
+    const spec = makeSpec();
+    const { ext, content } = renderForOpencode(spec);
+    expect(ext).toBe('.md');
+    expect(content).toContain('description: A test agent for unit tests');
+    expect(content).toContain('mode: subagent');
+    // OpenCode derives the name from the filename — it must NOT be in frontmatter.
+    expect(content).not.toMatch(/^name:/m);
+    expect(content).toContain('You are a helpful assistant.');
+  });
+
+  it('includes model when present', () => {
+    const spec = makeSpec({ model: 'anthropic/claude-sonnet-4' });
+    const { content } = renderForOpencode(spec);
+    expect(content).toContain('model: anthropic/claude-sonnet-4');
+  });
+
+  it('does NOT emit the deprecated tools field', () => {
+    const spec = makeSpec({ tools: ['read', 'write'] });
+    const { content } = renderForOpencode(spec);
+    expect(content).not.toMatch(/^tools:/m);
+  });
+
+  it('flattens tool_extras.opencode (permission/temperature) into frontmatter', () => {
+    const spec = makeSpec({ tool_extras: { opencode: { temperature: 0.1, permission: { edit: 'deny' } } } });
+    const { content } = renderForOpencode(spec);
+    expect(content).toContain('temperature: 0.1');
+    expect(content).toContain('edit: deny');
+  });
+
+  it('renderForTool dispatches opencode to renderForOpencode', () => {
+    const spec = makeSpec();
+    const viaTool = renderForTool(spec, 'opencode');
+    const direct = renderForOpencode(spec);
+    expect(viaTool).toEqual(direct);
+  });
+});
+
+// ─── reverseFromOpencode ─────────────────────────────────────────────────────
+
+describe('reverseFromOpencode', () => {
+  it('derives name from filename and reads description', () => {
+    const content = `---\ndescription: OpenCode helper\nmode: subagent\n---\nInstructions here\n`;
+    const result = reverseFromOpencode('/agents/oc-agent.md', content);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.spec.name).toBe('oc-agent');
+    expect(result.spec.description).toBe('OpenCode helper');
+  });
+
+  it('collects mode/permission into tool_extras.opencode', () => {
+    const content = `---\ndescription: b\nmode: subagent\ntemperature: 0.2\n---\nBody\n`;
+    const result = reverseFromOpencode('/agents/a.md', content);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.spec.tool_extras?.['opencode']).toEqual({ mode: 'subagent', temperature: 0.2 });
+  });
+
+  it('moves model into the common field, not extras', () => {
+    const content = `---\ndescription: b\nmodel: anthropic/claude-sonnet-4\n---\nBody\n`;
+    const result = reverseFromOpencode('/agents/a.md', content);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.spec.model).toBe('anthropic/claude-sonnet-4');
+    expect(result.spec.tool_extras?.['opencode']).toBeUndefined();
+  });
+
+  it('returns error on missing description', () => {
+    const content = `---\nmode: subagent\n---\nBody\n`;
+    const result = reverseFromOpencode('/agents/a.md', content);
+    expect(result.ok).toBe(false);
+  });
+
+  it('returns error on empty body', () => {
+    const content = `---\ndescription: b\n---\n\n`;
+    const result = reverseFromOpencode('/agents/a.md', content);
+    expect(result.ok).toBe(false);
+  });
+
+  it('round-trips render → reverse preserving common fields', () => {
+    const spec = makeSpec({ model: 'anthropic/claude-sonnet-4' });
+    const { content } = renderForOpencode(spec);
+    const result = reverseFromOpencode('/agents/test-agent.md', content);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.spec.name).toBe('test-agent');
+    expect(result.spec.description).toBe(spec.description);
+    expect(result.spec.instructions).toBe(spec.instructions);
+    expect(result.spec.model).toBe('anthropic/claude-sonnet-4');
   });
 });
 
@@ -529,9 +740,9 @@ describe('AgentsHandler.pullItem — multi-target', () => {
     await fse.remove(tmpDir);
   });
 
-  it('deploys only to spec.targets=[claude, codex] with correct extensions', async () => {
+  it('deploys to JoyCode when included in spec.targets', async () => {
     const spec: AgentSpec = makeSpec({
-      targets: ['claude', 'codex'] as ToolName[],
+      targets: ['claude', 'codex', 'joycode'] as ToolName[],
       model: 'claude-haiku',
     });
     const yamlContent = serializeAgentYaml(spec);
@@ -540,11 +751,13 @@ describe('AgentsHandler.pullItem — multi-target', () => {
 
     // Create .codex/agents directory (marks codex as installed)
     await fse.ensureDir(path.join(homeDir, '.codex', 'agents'));
+    await fse.ensureDir(path.join(homeDir, '.joycode', 'agents'));
 
     const teamConfig = buildTeamConfig({
       claude: { skills: '.claude/skills', agents: '.claude/agents' },
       codex: { skills: '.codex/skills', agents: '.codex/agents' },
       cursor: { skills: '.cursor/skills', agents: '.cursor/agents' },
+      joycode: { skills: '.joycode/skills', agents: '.joycode/agents' },
     });
 
     await handler.pullItem(
@@ -557,8 +770,100 @@ describe('AgentsHandler.pullItem — multi-target', () => {
     expect(await fse.pathExists(path.join(homeDir, '.claude', 'agents', 'test-agent.md'))).toBe(true);
     // codex: .toml
     expect(await fse.pathExists(path.join(homeDir, '.codex', 'agents', 'test-agent.toml'))).toBe(true);
+    // joycode: .md
+    expect(await fse.pathExists(path.join(homeDir, '.joycode', 'agents', 'test-agent.md'))).toBe(true);
     // cursor: not in targets, should not be created
     expect(await fse.pathExists(path.join(homeDir, '.cursor', 'agents', 'test-agent.md'))).toBe(false);
+  });
+
+  it('does not report an untouched JoyCode rendering as modified', async () => {
+    const spec = makeSpec({ targets: ['joycode'], tool_extras: { cursor: { composer_mode: true } } });
+    const yamlPath = path.join(repoPath, 'agents/test-agent.yaml');
+    await fse.writeFile(yamlPath, serializeAgentYaml(spec));
+    await fse.ensureDir(path.join(homeDir, '.joycode'));
+    const config = buildTeamConfig({ joycode: { agents: '.joycode/agents' } });
+    await handler.pullItem({ name: 'test-agent', type: 'agents', sourcePath: yamlPath, relativePath: 'agents/test-agent.yaml' }, config, localConfig);
+
+    expect(await handler.scanLocalForPush(config, localConfig)).toEqual([]);
+  });
+
+  it('merges real JoyCode edits without losing canonical targets or other tools metadata', async () => {
+    const spec = makeSpec({ targets: ['joycode'], model: 'test-model',
+      tool_extras: { joycode: { color: 'blue' }, cursor: { composer_mode: true } } });
+    const yamlPath = path.join(repoPath, 'agents/test-agent.yaml');
+    await fse.writeFile(yamlPath, serializeAgentYaml(spec) + 'custom_setting: keep\n');
+    await fse.ensureDir(path.join(homeDir, '.joycode'));
+    const config = buildTeamConfig({ joycode: { agents: '.joycode/agents' }, codex: { agents: '.codex/agents' } });
+    const item = { name: 'test-agent', type: 'agents' as const, sourcePath: yamlPath, relativePath: 'agents/test-agent.yaml' };
+    await handler.pullItem(item, config, localConfig);
+    const edited = { ...spec, instructions: 'Edited prompt.', tool_extras: { joycode: { color: 'red' } } };
+    await fse.writeFile(path.join(homeDir, '.joycode/agents/test-agent.md'), renderForJoycode(edited).content);
+
+    const candidates = await handler.scanLocalForPush(config, localConfig);
+    expect(candidates).toHaveLength(1);
+    expect(candidates[0].skipReason).toBeUndefined();
+    await handler.pushItem(candidates[0], config, localConfig);
+    expect(await fse.readFile(yamlPath, 'utf-8')).toContain('custom_setting: keep');
+    const result = parseAgentYaml(await fse.readFile(yamlPath, 'utf-8'), 'test-agent.yaml');
+    expect(result).toEqual({ ok: true, spec: { ...spec, instructions: 'Edited prompt.',
+      tool_extras: { ...spec.tool_extras, joycode: { color: 'red' } } } });
+    await handler.pullItem(item, config, localConfig);
+    expect(await fse.pathExists(path.join(homeDir, '.codex/agents/test-agent.toml'))).toBe(false);
+    expect(await handler.scanLocalForPush(config, localConfig)).toEqual([]);
+  });
+
+  it.each(['unchanged', 'conflicting', 'invalid'] as const)('handles an %s second tool copy without data loss', async (mode) => {
+    const spec = makeSpec({ targets: ['joycode', 'claude'],
+      tool_extras: { cursor: { composer_mode: true } } });
+    const yamlPath = path.join(repoPath, 'agents/test-agent.yaml');
+    const original = serializeAgentYaml(spec);
+    await fse.writeFile(yamlPath, original);
+    await fse.ensureDir(path.join(homeDir, '.joycode'));
+    const config = buildTeamConfig({ joycode: { agents: '.joycode/agents' }, claude: { agents: '.claude/agents' } });
+    await handler.pullItem({ name: 'test-agent', type: 'agents', sourcePath: yamlPath, relativePath: 'agents/test-agent.yaml' }, config, localConfig);
+    await fse.writeFile(path.join(homeDir, '.joycode/agents/test-agent.md'), renderForJoycode({ ...spec, instructions: 'JoyCode edit.' }).content);
+    if (mode !== 'unchanged') {
+      await fse.writeFile(path.join(homeDir, '.claude/agents/test-agent.md'), mode === 'invalid' ? 'Not an agent' : renderForClaude({ ...spec, instructions: 'Conflicting edit.' }).content);
+    }
+    const candidates = await handler.scanLocalForPush(config, localConfig);
+    expect(candidates).toHaveLength(1);
+    if (mode === 'unchanged') {
+      expect(candidates[0].skipReason).toBeUndefined();
+      expect(candidates[0].mergedSpec).toEqual({ ...spec, instructions: 'JoyCode edit.' });
+    } else {
+      expect(candidates[0].skipReason).toBeTruthy();
+      await handler.pushItem(candidates[0], config, localConfig);
+      expect(await fse.readFile(yamlPath, 'utf-8')).toBe(original);
+    }
+  });
+
+  it('preserves canonical metadata while removing optional JoyCode fields intentionally', async () => {
+    const spec = makeSpec({ targets: ['joycode'], model: 'old-model', tools: ['Read'],
+      tool_extras: { joycode: { color: 'blue' }, cursor: { composer_mode: true } } });
+    const yamlPath = path.join(repoPath, 'agents/test-agent.yaml');
+    await fse.writeFile(yamlPath, serializeAgentYaml(spec));
+    await fse.ensureDir(path.join(homeDir, '.joycode/agents'));
+    await fse.writeFile(path.join(homeDir, '.joycode/agents/test-agent.md'), renderForJoycode(makeSpec()).content);
+    const config = buildTeamConfig({ joycode: { agents: '.joycode/agents' } });
+    const candidates = await handler.scanLocalForPush(config, localConfig);
+    expect(candidates).toHaveLength(1);
+    expect(candidates[0].mergedSpec).toEqual(makeSpec({ targets: ['joycode'], tool_extras: { cursor: { composer_mode: true } } }));
+  });
+
+  it.each(['codex', 'cursor', 'opencode'] as const)('retains canonical fields not rendered by %s', async (tool) => {
+    const spec = makeSpec({ targets: [tool], model: 'canonical-model', tools: ['Read'],
+      tool_extras: { joycode: { color: 'blue' } } });
+    const yamlPath = path.join(repoPath, 'agents/test-agent.yaml');
+    await fse.writeFile(yamlPath, serializeAgentYaml(spec));
+    const config = buildTeamConfig({ [tool]: { agents: `.${tool}/agents` } });
+    await fse.ensureDir(path.join(homeDir, `.${tool}`));
+    await handler.pullItem({ name: 'test-agent', type: 'agents', sourcePath: yamlPath, relativePath: 'agents/test-agent.yaml' }, config, localConfig);
+    expect(await handler.scanLocalForPush(config, localConfig)).toEqual([]);
+    const edited = renderForTool({ ...spec, instructions: 'Changed prompt.' }, tool);
+    await fse.writeFile(path.join(homeDir, `.${tool}/agents/test-agent${edited.ext}`), edited.content);
+    const candidates = await handler.scanLocalForPush(config, localConfig);
+    expect(candidates).toHaveLength(1);
+    expect(candidates[0].mergedSpec).toEqual({ ...spec, instructions: 'Changed prompt.' });
   });
 
   it('legacy .md items are copied only to claude/codebuddy/claude-internal', async () => {

@@ -17,7 +17,6 @@ import { incrementRecalled, incrementUpvoted, syncVotesToTeam, loadUserVotes } f
 import { parseTranscriptForVotes } from '../transcript-parser.js';
 import { buildIndex, loadIndex, search } from '../utils/search-index.js';
 import { computeAllConfidence, writeBackConfidence } from '../maintenance/confidence.js';
-import { annotateHotness, HOT_THRESHOLD } from '../maintenance/hot-cold.js';
 import { findPruneCandidates } from '../maintenance/prune.js';
 import type { UserVotesV2 } from '../types.js';
 
@@ -68,24 +67,38 @@ describe('Phase 3+4 end-to-end data flow', () => {
     expect(afterRecall.deltas['api-retry'].recalled_delta).toBe(3);
 
     // ─── Step 2: Simulate Stop hook (transcript parse → incrementUpvoted) ───
-    // Create a fake transcript with referenced-doc-ids
+    // Adoption is captured from tool-use evidence: the agent opens api-retry's
+    // file via Read, with no self-declaration anywhere.
     const transcriptPath = path.join(tmpDir, 'transcript.jsonl');
-    const transcriptEntry = {
-      type: 'assistant',
-      message: {
-        content: [{
-          type: 'text',
-          text: 'Here is the solution.\n\n<!-- teamai:referenced-doc-ids: [api-retry] -->',
-        }],
+    const transcriptLines = [
+      {
+        type: 'assistant',
+        message: {
+          content: [{
+            type: 'text',
+            text: '--- [teamai:recall:start] ---\nFile: ' + path.join(learningsDir, 'api-retry.md') +
+              '\nFile: ' + path.join(learningsDir, 'outdated-pattern.md') + '\n--- [teamai:recall:end] ---',
+          }],
+        },
       },
-    };
-    fs.writeFileSync(transcriptPath, JSON.stringify(transcriptEntry) + '\n');
+      {
+        type: 'assistant',
+        message: {
+          content: [{
+            type: 'tool_use',
+            name: 'Read',
+            input: { file_path: path.join(learningsDir, 'api-retry.md') },
+          }],
+        },
+      },
+    ];
+    fs.writeFileSync(transcriptPath, transcriptLines.map((l) => JSON.stringify(l)).join('\n') + '\n');
 
     const voteData = await parseTranscriptForVotes(transcriptPath);
-    expect(voteData.referencedDocIds).toContain('api-retry');
-    expect(voteData.referencedDocIds).not.toContain('outdated-pattern');
+    expect(voteData.adoptedDocIds).toContain('api-retry');
+    expect(voteData.adoptedDocIds).not.toContain('outdated-pattern');
 
-    await incrementUpvoted(localVotePath, voteData.referencedDocIds);
+    await incrementUpvoted(localVotePath, voteData.adoptedDocIds);
 
     // Verify: api-retry now has upvoted_count=1
     const afterUpvote = await loadUserVotes(localVotePath);
@@ -142,6 +155,57 @@ describe('Phase 3+4 end-to-end data flow', () => {
     expect(results[0].score).toBeGreaterThan(results[1].score);
   });
 
+  it('tool-use adoption drives upvotes with NO self-declaration (issue #723)', async () => {
+    const learningsDir = path.join(tmpDir, 'learnings');
+    const votesDir = path.join(tmpDir, 'votes');
+    fs.mkdirSync(learningsDir, { recursive: true });
+    fs.mkdirSync(votesDir, { recursive: true });
+
+    const localVotePath = path.join(votesDir, 'jeff.yaml');
+    // Two docs recalled this session.
+    await incrementRecalled(localVotePath, ['api-retry', 'outdated-pattern']);
+
+    // Transcript: recall region injects both candidates, then the agent opens
+    // ONLY api-retry's file via Read. Crucially, there is NO referenced-doc-ids
+    // declaration anywhere — the structural failure mode from #723.
+    const transcriptPath = path.join(tmpDir, 'transcript.jsonl');
+    const lines = [
+      {
+        type: 'assistant',
+        message: {
+          content: [{
+            type: 'text',
+            text: '--- [teamai:recall:start] ---\nFile: ' + path.join(learningsDir, 'api-retry.md') +
+              '\nFile: ' + path.join(learningsDir, 'outdated-pattern.md') + '\n--- [teamai:recall:end] ---',
+          }],
+        },
+      },
+      {
+        type: 'assistant',
+        message: {
+          content: [{
+            type: 'tool_use',
+            name: 'Read',
+            input: { file_path: path.join(learningsDir, 'api-retry.md') },
+          }],
+        },
+      },
+    ];
+    fs.writeFileSync(transcriptPath, lines.map((l) => JSON.stringify(l)).join('\n') + '\n');
+
+    const voteData = await parseTranscriptForVotes(transcriptPath);
+    // No self-declaration, yet adoption is captured from the Read tool call.
+    expect(voteData.adoptedDocIds).toEqual(['api-retry']);
+
+    // Upvote is driven purely by tool-use adoption evidence.
+    await incrementUpvoted(localVotePath, voteData.adoptedDocIds);
+
+    const after = await loadUserVotes(localVotePath);
+    expect(after.votes['api-retry'].upvoted_count).toBe(1);
+    // The recalled-but-unopened doc gets no upvote.
+    expect(after.votes['outdated-pattern'].upvoted_count).toBe(0);
+  });
+
   it('confidence writeback updates frontmatter', async () => {
     const learningsDir = path.join(tmpDir, 'learnings');
     const votesDir = path.join(tmpDir, 'votes');
@@ -160,8 +224,8 @@ describe('Phase 3+4 end-to-end data flow', () => {
     fs.writeFileSync(path.join(votesDir, 'user1.yaml'), YAML.stringify(v2));
 
     const map = await computeAllConfidence(votesDir);
-    const updated = await writeBackConfidence(learningsDir, map);
-    expect(updated).toBe(1);
+    const written = await writeBackConfidence([learningsDir], map);
+    expect(written).toEqual([path.join(learningsDir, 'test-doc.md')]);
 
     // Verify frontmatter has confidence
     const afterContent = fs.readFileSync(path.join(learningsDir, 'test-doc.md'), 'utf-8');
@@ -180,7 +244,7 @@ describe('Phase 3+4 end-to-end data flow', () => {
     const content = matter.stringify('Brand new learning.', { title: 'new-doc', date: '2026-07-01', tags: ['test'] });
     fs.writeFileSync(path.join(learningsDir, 'new-doc.md'), content);
 
-    const candidates = await findPruneCandidates(learningsDir, votesDir);
+    const candidates = await findPruneCandidates([learningsDir], votesDir);
     expect(candidates).toHaveLength(0);
   });
 });

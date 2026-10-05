@@ -20,6 +20,8 @@ export interface CodebaseCmdOptions extends GlobalOptions {
     project?: string;
     maxFiles?: string;
     status?: boolean;
+    reconcile?: boolean;
+    deepEnrich?: boolean;
 }
 
 // ─── Command handler ─────────────────────────────────────────────────────────
@@ -55,7 +57,7 @@ export async function codebaseCmd(opts: CodebaseCmdOptions): Promise<void> {
         return;
     }
 
-    if (!opts.lint) {
+    if (!opts.lint && !opts.reconcile && !opts.deepEnrich) {
         console.log('teamai codebase — team codebase knowledge management');
         console.log('');
         console.log('Usage:');
@@ -64,6 +66,8 @@ export async function codebaseCmd(opts: CodebaseCmdOptions): Promise<void> {
         console.log('  teamai codebase --lint                  Run teamwiki consistency lint');
         console.log('  teamai codebase --lint --json           Output JSON report (for CI)');
         console.log('  teamai codebase --lint --severity high  Only report high-severity issues');
+        console.log('  teamai codebase --reconcile             Reconcile product and code knowledge');
+        console.log('  teamai codebase --deep-enrich           Generate deep knowledge from extracted evidence');
         console.log('  teamai codebase --status                Show knowledge-base git baseline');
         return;
     }
@@ -85,6 +89,86 @@ export async function codebaseCmd(opts: CodebaseCmdOptions): Promise<void> {
 
     if (!(await pathExists(teamwikiDir))) {
         console.log('No teamwiki found. Run `teamai import` first.');
+        if (opts.reconcile || opts.deepEnrich) process.exitCode = 1;
+        return;
+    }
+
+    if (opts.deepEnrich) {
+        const project = opts.project?.trim() ?? '';
+        if (!project) {
+            console.log('Deep enrichment requires --project <slug>.');
+            process.exitCode = 1;
+            return;
+        }
+        const { assertWithinRoot } = await import('./utils/path-safety.js');
+        const codeRoot = path.join(teamwikiDir, 'evidence', 'code');
+        const evidenceDir = path.join(codeRoot, project);
+        try {
+            assertWithinRoot(codeRoot, evidenceDir);
+        } catch (e) {
+            console.log((e as Error).message);
+            process.exitCode = 1;
+            return;
+        }
+        if (!(await pathExists(evidenceDir))) {
+            console.log(`No extracted evidence found for project "${project}". Run \`teamai codebase --extract\` first.`);
+            process.exitCode = 1;
+            return;
+        }
+        let componentCount = 0;
+        try {
+            const manifest = JSON.parse(await readFile(path.join(evidenceDir, '_manifest.json'), 'utf-8')) as {
+                components?: unknown;
+            };
+            componentCount = Array.isArray(manifest.components) ? manifest.components.length : 0;
+        } catch {
+            componentCount = 0;
+        }
+        if (componentCount === 0) {
+            console.log(`No components in _manifest.json for project "${project}".`);
+            process.exitCode = 1;
+            return;
+        }
+        if (opts.dryRun) {
+            if (opts.json) {
+                console.log(JSON.stringify({ project, evidenceDir, dryRun: true }, null, 2));
+            } else {
+                console.log(`Deep enrichment preview: project=${project} (no writes)`);
+            }
+            return;
+        }
+        const { deepEnrich } = await import('./deep-enrich.js');
+        const result = await deepEnrich({ project, evidenceDir, wikiRoot: teamwikiDir });
+        if (opts.json) {
+            console.log(JSON.stringify({
+                project,
+                evidenceDir,
+                complete: result.complete,
+                missingComponents: result.missingComponents,
+                missingArchitecture: result.missingArchitecture,
+            }, null, 2));
+        } else if (result.complete) {
+            console.log(`Deep enrichment complete: project=${project}`);
+        } else {
+            const parts: string[] = [];
+            if (result.missingComponents.length > 0) {
+                parts.push(`missing component docs: ${result.missingComponents.join(', ')}`);
+            }
+            if (result.missingArchitecture) parts.push('missing architecture.md');
+            console.log(`Deep enrichment incomplete: project=${project}, ${parts.join(', ')}`);
+        }
+        if (!result.complete) process.exitCode = 1;
+        return;
+    }
+
+    if (opts.reconcile) {
+        const { reconcileKnowledge } = await import('./wiki-engine/adapters/index.js');
+        const result = await reconcileKnowledge({ wikiRoot: teamwikiDir, dryRun: opts.dryRun });
+        if (opts.json) {
+            console.log(JSON.stringify(result, null, 2));
+        } else {
+            console.log(`Reconciliation complete: mappings=${result.mappings}, gaps=${result.gaps.length}, conflicts=${result.conflicts.length}`);
+        }
         return;
     }
 

@@ -74,10 +74,23 @@ export async function importFromRepoList(
     // 1. 加载白名单
     const repoListFile = await loadRepoList(listPath);
 
+    let releaseBatchLock: (() => Promise<void>) | null = null;
+    if (!dryRun) {
+        try {
+            const { autoDetectInit } = await import('./config.js');
+            const { localConfig: lc } = await autoDetectInit();
+            const { acquireImportLock } = await import('./utils/import-lock.js');
+            releaseBatchLock = await acquireImportLock(lc.repo.localPath);
+        } catch (e) {
+            log.debug(`[import-lock] batch lock acquire skipped: ${(e as Error).message}`);
+        }
+    }
+
     const succeeded: number[] = [];
     const failed: Array<{ url: string; error: string }> = [];
     const skipped: Array<{ url: string; reason: string }> = [];
 
+    try {
     // 2. 分拣 org entry（暂不支持）与单仓 entry
     const singleEntries: ReturnType<typeof sortByPriority> = [];
     for (const item of repoListFile.repos) {
@@ -108,7 +121,6 @@ export async function importFromRepoList(
                 explicitDomain: entry.domain,
                 dryRun,
                 output,
-                interactive: false,
                 incremental,
                 skipAutoPush: true,
                 skipEnrich,
@@ -122,7 +134,7 @@ export async function importFromRepoList(
     }
 
     // 并发控制循环
-    const inFlight: Promise<void>[] = [];
+    const inFlight = new Set<Promise<void>>();
 
     for (const entry of queue) {
         while (semaphore.running >= concurrency) {
@@ -133,10 +145,9 @@ export async function importFromRepoList(
         semaphore.running++;
         const task = processEntry(entry).finally(() => {
             semaphore.running--;
-            const idx = inFlight.indexOf(task);
-            if (idx !== -1) inFlight.splice(idx, 1);
+            inFlight.delete(task);
         });
-        inFlight.push(task);
+        inFlight.add(task);
     }
 
     // 等待全部完成
@@ -157,6 +168,24 @@ export async function importFromRepoList(
         }
     }
 
+    // 4.5 全量重建全局导航文件 router.md / index.md（基于完整 evidence/code/ 目录，覆盖 append 的中间状态）
+    if (!dryRun && succeeded.length > 0) {
+        try {
+            const { autoDetectInit } = await import('./config.js');
+            const { localConfig } = await autoDetectInit();
+            const teamwikiRoot = path.join(localConfig.repo.localPath, 'teamwiki');
+
+            if (await fs.pathExists(teamwikiRoot)) {
+                const { rebuildWikiIndex } = await import('./rebuild-wiki-index.js');
+                await rebuildWikiIndex(teamwikiRoot);
+                log.info('teamwiki router.md / index.md rebuilt');
+            }
+        } catch (e) {
+            const msg = e instanceof Error ? e.message : String(e);
+            log.warn(`[wiki] global index rebuild failed (non-blocking): ${msg}`);
+        }
+    }
+
     // 5. 统一推送（graph 通过 MR 提交）
     if (!dryRun && succeeded.length > 0) {
         try {
@@ -168,7 +197,7 @@ export async function importFromRepoList(
                 '[teamai] Batch import: graph',
                 ['.'],
                 { repo: tc.repo, provider: tc.provider, reviewers: tc.reviewers },
-                { repo: lc.repo, username: lc.username },
+                { repo: lc.repo, username: lc.username, provider: lc.provider },
             );
             if (prUrl) {
                 log.success(`MR created: ${prUrl}`);
@@ -177,6 +206,12 @@ export async function importFromRepoList(
             }
         } catch (e) {
             log.warn(`[git] batch push failed (non-blocking): ${(e as Error).message}`);
+        }
+    }
+
+    } finally {
+        if (releaseBatchLock) {
+            await releaseBatchLock();
         }
     }
 

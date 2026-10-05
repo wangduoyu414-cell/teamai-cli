@@ -1,9 +1,15 @@
-import path from 'node:path';
-import YAML from 'yaml';
-import { requireInit, saveLocalConfig, saveLocalConfigForScope, detectProjectConfig } from './config.js';
+import {
+    requireInit,
+    saveLocalConfig,
+    saveLocalConfigForScope,
+    detectProjectConfig,
+    loadStateForScope,
+    saveStateForScope,
+    loadTeamConfig,
+} from './config.js';
+import { buildRolePullContext, resolveDesiredSkills } from './resources/desired.js';
 import { loadTagsConfig, collectTagStats, saveTagsConfig } from './utils/tags.js';
 import { log } from './utils/logger.js';
-import { readFileSafe } from './utils/fs.js';
 import type { GlobalOptions, LocalConfig, TagsConfig } from './types.js';
 
 /**
@@ -12,9 +18,9 @@ import type { GlobalOptions, LocalConfig, TagsConfig } from './types.js';
  * so `tags list/subscribe/unsubscribe` agree with what `recall` actually queries
  * instead of always reading/writing ~/.teamai/config.yaml (#85).
  */
-async function resolveTagsScope(): Promise<LocalConfig> {
-    const projectConfig = await detectProjectConfig();
-    return projectConfig ?? (await requireInit()).localConfig;
+async function resolveTagsScope(options: GlobalOptions = {}): Promise<LocalConfig> {
+    const projectConfig = await detectProjectConfig(undefined, undefined, options);
+    return projectConfig ?? (await requireInit(options)).localConfig;
 }
 
 /**
@@ -26,13 +32,23 @@ async function saveTagsScopeConfig(localConfig: LocalConfig): Promise<void> {
     } else {
         await saveLocalConfig(localConfig);
     }
+
+    // Changed subscriptions must bypass pull's unchanged-revision fast path so
+    // newly matched resources are installed and filtered-out ones removed.
+    try {
+        const state = await loadStateForScope(localConfig);
+        state.lastPullRev = null;
+        await saveStateForScope(state, localConfig);
+    } catch {
+        // Missing/corrupt state is non-critical: the next pull performs a full sync.
+    }
 }
 
 /**
  * List all available tags from the team repo's tags.yaml.
  * Shows tag name, skill count, and rule count.
  */
-export async function tagsList(options: GlobalOptions): Promise<void> {
+export async function tagsList(): Promise<void> {
     const localConfig = await resolveTagsScope();
     const tagsConfig = await loadTagsConfig(localConfig.repo.localPath);
 
@@ -69,13 +85,10 @@ export async function tagsList(options: GlobalOptions): Promise<void> {
         );
     }
 
-    const totalSkills = Object.keys(tagsConfig.skills).length;
-    const totalRules = Object.keys(tagsConfig.rules).length;
-    const allTeamSkills = await getTeamSkillCount(localConfig.repo.localPath);
-    const untaggedSkills = allTeamSkills - totalSkills;
+    const untaggedSkills = await countUntaggedDeliveredSkills(localConfig, tagsConfig);
 
     console.log('');
-    if (untaggedSkills > 0) {
+    if (untaggedSkills !== null && untaggedSkills > 0) {
         log.dim(`  ${untaggedSkills} skill(s) have no tags and are always synced.`);
     }
 }
@@ -89,7 +102,7 @@ export async function tagsSubscribe(tags: string[], options: GlobalOptions): Pro
         return;
     }
 
-    const localConfig = await resolveTagsScope();
+    const localConfig = await resolveTagsScope(options);
     const existing = new Set(localConfig.subscribedTags ?? []);
 
     const newTags: string[] = [];
@@ -102,6 +115,11 @@ export async function tagsSubscribe(tags: string[], options: GlobalOptions): Pro
 
     if (newTags.length === 0) {
         log.info('Already subscribed to all specified tags.');
+        return;
+    }
+
+    if (options.dryRun) {
+        log.info(`[dry-run] Would subscribe to: ${newTags.join(', ')}`);
         return;
     }
 
@@ -123,7 +141,7 @@ export async function tagsUnsubscribe(tags: string[], options: GlobalOptions): P
         return;
     }
 
-    const localConfig = await resolveTagsScope();
+    const localConfig = await resolveTagsScope(options);
     const existing = new Set(localConfig.subscribedTags ?? []);
 
     const removed: string[] = [];
@@ -136,6 +154,11 @@ export async function tagsUnsubscribe(tags: string[], options: GlobalOptions): P
 
     if (removed.length === 0) {
         log.info('Not subscribed to any of the specified tags.');
+        return;
+    }
+
+    if (options.dryRun) {
+        log.info(`[dry-run] Would unsubscribe from: ${removed.join(', ')}`);
         return;
     }
 
@@ -242,15 +265,25 @@ export async function tagsRemove(
 }
 
 /**
- * Count total team skills by listing skill directories.
+ * How many untagged skills pull delivers. Pull delivers every skill in the
+ * member's namespaces (all of them without roles) whatever its tags; tags only
+ * add skills from elsewhere. So an untagged skill is synced exactly when pull
+ * delivers it, and asking pull's own resolver keeps roles, exclusions and
+ * same-name skills counted the way pull counts them. Null when pull would stop
+ * on a delivery conflict, the team config is missing, or the resolver fails
+ * (for example on a malformed manifest), so there is no count to show. The
+ * count is only a hint, so a resolver failure warns instead of aborting the
+ * listing that is already on screen.
  */
-async function getTeamSkillCount(repoPath: string): Promise<number> {
+async function countUntaggedDeliveredSkills(localConfig: LocalConfig, tagsConfig: TagsConfig): Promise<number | null> {
+    const teamConfig = await loadTeamConfig(localConfig.repo.localPath);
+    if (!teamConfig) return null;
     try {
-        const { listDirs } = await import('./utils/fs.js');
-        const skillsDir = path.join(repoPath, 'skills');
-        const dirs = await listDirs(skillsDir);
-        return dirs.length;
-    } catch {
-        return 0;
+        const desired = await resolveDesiredSkills(teamConfig, localConfig, await buildRolePullContext(localConfig));
+        if (desired.kind !== 'resolved') return null;
+        return desired.items.filter((item) => !tagsConfig.skills[item.name]?.length).length;
+    } catch (e) {
+        log.warn(`Could not count untagged skills: ${e instanceof Error ? e.message : String(e)}`);
+        return null;
     }
 }

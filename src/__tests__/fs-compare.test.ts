@@ -7,6 +7,8 @@ import {
   dirContentEqual,
   getFileMtime,
   getDirLatestMtime,
+  hasVcsMetadataRecursive,
+  pruneEmptyDirs,
 } from '../utils/fs.js';
 
 describe('fileContentEqual', () => {
@@ -286,5 +288,110 @@ describe('dirContentEqual', () => {
     await fse.writeFile(path.join(dirB, 'CONTRIBUTORS'), 'bob\n');
 
     expect(await dirContentEqual(dirA, dirB, ['CONTRIBUTORS'])).toBe(true);
+  });
+});
+
+describe('hasVcsMetadataRecursive', () => {
+  let tmpDir: string;
+
+  beforeEach(async () => {
+    tmpDir = await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-vcs-test-'));
+  });
+
+  afterEach(async () => {
+    await fse.remove(tmpDir);
+  });
+
+  it('returns false for a plain directory tree with no VCS metadata', async () => {
+    await fse.outputFile(path.join(tmpDir, 'SKILL.md'), '# x');
+    await fse.outputFile(path.join(tmpDir, 'scripts', 'run.py'), 'x');
+    expect(await hasVcsMetadataRecursive(tmpDir)).toBe(false);
+  });
+
+  it('detects a .git directory at the root', async () => {
+    await fse.outputFile(path.join(tmpDir, 'SKILL.md'), '# x');
+    await fse.ensureDir(path.join(tmpDir, '.git'));
+    expect(await hasVcsMetadataRecursive(tmpDir)).toBe(true);
+  });
+
+  it('detects a NESTED .git directory (scripts/.git)', async () => {
+    await fse.outputFile(path.join(tmpDir, 'scripts', 'run.py'), 'x');
+    await fse.ensureDir(path.join(tmpDir, 'scripts', '.git'));
+    expect(await hasVcsMetadataRecursive(tmpDir)).toBe(true);
+  });
+
+  it('detects a .git FILE (submodule/worktree link), not just a directory', async () => {
+    await fse.outputFile(path.join(tmpDir, 'sub', '.git'), 'gitdir: /elsewhere/.git/modules/sub\n');
+    expect(await hasVcsMetadataRecursive(tmpDir)).toBe(true);
+  });
+
+  it('detects .hg and .svn too', async () => {
+    const hg = await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-hg-'));
+    const svn = await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-svn-'));
+    try {
+      await fse.ensureDir(path.join(hg, 'a', '.hg'));
+      await fse.ensureDir(path.join(svn, '.svn'));
+      expect(await hasVcsMetadataRecursive(hg)).toBe(true);
+      expect(await hasVcsMetadataRecursive(svn)).toBe(true);
+    } finally {
+      await fse.remove(hg);
+      await fse.remove(svn);
+    }
+  });
+
+  it('ignores .git inside node_modules (dependency noise, not user work)', async () => {
+    await fse.outputFile(path.join(tmpDir, 'SKILL.md'), '# x');
+    await fse.ensureDir(path.join(tmpDir, 'node_modules', 'dep', '.git'));
+    expect(await hasVcsMetadataRecursive(tmpDir)).toBe(false);
+  });
+
+  it('returns false for a missing directory', async () => {
+    expect(await hasVcsMetadataRecursive(path.join(tmpDir, 'nope'))).toBe(false);
+  });
+});
+
+describe('pruneEmptyDirs', () => {
+  let tmpDir: string;
+
+  beforeEach(async () => {
+    tmpDir = await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-prune-test-'));
+  });
+
+  afterEach(async () => {
+    await fse.remove(tmpDir);
+  });
+
+  it('removes a directory tree that contains no files', async () => {
+    const target = path.join(tmpDir, 'skills', 'channel-bill-push-test');
+    await fse.ensureDir(path.join(target, 'assets'));
+    await fse.ensureDir(path.join(target, 'references'));
+
+    await pruneEmptyDirs(target);
+
+    expect(await fse.pathExists(target)).toBe(false);
+    expect(await fse.pathExists(path.join(tmpDir, 'skills'))).toBe(true);
+  });
+
+  it('keeps the directory and prunes only its empty subdirectories', async () => {
+    const target = path.join(tmpDir, 'skills', 'my-skill');
+    await fse.outputFile(path.join(target, 'SKILL.md'), '# x');
+    await fse.ensureDir(path.join(target, 'assets'));
+    await fse.outputFile(path.join(target, 'scripts', 'run.sh'), 'echo hi');
+
+    await pruneEmptyDirs(target);
+
+    expect(await fse.pathExists(path.join(target, 'SKILL.md'))).toBe(true);
+    expect(await fse.pathExists(path.join(target, 'scripts', 'run.sh'))).toBe(true);
+    expect(await fse.pathExists(path.join(target, 'assets'))).toBe(false);
+  });
+
+  it('does nothing for a missing path or a file', async () => {
+    const file = path.join(tmpDir, 'teamai.yaml');
+    await fse.outputFile(file, 'team: x');
+
+    await pruneEmptyDirs(path.join(tmpDir, 'nope'));
+    await pruneEmptyDirs(file);
+
+    expect(await fse.pathExists(file)).toBe(true);
   });
 });

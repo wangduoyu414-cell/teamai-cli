@@ -1,8 +1,8 @@
 import fse from 'fs-extra';
 import crypto from 'node:crypto';
 import path from 'node:path';
-import os from 'node:os';
 import { log } from './logger.js';
+import { expandHome } from './home.js';
 
 const IGNORED_NAMES = new Set([
   '__pycache__',
@@ -16,15 +16,7 @@ function isIgnored(name: string): boolean {
   return IGNORED_NAMES.has(name) || name.endsWith('.pyc');
 }
 
-/**
- * Expand ~ to $HOME in paths
- */
-export function expandHome(p: string): string {
-  if (p.startsWith('~/') || p === '~') {
-    return path.join(os.homedir(), p.slice(1));
-  }
-  return p;
-}
+export { expandHome } from './home.js';
 
 /**
  * Ensure a directory exists
@@ -45,12 +37,90 @@ export async function readFileSafe(filePath: string): Promise<string | null> {
 }
 
 /**
- * Write a file, creating parent dirs as needed.
+ * Read a file that is allowed to be absent. `null` means the file does not
+ * exist; any other failure (permissions, I/O) is thrown, unlike `readFileSafe`,
+ * which folds every error into `null`. Use this where a caller must tell
+ * "the team has no such file" apart from "the file could not be read".
  */
-export async function writeFile(filePath: string, content: string): Promise<void> {
+export async function readFileIfExists(filePath: string): Promise<string | null> {
+  try {
+    return await fse.readFile(expandHome(filePath), 'utf-8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw error;
+  }
+}
+
+/**
+ * Write a file, creating parent dirs as needed. Bytes are written as they are.
+ */
+export async function writeFile(filePath: string, content: string | Uint8Array): Promise<void> {
   const expanded = expandHome(filePath);
   await fse.ensureDir(path.dirname(expanded));
   await fse.writeFile(expanded, content, 'utf-8');
+}
+
+const MAX_SYMLINK_HOPS = 40;
+
+/**
+ * The path a link chain starting at `filePath` ends at, whether or not a file
+ * exists there yet; `filePath` itself when it is not a link. Each hop resolves
+ * against the real directory of the link, as the kernel does.
+ */
+async function symlinkTarget(filePath: string): Promise<string> {
+  let target = filePath;
+  for (let hops = 0; hops < MAX_SYMLINK_HOPS; hops++) {
+    try {
+      if (!(await fse.lstat(target)).isSymbolicLink()) return target;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return target;
+      throw error;
+    }
+    target = path.resolve(await fse.realpath(path.dirname(target)), await fse.readlink(target));
+  }
+  throw new Error(
+    `Cannot write ${filePath}: it is part of a symbolic link loop. Point the link at a regular file, then retry.`,
+  );
+}
+
+/**
+ * Write a text file atomically (same-dir temp file + rename), preserving the
+ * target's existing permission bits (or defaulting to 0o600 for a new file).
+ *
+ * rename(2) within a filesystem is atomic, so a failed or interrupted write
+ * (ENOSPC, EFBIG, a crash mid-write) can NEVER truncate or corrupt an existing
+ * target — the original file is untouched until the fully-written temp file
+ * replaces it in one step, and on any error the temp file is removed and the
+ * original left in place. Use this for a single-copy, must-not-be-lost file
+ * such as a partition's config.yaml; `writeFile` (a plain overwrite) is fine
+ * for regenerable files. Pass options.mode to force restrictive permissions
+ * for a file that newly contains credentials.
+ *
+ * A symlinked target is written at the file its link chain ends at, so the
+ * links stay; for a dangling link that file (and its directory) is created.
+ */
+export async function writeFileAtomic(
+  filePath: string,
+  content: string,
+  options?: { mode?: number },
+): Promise<void> {
+  const expanded = await symlinkTarget(expandHome(filePath));
+  await fse.ensureDir(path.dirname(expanded));
+  let mode = options?.mode ?? 0o600;
+  try {
+    if (options?.mode === undefined) mode = (await fse.stat(expanded)).mode & 0o777;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+  const tmp = `${expanded}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
+  try {
+    await fse.writeFile(tmp, content, 'utf-8');
+    await fse.chmod(tmp, mode);
+    await fse.rename(tmp, expanded);
+  } catch (error) {
+    await fse.remove(tmp).catch(() => undefined);
+    throw error;
+  }
 }
 
 /**
@@ -86,16 +156,23 @@ export async function writeJson(filePath: string, data: unknown): Promise<void> 
  *
  * @param filePath - Destination path (may use ~).
  * @param data - JSON-serializable value.
+ * @param options.mode - Force permission bits instead of preserving the target.
  */
-export async function writeJsonAtomic(filePath: string, data: unknown): Promise<void> {
+export async function writeJsonAtomic(
+  filePath: string,
+  data: unknown,
+  options?: { mode?: number },
+): Promise<void> {
   const expanded = expandHome(filePath);
   await fse.ensureDir(path.dirname(expanded));
   const content = JSON.stringify(data, null, 2) + '\n';
-  let mode = 0o600;
-  try {
-    mode = (await fse.stat(expanded)).mode & 0o777;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  let mode = options?.mode ?? 0o600;
+  if (options?.mode === undefined) {
+    try {
+      mode = (await fse.stat(expanded)).mode & 0o777;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
   }
   const tmp = `${expanded}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
   try {
@@ -127,6 +204,45 @@ export async function copyDir(src: string, dest: string): Promise<void> {
     overwrite: true,
     filter: (srcPath: string) => !isIgnored(path.basename(srcPath)),
   });
+}
+
+/**
+ * Recursively delete directories under `target` that contain no files at any
+ * depth, and `target` itself when it ends up empty.
+ *
+ * Git tracks files, not directories: a copied skill whose source has an empty
+ * subdirectory (e.g. an unused `assets/`) leaves that subdirectory behind as an
+ * untracked shell when git switches back to the default branch after a push.
+ * Such a shell has no SKILL.md, which makes later scans mistake it for a skill
+ * namespace. Missing paths and files are left untouched.
+ */
+export async function pruneEmptyDirs(target: string): Promise<boolean> {
+  const expanded = expandHome(target);
+  let entries;
+  try {
+    const stat = await fse.lstat(expanded);
+    if (!stat.isDirectory() || stat.isSymbolicLink()) return false;
+    entries = await fse.readdir(expanded, { withFileTypes: true });
+  } catch {
+    return false; // missing or unreadable — nothing to prune
+  }
+
+  let empty = true;
+  for (const entry of entries) {
+    if (entry.isDirectory()) {
+      if (!await pruneEmptyDirs(path.join(expanded, entry.name))) empty = false;
+    } else {
+      empty = false;
+    }
+  }
+
+  if (!empty) return false;
+  try {
+    await fse.rmdir(expanded);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -180,6 +296,36 @@ async function _walkFiles(base: string, prefix: string, results: string[]): Prom
       await _walkFiles(base, rel, results);
     }
   }
+}
+
+const VCS_METADATA_NAMES = new Set(['.git', '.hg', '.svn']);
+
+/**
+ * Recursively detect local version-control metadata (`.git`/`.hg`/`.svn`) at ANY
+ * depth under `dir`. Deliberately does NOT reuse the file-walk helpers above:
+ * they skip `.git` via IGNORED_NAMES, which is exactly what would hide a nested
+ * repo. `.git` is matched whether it is a directory or a file (submodule/worktree
+ * links store it as a file). `node_modules` is skipped — its VCS metadata is
+ * dependency noise, not the user's own unpushed work. Used to keep a deployed
+ * skill that embeds a git repo (root OR nested) from being auto-deleted, since
+ * such a repo can hide stashes / unpushed history a content compare cannot see.
+ */
+export async function hasVcsMetadataRecursive(dir: string): Promise<boolean> {
+  const expanded = expandHome(dir);
+  if (!await fse.pathExists(expanded)) return false;
+  let entries;
+  try {
+    entries = await fse.readdir(expanded, { withFileTypes: true });
+  } catch {
+    return false;
+  }
+  for (const entry of entries) {
+    if (VCS_METADATA_NAMES.has(entry.name)) return true; // dir or file (submodule link)
+    if (entry.isDirectory() && entry.name !== 'node_modules') {
+      if (await hasVcsMetadataRecursive(path.join(expanded, entry.name))) return true;
+    }
+  }
+  return false;
 }
 
 /**

@@ -10,7 +10,11 @@ import { importFromRepo } from './import-repo.js';
 import { importFromRepoList } from './import-repo-list.js';
 import { importFromOrg } from './import-org.js';
 import { importFromIWikiDual } from './iwiki-dual.js';
-import type { GlobalOptions, LearningDraft } from './types.js';
+import { resolveActiveLearningsNamespaces } from './projects.js';
+import { indexableLearningsRoots } from './utils/learnings-roots.js';
+import { pendingLearningsDir, queueWriteRefusal, savePendingLearning } from './utils/pending-learnings.js';
+import type { GlobalOptions } from './types.js';
+import { assertNotReadOnly } from './read-only.js';
 import { Listr, PRESET_TIMER } from 'listr2';
 import { log, setSilent } from './utils/logger.js';
 import { autoPushTeamRepo } from './utils/git.js';
@@ -65,6 +69,58 @@ interface ImportOptions extends GlobalOptions {
   requireReview?: boolean;
   /** --skip-enrich: skip AI enrichment, only do clone + extract + graph */
   skipEnrich?: boolean;
+}
+
+/**
+ * Run knowledge reconciliation followed by deep enrichment for a freshly
+ * extracted codebase, mirroring the reconcile → deep-enrich stages used by
+ * the --from-repo flow.
+ *
+ * Both stages are non-blocking: failures are logged at debug level and
+ * swallowed so they never abort the import. Deep enrich runs only when
+ * `_manifest.json` exists (AI or fallback) and `skipEnrich` is not set.
+ *
+ * @param params - Reconcile/enrich parameters
+ * @param params.slug - Project slug, used for evidence dir naming and logging
+ * @param params.evidenceDir - Path to evidence/code/<slug> under the wiki root
+ * @param params.wikiRoot - teamwiki root directory to reconcile/enrich against
+ * @param params.cacheDir - Source code directory (the resolved --dir path)
+ * @param params.skipEnrich - When true, skip the deep-enrich stage
+ */
+async function reconcileAndDeepEnrich(params: {
+  slug: string;
+  evidenceDir: string;
+  wikiRoot: string;
+  cacheDir: string;
+  skipEnrich: boolean;
+}): Promise<void> {
+  const { slug, evidenceDir, wikiRoot, cacheDir, skipEnrich } = params;
+
+  // Reconcile product docs ↔ code knowledge (if product docs exist)
+  try {
+    const { reconcileKnowledge } = await import('./wiki-engine/adapters/index.js');
+    const result = await reconcileKnowledge({ wikiRoot, dryRun: false });
+    if (result.mappings > 0 || result.gaps.length > 0) {
+      log.info(
+        `  reconcile: ${result.mappings} mappings, ` +
+        `${result.gaps.length} gaps, ${result.graphEdges.length} MAPS_TO edges`,
+      );
+    }
+  } catch (err) {
+    log.debug(`reconcile skipped: ${(err as Error).message}`);
+  }
+
+  // Deep enrich (synchronous, before push — so all content goes into one MR)
+  const manifestExists = await fs.pathExists(path.join(evidenceDir, '_manifest.json'));
+  if (!skipEnrich && manifestExists) {
+    try {
+      const { deepEnrich } = await import('./deep-enrich.js');
+      await deepEnrich({ project: slug, evidenceDir, wikiRoot, cacheDir });
+      log.info(`Deep enrich complete: ${slug}`);
+    } catch (err) {
+      log.debug(`deep-enrich failed for ${slug} (non-blocking): ${(err as Error).message}`);
+    }
+  }
 }
 
 /**
@@ -185,22 +241,71 @@ export async function importCmd(opts: ImportOptions): Promise<void> {
     } else if (opts.fromMr) {
       // 分支 1：--from-mr <url>，提取 learning + 增量更新 teamwiki
       const { localConfig, teamConfig } = await autoDetectInit();
+      // Its learning is published the way `teamai contribute` publishes, which a
+      // read-only (HTTP) source refuses; a dry run or --output publishes nothing.
+      if (!opts.dryRun && !opts.output) assertNotReadOnly(localConfig, 'teamai import --from-mr');
+      // As contribute: into the active project's learnings namespace when there
+      // is exactly one, else the shared root.
+      const { resolveLearningsSubdir } = await import('./contribute.js');
+      const learningsSubdir = opts.dryRun || opts.output ? '' : await resolveLearningsSubdir(localConfig);
+      // The namespaces recall finds learnings in here (#823). The duplicate
+      // check is advisory: a broken projects.yaml narrows it to the shared
+      // root, as recall does.
+      const learningsNamespaces = await resolveActiveLearningsNamespaces(localConfig.repo.localPath, localConfig.projects ?? [])
+        .catch((e: unknown) => {
+          log.warn(`The duplicate check reads the shared learnings only: ${e instanceof Error ? e.message : String(e)}`);
+          return [];
+        });
+      // Publishing creates a worktree under `.teamai/`; self-heal the ignore
+      // rule first, as contribute does, while its notice can still be seen.
+      if (!opts.dryRun && !opts.output) {
+        const { migrateSelfModeGitignore } = await import('./init.js');
+        await migrateSelfModeGitignore(localConfig);
+      }
+
+      // Before the task list, not in it: in a terminal, listr2 holds back what
+      // is written to stdout while a task runs, so `Accept learning?` never
+      // showed and the extraction seemed to hang (#823).
+      const extracted = await importFromMR({
+        url: opts.fromMr,
+        // Not another repository's learnings checkout (#808).
+        learningsDirs: [pendingLearningsDir(localConfig), ...(await indexableLearningsRoots(localConfig))],
+        learningsNamespaces,
+        all: opts.all,
+        outputDir: opts.output,
+        // Into the contribution queue, which publishing drains (#823).
+        queueLearning: opts.dryRun ? undefined : async (filename, content) => {
+          const queued = await savePendingLearning(localConfig, path.posix.join(learningsSubdir, filename), content);
+          if (queued.status !== 'saved') throw new Error(queueWriteRefusal(queued));
+          return queued.path;
+        },
+        dryRun: opts.dryRun,
+      });
 
       const tasks = new Listr([
         {
-          title: 'Extract learning from MR',
-          task: async (ctx) => {
-            const { learning, repoUrl } = await importFromMR({
-              url: opts.fromMr!,
-              learningsDir: path.join(localConfig.repo.localPath, 'learnings'),
-              all: opts.all,
-              outputDir: opts.output,
-              repoPath: opts.dryRun ? undefined : localConfig.repo.localPath,
-              dryRun: opts.dryRun,
-            });
-            ctx.learning = learning;
-            ctx.repoUrl = repoUrl;
+          title: 'Publish learning',
+          skip: (ctx) => !!opts.dryRun || !!opts.output || !ctx.learning,
+          task: async (ctx, task) => {
+            const { publishQueuedLearnings } = await import('./utils/learnings-publish.js');
+            const { rebuildIndexAfterContribute } = await import('./contribute.js');
+            const report = await publishQueuedLearnings(localConfig, localConfig.username);
+            // Recall finds it where it is now: published, or still queued.
+            await rebuildIndexAfterContribute(localConfig).catch((e: unknown) =>
+              log.debug(`import: index rebuild skipped: ${e instanceof Error ? e.message : String(e)}`));
+            const queued = ctx.learningFile ? path.posix.join(learningsSubdir, path.basename(ctx.learningFile)) : '';
+            if (report.installChanged) {
+              const { KEPT_FOR_ITS_INSTALL } = await import('./contribute.js');
+              task.title = `Learning saved locally, not published: ${report.installChanged}. ${KEPT_FOR_ITS_INSTALL}`;
+            } else if (report.refused) {
+              const { KEPT_UNTIL_CHECKOUT_SETTLED } = await import('./contribute.js');
+              task.title = `Learning saved locally (${report.lastError ?? 'not published yet'}). ${KEPT_UNTIL_CHECKOUT_SETTLED}`;
+            } else if (!report.published.includes(queued)) {
+              task.title = `Learning saved locally (${report.lastError ?? 'not published yet'}); `
+                + 'the next `teamai pull` publishes it';
+            }
           },
+          rendererOptions: { persistentOutput: true },
         },
         {
           title: 'Incremental teamwiki update',
@@ -221,10 +326,16 @@ export async function importCmd(opts: ImportOptions): Promise<void> {
                 await importFromRepo({
                   url: ctx.repoUrl,
                   incremental: true,
-                  interactive: false,
                   skipAutoPush: true,
                   sourceMrUrl: opts.fromMr,
                 });
+                try {
+                  const { rebuildWikiIndex } = await import('./rebuild-wiki-index.js');
+                  await rebuildWikiIndex(teamwikiRoot);
+                } catch (e) {
+                  const msg = e instanceof Error ? e.message : String(e);
+                  log.warn(`[wiki] global index rebuild failed (non-blocking): ${msg}`);
+                }
                 ctx.didUpdate = true;
               } else {
                 task.skip('No existing evidence for this repo');
@@ -236,8 +347,9 @@ export async function importCmd(opts: ImportOptions): Promise<void> {
           rendererOptions: { persistentOutput: true },
         },
         {
+          // The teamwiki update only: the learning was published above.
           title: 'Push changes via MR',
-          skip: (ctx) => !!opts.dryRun || !!opts.output || (!ctx.learning && !ctx.didUpdate),
+          skip: (ctx) => !!opts.dryRun || !!opts.output || (!ctx.didUpdate && 'No teamwiki changes to push'),
           task: async () => {
             const { autoPushViaMR } = await import('./utils/git.js');
             await autoPushViaMR(
@@ -245,14 +357,14 @@ export async function importCmd(opts: ImportOptions): Promise<void> {
               `[teamai] Import from MR: ${opts.fromMr}`,
               ['.'],
               { repo: teamConfig.repo, provider: teamConfig.provider, reviewers: teamConfig.reviewers },
-              { repo: localConfig.repo, username: localConfig.username },
+              { repo: localConfig.repo, username: localConfig.username, provider: localConfig.provider },
             );
           },
         },
       ], {
         rendererOptions: { timer: PRESET_TIMER, collapseErrors: false },
         exitOnError: true,
-        ctx: { learning: undefined as LearningDraft | undefined, repoUrl: '', didUpdate: false },
+        ctx: { ...extracted, didUpdate: false },
       });
       setSilent(true);
       try { await tasks.run(); } finally { setSilent(false); }
@@ -262,7 +374,8 @@ export async function importCmd(opts: ImportOptions): Promise<void> {
       if (!(await fs.pathExists(dirPath))) {
         throw new Error(`Directory not found: ${dirPath}`);
       }
-      const slug = path.basename(dirPath);
+      const { defaultProjectSlug, extractCodebase } = await import('./codebase-extract.js');
+      const slug = await defaultProjectSlug(dirPath);
       log.info(`Scanning local directory: ${dirPath} (project: ${slug})`);
 
       if (opts.dryRun) {
@@ -274,7 +387,6 @@ export async function importCmd(opts: ImportOptions): Promise<void> {
       // 使用临时目录承接 extractCodebase 产物，避免污染源码目录已有的 teamwiki/
       const tmpExtractDir = await fs.mkdtemp(path.join(os.tmpdir(), 'teamai-extract-'));
       try {
-        const { extractCodebase } = await import('./codebase-extract.js');
         await extractCodebase({
           path: dirPath,
           project: slug,
@@ -291,6 +403,13 @@ export async function importCmd(opts: ImportOptions): Promise<void> {
             if (await fs.pathExists(srcWiki)) {
               await fs.copy(srcWiki, outputWiki, { overwrite: true });
               log.info(`Output written: ${outputWiki}`);
+              await reconcileAndDeepEnrich({
+                slug,
+                evidenceDir: path.join(outputWiki, 'evidence', 'code', slug),
+                wikiRoot: outputWiki,
+                cacheDir: dirPath,
+                skipEnrich: opts.skipEnrich ?? false,
+              });
             }
           } else {
             // 默认模式：写入 team-repo 并推送
@@ -312,10 +431,26 @@ export async function importCmd(opts: ImportOptions): Promise<void> {
                 await fs.copy(srcGraph, path.join(destGraphDir, 'graph-index.json'), { overwrite: true });
               }
               log.info(`teamwiki/ knowledge graph updated: ${slug}`);
+              await reconcileAndDeepEnrich({
+                slug,
+                evidenceDir: evidenceDest,
+                wikiRoot: teamwikiRoot,
+                cacheDir: dirPath,
+                skipEnrich: opts.skipEnrich ?? false,
+              });
             }
 
             const { aggregateGlobalGraph } = await import('./graph-aggregate.js');
             await aggregateGlobalGraph(teamwikiRoot);
+
+            // Rebuild global router.md / index.md so newly imported repos appear in navigation
+            try {
+              const { rebuildWikiIndex } = await import('./rebuild-wiki-index.js');
+              await rebuildWikiIndex(teamwikiRoot);
+              log.info('teamwiki router.md / index.md rebuilt');
+            } catch (e) {
+              log.warn(`[wiki] global index rebuild failed (non-blocking): ${e instanceof Error ? e.message : String(e)}`);
+            }
 
             await autoPushTeamRepo(teamRepoPath, `[teamai] Import from local dir: ${slug}`);
             log.success(`Pushed to team knowledge repo (${localConfig.repo.remote})`);

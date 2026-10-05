@@ -1,198 +1,279 @@
+import { buildSpecialHostReports, buildSpecialHostDiagnostics } from './doctor-special-hosts.js';
+import { isHostSelected, usesManagedPolicy } from './host-adapters.js';
 import path from 'node:path';
-import { readdir } from 'node:fs/promises';
 import { detectProjectConfig, loadLocalConfig, loadTeamConfig } from './config.js';
 import { pathExists, readFileSafe } from './utils/fs.js';
-import { log } from './utils/logger.js';
-import type { GlobalOptions, LocalConfig, Scope } from './types.js';
+import { log, setStderrOnly } from './utils/logger.js';
+import type { GlobalOptions } from './types.js';
 import {
-  TeamaiConfigSchema,
-  TEAMAI_ENV_START,
-  resolveBaseDir,
+  CLAUDE_TOOL_ID,
+  COPILOT_TOOL_ID,
+  DEFAULT_CLAUDE_ROOT,
+  detectClaudeConfigRoot,
+  resolveToolRootDir,
+  toolRootRejection,
+  resolveHookScope,
+  resolveToolBaseDir,
+  isAgentExcluded,
+  scopedToolPaths,
+  type LocalConfig,
   type TeamaiConfig,
 } from './types.js';
-import { TEAMAI_HOOK_SUBCOMMANDS } from './hooks.js';
+import { isToolInstalledForConfig } from './resources/base.js';
+import { skillsDirForTool } from './resources/skills.js';
+import { TEAMAI_HOOK_SUBCOMMANDS, isCodexTrustGatedTool, codexTrustReminder } from './hooks.js';
 import {
-  DSH_EXACT_VERSION,
-  WORKBUDDY_VALIDATED_VERSION,
-  homeDir,
-  isHostSelected,
-  resolveHostResourcePath,
-  resolveHostRoot,
-} from './host-adapters.js';
-import { getAgentVersion } from './agent-version.js';
+  buildDeliveryChecks,
+  buildRulesDeliveryChecks,
+  buildAgentsDeliveryChecks,
+  buildNamespaceNotes,
+  buildMcpDeliveryChecks,
+  buildEnvDeliveryCheck,
+  buildEntryResolutionChecks,
+  buildEntryScopeKeyCheck,
+  entryNamespaceNotes,
+  buildDocsCheck,
+} from './doctor-delivery.js';
 
-interface Check {
-  id: string;
+/**
+ * Where a check gets its answer. `provider` checks shell out to a provider CLI
+ * or the network; `local` checks only read this machine. Callers that run the
+ * registry outside `teamai doctor` filter on it — see the post-pull pass in
+ * `pull()`, which has just used the provider successfully and must not pay for
+ * an auth probe on every sync.
+ */
+export type CheckSource = 'local' | 'provider';
+import { hasPiHooks } from './pi-hooks.js';
+
+export interface Check {
+  id?: string;
   name: string;
+  source: CheckSource;
+  /**
+   * Names something `teamai pull` says in its own words, better than a static
+   * `fix` can: the queue warning carries the push error, which `doctor` cannot
+   * learn without attempting a push of its own, and a read-only diagnostic must
+   * not. The post-pull pass drops a check whose topic that run actually
+   * reported. Not every run does: a scope whose team repo fails to refresh
+   * returns before the publish step, and a publish that throws is swallowed
+   * into a debug line. On those paths nobody has spoken, so the check is the
+   * only voice left and must be heard.
+   */
+  reportedByPull?: string;
+  /**
+   * True for a check whose failure is a cleanup opportunity, not a sign that
+   * anything a user asked for is actually broken. `doctor` still reports it
+   * like any other check; `pull`'s post-pull summary excludes it from the
+   * "N check(s) failed" count so a healthy delivery is not announced as
+   * broken because of unrelated leftover state (#693 review round 6).
+   */
+  informational?: boolean;
   check: () => Promise<boolean>;
   fix?: string;
 }
 
-export interface DoctorCheckResult {
-  id: string;
-  name: string;
-  ok: boolean;
-  fix?: string;
-  detail?: string;
-}
-
-export interface DoctorHostReport {
-  selected: boolean;
-  root: string | null;
-  detectedVersion: string | null;
-  expectedVersion: string;
-  managedResources: string[];
-  runtimeSmoke: 'manual' | 'opt-in-read-only';
-}
-
-export interface DoctorReport {
-  schemaVersion: 1;
-  ok: boolean;
-  scope: Scope;
-  projectRoot: string | null;
-  provider: string;
-  hosts: {
-    workbuddy: DoctorHostReport;
-    dsh: DoctorHostReport;
-  };
-  notices: string[];
-  checks: DoctorCheckResult[];
+/**
+ * Everything the check registry needs to describe this machine. Resolved once
+ * by `resolveDoctorContext`, then passed to `buildChecks` — so any caller
+ * (doctor, and later a post-pull run) builds the same checks the same way.
+ */
+export interface DoctorContext {
+  localConfig: LocalConfig;
+  teamConfig: TeamaiConfig | null;
+  /** Tool paths already narrowed to the enabled, non-excluded agents. */
+  toolPaths: TeamaiConfig['toolPaths'];
+  /**
+   * The same tool paths resolved at the scope hooks are injected into, which is
+   * not the config's scope: a non-self project scope injects into HOME (#264).
+   * Hook checks must use these, or a tool whose user-scope prefix differs from
+   * its project-scope one is looked for under the wrong prefix and always
+   * reported missing.
+   */
+  hookToolPaths: TeamaiConfig['toolPaths'];
+  /** Where hooks are actually injected — see `resolveHookScope` (#264). */
+  baseDir: string;
 }
 
 export interface DoctorOptions extends GlobalOptions {
+  /** Emit the report as JSON on stdout instead of the human rendering. */
   json?: boolean;
 }
 
-interface SpecialHostDiagnostics {
-  checks: Check[];
-  notices: string[];
+/** One check after it ran. */
+export interface CheckResult {
+  id?: string;
+  name: string;
+  ok: boolean;
+  fix?: string;
 }
 
-async function canonicalSkillNames(repoRoot: string): Promise<string[]> {
-  const skillsRoot = path.join(repoRoot, 'skills');
-  try {
-    const entries = await readdir(skillsRoot, { withFileTypes: true });
-    const names: string[] = [];
-    for (const entry of entries) {
-      if (!entry.isDirectory()) continue;
-      if (await pathExists(path.join(skillsRoot, entry.name, 'SKILL.md'))) names.push(entry.name);
-    }
-    return names.sort();
-  } catch {
-    return [];
-  }
-}
-
-async function filesMatch(left: string, right: string): Promise<boolean> {
-  const [leftText, rightText] = await Promise.all([readFileSafe(left), readFileSafe(right)]);
-  return leftText !== null && leftText === rightText;
-}
-
-async function buildSpecialHostReports(localConfig: LocalConfig | null): Promise<DoctorReport['hosts']> {
-  const scope: Scope = localConfig?.scope ?? 'user';
-  const build = async (host: 'workbuddy' | 'dsh'): Promise<DoctorHostReport> => {
-    const selected = Boolean(localConfig && isHostSelected(localConfig, host));
-    const root = selected
-      ? localConfig?.hostRoots?.[host] ?? resolveHostRoot(host, scope, localConfig?.projectRoot) ?? null
-      : null;
-    const detectedVersion = selected ? await getAgentVersion(host) || null : null;
-    return {
-      selected,
-      root,
-      detectedVersion,
-      expectedVersion: host === 'dsh' ? DSH_EXACT_VERSION : WORKBUDDY_VALIDATED_VERSION,
-      managedResources: host === 'dsh' && scope === 'user' ? ['skills', 'instructions'] : ['skills'],
-      runtimeSmoke: host === 'dsh' ? 'opt-in-read-only' : 'manual',
-    };
-  };
-  const [workbuddy, dsh] = await Promise.all([build('workbuddy'), build('dsh')]);
-  return { workbuddy, dsh };
-}
-
-async function buildSpecialHostDiagnostics(
-  localConfig: LocalConfig | null,
-  teamConfig: TeamaiConfig | null,
-  hosts: DoctorReport['hosts'],
-): Promise<SpecialHostDiagnostics> {
-  const diagnostics: SpecialHostDiagnostics = { checks: [], notices: [] };
-  if (!localConfig) return diagnostics;
-
-  const selectedHosts = (['workbuddy', 'dsh'] as const).filter((host) => hosts[host].selected);
-  if (selectedHosts.length === 0) return diagnostics;
-
-  const skillNames = await canonicalSkillNames(localConfig.repo.localPath);
-  for (const host of selectedHosts) {
-    const { root, detectedVersion: version, expectedVersion } = hosts[host];
-    const displayName = host === 'dsh' ? 'DSH' : 'WorkBuddy';
-
-    diagnostics.notices.push(
-      `${displayName} support evidence: synchronized entrypoints are checked here; runtime loading is a separate host smoke check`,
-    );
-    diagnostics.checks.push(
-      {
-        id: `host.${host}.root`,
-        name: `${displayName} host root is available (${root ?? 'unresolved'})`,
-        check: async () => Boolean(root && await pathExists(root)),
-        fix: `Run targeted uninstall, then re-run \`teamai init --agent ${host}\` to bind the current host root`,
-      },
-      {
-        id: `host.${host}.version`,
-        name: `${displayName} version matches ${expectedVersion} (detected: ${version ?? 'unavailable'})`,
-        check: async () => version === expectedVersion,
-        fix: host === 'dsh'
-          ? `Install DSH ${expectedVersion} before syncing`
-          : `Use WorkBuddy ${expectedVersion}, or revalidate the new version before treating it as supported`,
-      },
-      {
-        id: `host.${host}.skills`,
-        name: `${displayName} has all ${skillNames.length} canonical Skill entrypoints`,
-        check: async () => {
-          if (!root || skillNames.length === 0) return false;
-          const results = await Promise.all(
-            skillNames.map((name) => pathExists(path.join(root, 'skills', name, 'SKILL.md'))),
-          );
-          return results.every(Boolean);
-        },
-        fix: 'Run `teamai pull` to restore missing managed Skill entrypoints',
-      },
-    );
-
-    if (host === 'dsh') {
-      const source = teamConfig?.sharing?.instructions?.source;
-      const target = resolveHostResourcePath('dsh', 'instructions', localConfig);
-      diagnostics.checks.push({
-        id: 'host.dsh.instructions',
-        name: 'DSH managed AGENTS.md matches the canonical instruction source',
-        check: async () => Boolean(source && target && await filesMatch(path.join(localConfig.repo.localPath, source), target)),
-        fix: 'Run `teamai pull` to restore the managed DSH instruction file',
-      });
-
-      const projectInstructions = path.join(process.cwd(), 'AGENTS.md');
-      if (localConfig.scope === 'user' && target && await pathExists(projectInstructions)
-        && await filesMatch(projectInstructions, target)) {
-        diagnostics.notices.push(
-          'Identical user-level and project-level AGENTS.md files exist in this workspace; TeamAI does not infer duplicate DSH runtime loading from file presence alone',
-        );
-      }
-    }
-  }
-  return diagnostics;
+/** What `doctor --json` prints. One object, one place that builds it. */
+export interface DoctorReport {
+  schemaVersion?: 1;
+  projectRoot?: string | null;
+  provider?: string;
+  hosts?: Awaited<ReturnType<typeof buildSpecialHostReports>>;
+  notices?: string[];
+  ok: boolean;
+  /** null before initialization, when there is no config to scope. */
+  scope: string | null;
+  checks: CheckResult[];
+  /** Present only when the team repo declares packages. Human text, not checks. */
+  packages?: { ok: boolean; lines: string[] };
+  /** Advisories that are not checks: namespace overrides, the Codex trust-gate reminder. */
+  notes?: string[];
 }
 
 /**
- * Build hook checks only for tools whose settings parent directory already
- * exists (i.e. the tool is installed). Tools that are not installed are skipped.
+ * Check that every tool the team declares and the user enabled is actually here.
+ * Scope note: the loop is over `ctx.toolPaths`, already narrowed to the enabled,
+ * non-excluded agents, so a name in `enabledAgents` that `teamai.yaml` declares
+ * no paths for is out of scope — nothing would be written to it either way.
+ *
+ * That list is the user's own claim that they use the tool, and every writer —
+ * skills, rules, agents, hooks — silently skips a tool whose root is missing.
+ * Answering the claim with silence reproduces inside `doctor` the skip #574
+ * reports in `pull`: "Synced N" while the tool receives nothing. Without
+ * `enabledAgents` the team's tool list is aspirational, so an absent tool stays
+ * silent, as it always has.
+ *
+ * The probe uses a resource path rather than the settings path: resources land
+ * under `resolveToolBaseDir` (the project root in project scope), which is the
+ * root a pull would have to write into.
  */
-async function buildHookChecks(toolPaths: TeamaiConfig['toolPaths'], baseDir: string): Promise<Check[]> {
+async function buildEnabledToolChecks(ctx: DoctorContext): Promise<Check[]> {
+  const { localConfig, toolPaths } = ctx;
+  if (!localConfig.enabledAgents) return [];
+
   const checks: Check[] = [];
   for (const [tool, paths] of Object.entries(toolPaths)) {
-    if (!paths.settings) continue;
-    const settingsPath = path.join(baseDir, paths.settings);
-    const parentDir = path.dirname(settingsPath);
-    if (!await pathExists(parentDir)) continue;
+    // Copilot counts itself installed as soon as enabledAgents names it
+    // (isToolInstalledForConfig), so this check could never fail for it. Its
+    // delivery check still reports what did not arrive.
+    if (tool === COPILOT_TOOL_ID) continue;
+
+    const probePath = paths.skills ?? paths.rules ?? paths.agents ?? paths.settings ?? paths.hooks;
+    if (!probePath) continue;
+
+    // A tool that receives skills is asked the way the skills write path asks:
+    // OpenClaw lives at its workspace directory, not at the tool root, so the
+    // generic probe passes for a `~/.openclaw` with no workspace while delivery
+    // silently skips it — the same "reported success, received nothing" this
+    // check exists to catch. A tool with no skills path (rules only) has no
+    // such resolver, so it keeps the generic probe.
+    const skillsPath = paths.skills;
+    const isInstalled = skillsPath
+      ? async (): Promise<boolean> => await skillsDirForTool(tool, skillsPath, localConfig) !== null
+      : (): Promise<boolean> => isToolInstalledForConfig(tool, probePath, localConfig);
+
+    // Pushed whether or not it passes. Every other check in the registry
+    // reports both ways, and `doctor --json` is consumed by hooks and CI, where
+    // a missing entry cannot be told apart from one that passed.
     checks.push({
-      id: `hooks.${tool}`,
+      name: `${tool} is installed`,
+      source: 'local',
+      check: isInstalled,
+      fix: `enabledAgents lists ${tool}, but it has no directory under `
+        + `${resolveToolBaseDir(tool, localConfig)}, so a pull delivers nothing to it. `
+        + `Install ${tool} (in project scope, opening a session there creates its root), `
+        + `or run \`teamai uninstall --agent ${tool}\` to stop syncing to it.`,
+    });
+  }
+
+  return checks;
+}
+
+/**
+ * Check that a relocated Claude Code root is the one teamai writes to.
+ *
+ * `CLAUDE_CONFIG_DIR` moves everything Claude Code reads — settings, skills,
+ * rules, CLAUDE.md — and teamai learns about it only when `init` records it in
+ * `toolRoots.claude`. Without the check, a member who sets the variable after
+ * initializing (or changes it) keeps getting a green report while every synced
+ * resource lands in a directory their Claude never opens.
+ *
+ * Skipped only when the variable is unset — then there is nothing to relocate
+ * and a member who never used it should not be told about a setting they do not
+ * have. A value equal to the default root is not that case: it still moves
+ * `.claude.json` inside the directory, so it has to be recorded like any other.
+ */
+function buildClaudeRootCheck(localConfig: LocalConfig, toolPaths: TeamaiConfig['toolPaths']): Check[] {
+  // Nothing to compare for a config that never writes to Claude Code.
+  if (!(CLAUDE_TOOL_ID in toolPaths)) return [];
+  const detected = detectClaudeConfigRoot();
+  if (!detected) return [];
+  // The effective root, not the recorded string: `~/.claude-work` written by
+  // hand is the same directory as the expanded one, while a root the sync
+  // refuses (outside HOME, or nested too deep) resolves back to the default —
+  // so the check fails exactly when the sync would write somewhere else.
+  const recorded = localConfig.toolRoots?.[CLAUDE_TOOL_ID];
+  const effective = resolveToolRootDir(CLAUDE_TOOL_ID, DEFAULT_CLAUDE_ROOT, localConfig.toolRoots);
+  // A value init refuses cannot be fixed by re-running init: say why instead.
+  const rejection = toolRootRejection(detected);
+  return [{
+    name: 'Claude Code root matches CLAUDE_CONFIG_DIR',
+    source: 'local',
+    // Recording matters even when the directories agree: an unrecorded root
+    // leaves the MCP config at ~/.claude.json, while a Claude Code told to use
+    // that directory reads .claude.json from inside it.
+    check: async () => recorded !== undefined && effective === detected,
+    fix: rejection
+      ? `CLAUDE_CONFIG_DIR is ${detected}, which teamai cannot sync to (${rejection}); `
+        + `this config syncs Claude Code to ${effective}. Point CLAUDE_CONFIG_DIR at a directory `
+        + 'in your home (or ~/.config/<name>) and re-run `teamai init`.'
+      : `CLAUDE_CONFIG_DIR is ${detected}; this config syncs Claude Code to ${effective}`
+        + `${recorded === undefined ? ' (no root recorded)' : ''}. `
+        + 'Re-run `teamai init` to record it.',
+  }];
+}
+
+/**
+ * Build hook checks for tools whose settings parent directory already exists
+ * (i.e. the tool is installed). Tools that are not installed are skipped.
+ */
+async function buildHookChecks(
+  toolPaths: TeamaiConfig['toolPaths'],
+  hookToolPaths: TeamaiConfig['toolPaths'],
+  baseDir: string,
+  localConfig: LocalConfig,
+): Promise<Check[]> {
+  const checks: Check[] = [];
+  for (const [tool, paths] of Object.entries(toolPaths)) {
+    if (tool === 'pi') {
+      const installed = await isToolInstalledForConfig(tool, paths.skills ?? '.pi/skills', localConfig);
+      if (!installed) continue;
+      checks.push({
+        name: 'teamai hooks in pi extension',
+        source: 'local',
+        check: async () => hasPiHooks(),
+        fix: 'Run `teamai hooks inject` to inject/update hooks',
+      });
+      continue;
+    }
+    // A standalone hooks file (Copilot) is injected at the config's own scope
+    // (`reconcileTeamHooksForConfig` joins resolveToolBaseDir with the
+    // config-scoped `hooks`), so it is probed from `toolPaths`. Settings-based
+    // hooks follow resolveHookScope and are probed from `hookToolPaths`.
+    // Mixing the two — userScope `hooks/teamai.json` under <projectRoot> —
+    // reported Copilot missing right after a successful `hooks inject` (#732).
+    const settings = hookToolPaths[tool]?.settings;
+    const hookPath = paths.hooks
+      ? path.join(resolveToolBaseDir(tool, localConfig), paths.hooks)
+      : settings
+        ? path.join(baseDir, settings)
+        : undefined;
+    if (!hookPath) continue;
+    const settingsPath = hookPath;
+    const parentDir = path.dirname(settingsPath);
+    const installed = tool === COPILOT_TOOL_ID
+      ? await isToolInstalledForConfig(tool, paths.hooks ?? paths.settings ?? '', localConfig)
+      : await pathExists(parentDir);
+    // An uninstalled tool has no hooks to check. Whether it should be installed
+    // at all is a different question — see buildEnabledToolChecks.
+    if (!installed) continue;
+    checks.push({
       name: `teamai hooks in ${tool} settings`,
+      source: 'local',
       check: async () => {
         if (!await pathExists(settingsPath)) return false;
         const content = await readFileSafe(settingsPath);
@@ -209,25 +290,83 @@ async function buildHookChecks(toolPaths: TeamaiConfig['toolPaths'], baseDir: st
   return checks;
 }
 
-export async function doctor(options: DoctorOptions): Promise<DoctorReport> {
-  const projectConfig = await detectProjectConfig();
-  const localConfig = projectConfig ?? (await loadLocalConfig());
-  const scope: Scope = localConfig?.scope ?? 'user';
-  const configPathLabel = projectConfig
-    ? `${projectConfig.projectRoot}/.teamai/config.yaml`
-    : '~/.teamai/config.yaml';
 
-  let teamConfig: TeamaiConfig | null = null;
-  if (localConfig) {
-    teamConfig = await loadTeamConfig(localConfig.repo.localPath);
+/**
+ * True if a trust-gated Codex tool (the public `codex`) already has teamai hooks
+ * installed on disk (settings file exists and contains the hook-dispatch
+ * command). Used to emit a lightweight reminder that Codex may still require the
+ * user to trust them. Read-only — never inspects or modifies Codex's
+ * [hooks.state] trust store. Internal variants are excluded (no trust gate).
+ */
+async function hasInstalledCodexHooks(toolPaths: TeamaiConfig['toolPaths'], baseDir: string): Promise<boolean> {
+  for (const [tool, paths] of Object.entries(toolPaths)) {
+    if (!isCodexTrustGatedTool(tool) || !paths.settings) continue;
+    const settingsPath = path.join(baseDir, paths.settings);
+    if (!await pathExists(settingsPath)) continue;
+    const content = await readFileSafe(settingsPath);
+    if (content?.includes('teamai hook-dispatch')) return true;
   }
-  const toolPaths = teamConfig?.toolPaths ?? TeamaiConfigSchema.shape.toolPaths.parse(undefined);
-  const providerName = teamConfig?.provider ?? 'tgit';
-  const baseDir = localConfig ? resolveBaseDir(localConfig) : homeDir();
-  const hosts = await buildSpecialHostReports(localConfig);
+  return false;
+}
 
+/**
+ * Resolve the local/team configuration the checks run against. Returns null
+ * when TeamAI is not initialized here — the caller decides how to report that.
+ */
+export async function resolveDoctorContext(): Promise<DoctorContext | null> {
+  const projectConfig = await detectProjectConfig(undefined, undefined, { dryRun: true });
+  const localConfig = projectConfig ?? (await loadLocalConfig({ dryRun: true }));
+  if (!localConfig) return null;
+
+  const teamConfig = await loadTeamConfig(localConfig.repo.localPath);
+  const toolPaths: TeamaiConfig['toolPaths'] = teamConfig
+    ? Object.fromEntries(
+      Object.entries(scopedToolPaths(teamConfig, localConfig))
+        .filter(([tool]) => !isAgentExcluded(localConfig, tool) && (!usesManagedPolicy(teamConfig, localConfig) || isHostSelected(localConfig, tool))),
+    )
+    : {};
+  // Hook checks must look where hooks are actually injected. resolveHookScope
+  // maps a non-self project scope to HOME (#264), matching the injection path in
+  // init/pull/hooks-cmd — otherwise doctor checks <projectRoot>/.claude while the
+  // hooks live in ~/.claude and always reports them missing. The paths have to
+  // follow the same scope, or a tool whose user-scope prefix differs from its
+  // project-scope one (`qoder-cn`, OpenCode) is probed under the wrong prefix.
+  const hookScope = resolveHookScope(localConfig);
+  const hookToolPaths: TeamaiConfig['toolPaths'] = teamConfig
+    ? Object.fromEntries(
+      Object.entries(scopedToolPaths(teamConfig, { ...localConfig, scope: hookScope.scope }))
+        .filter(([tool]) => !isAgentExcluded(localConfig, tool) && (!usesManagedPolicy(teamConfig, localConfig) || isHostSelected(localConfig, tool))),
+    )
+    : {};
+  const baseDir = hookScope.baseDir;
+
+  return { localConfig, teamConfig, toolPaths, hookToolPaths, baseDir };
+}
+
+/**
+ * Which caller the registry is being built for.
+ *
+ * `pull` runs the registry again at the end of an interactive sync, under a
+ * budget that covers building it as well as running it. Skills and docs cost a
+ * stat per item; rules cost a read per rule per tool and agents parse every
+ * spec. Spending the budget on those loses the cheap checks that catch the bug
+ * this whole line of work exists for, so they are `doctor`-only.
+ *
+ * The stage is a property of the caller, not of a check, which is why it is an
+ * argument here rather than a third optional flag on `Check` beside `source`
+ * and `reportedByPull`.
+ */
+export type CheckStage = 'pull' | 'doctor';
+
+/**
+ * The check registry. Exported so callers other than `teamai doctor` can run
+ * the same diagnostics and act on the result.
+ */
+export async function buildChecks(ctx: DoctorContext, stage: CheckStage = 'doctor'): Promise<Check[]> {
+  const { localConfig, teamConfig, toolPaths, hookToolPaths, baseDir } = ctx;
+  // A member's `init --provider` choice outranks the team's provider (#789).
+  const providerName = localConfig.provider ?? teamConfig?.provider;
   const checks: Check[] = [];
-  const specialHostDiagnostics = await buildSpecialHostDiagnostics(localConfig, teamConfig, hosts);
 
   // Provider-specific checks: gf CLI only needed for TGit, gh CLI for GitHub
   if (providerName === 'tgit') {
@@ -235,14 +374,14 @@ export async function doctor(options: DoctorOptions): Promise<DoctorReport> {
     const { isGfInstalled, gfIsAuthenticated } = await import('./providers/tgit/index.js');
     checks.push(
       {
-        id: 'provider.tgit.installed',
         name: 'gf CLI is installed',
+        source: 'provider',
         check: async () => isGfInstalled(),
         fix: 'Run `teamai init` to install gf CLI automatically',
       },
       {
-        id: 'provider.tgit.authenticated',
         name: 'gf CLI is authenticated',
+        source: 'provider',
         check: async () => gfIsAuthenticated(),
         fix: 'Run `teamai init` to authenticate via gf auth login',
       },
@@ -252,119 +391,212 @@ export async function doctor(options: DoctorOptions): Promise<DoctorReport> {
     const { isGhInstalled, ghIsAuthenticated } = await import('./providers/github/index.js');
     checks.push(
       {
-        id: 'provider.github.installed',
         name: 'gh CLI is installed',
+        source: 'provider',
         check: async () => isGhInstalled(),
         fix: 'Install from https://cli.github.com/ or run `brew install gh`',
       },
       {
-        id: 'provider.github.authenticated',
         name: 'gh CLI is authenticated',
+        source: 'provider',
         check: async () => ghIsAuthenticated(),
         fix: 'Run `gh auth login` to authenticate',
       },
     );
+  } else if (providerName === 'gitlab') {
+    // GitLab needs no CLI — only a Personal Access Token.
+    const { gitlabIsAuthenticated } = await import('./providers/gitlab/index.js');
+    checks.push({
+      name: 'GitLab token is configured',
+      source: 'provider',
+      check: async () => gitlabIsAuthenticated(),
+      fix: 'Export GITLAB_TOKEN (a Personal Access Token with `api` scope). '
+        + 'GITLAB_PRIVATE_TOKEN and GITLAB_PAT are accepted as aliases.',
+    });
+  } else if (providerName === 'gitcode') {
+    // GitCode needs no CLI — only a Personal Access Token (env or ~/.netrc).
+    const { gitcodeIsAuthenticated } = await import('./providers/gitcode/index.js');
+    checks.push({
+      name: 'GitCode token is configured',
+      source: 'provider',
+      check: async () => gitcodeIsAuthenticated(),
+      fix: 'Export GITCODE_TOKEN (a GitCode Personal Access Token), or run `teamai init` '
+        + 'to paste one interactively. GC_TOKEN is accepted as an alias.',
+    });
   }
 
   checks.push(
     {
-      id: 'config.local',
-      name: `Local config exists (${configPathLabel})`,
-      check: async () => localConfig !== null,
-      fix: 'Run `teamai init` to initialize',
-    },
-    {
-      id: 'config.team-repo',
       name: 'Team repo exists locally',
-      check: async () => {
-        if (!localConfig) return false;
-        return pathExists(localConfig.repo.localPath);
-      },
+      source: 'local',
+      check: async () => pathExists(localConfig.repo.localPath),
       fix: 'Run `teamai init` to clone the team repo',
     },
     {
       id: 'config.team',
       name: 'Team config (teamai.yaml) is valid',
-      check: async () => localConfig !== null && teamConfig !== null,
+      source: 'local',
+      check: async () => {
+        const config = await loadTeamConfig(localConfig.repo.localPath);
+        return config !== null;
+      },
       fix: 'Check teamai.yaml in team repo for syntax errors',
     },
-    ...await buildHookChecks(toolPaths, baseDir),
     {
-      id: 'environment.shell-profile',
-      name: teamConfig?.sharing?.env?.injectShellProfile === false
-        ? 'Env variables are not injected (disabled by team policy)'
-        : 'Env variables injected in shell profile',
+      // A contribution is kept locally when it cannot be published. Without
+      // this check a member whose pushes are rejected queues notes forever and
+      // is told each time that the next pull will retry.
+      name: 'Contributed learnings are published',
+      source: 'local',
+      // pullForScope warns about the queue on its own, with the push error
+      // attached; this check is the standing version of it for `teamai doctor`.
+      reportedByPull: 'pending-learnings',
       check: async () => {
-        if (teamConfig?.sharing?.env?.injectShellProfile === false) return true;
-
-        if (!localConfig) return true;
-        const envYamlPath = path.join(localConfig.repo.localPath, 'env', 'env.yaml');
-        if (!await pathExists(envYamlPath)) return true;
-
-        const home = homeDir();
-
-        const envShPath = path.join(home, '.teamai', 'env.sh');
-        if (!await pathExists(envShPath)) return false;
-
-        const shell = process.env.SHELL ?? '';
-        const profilePath = shell.includes('zsh')
-          ? path.join(home, '.zshrc')
-          : path.join(home, '.bashrc');
-        if (!await pathExists(profilePath)) return false;
-        const content = await readFileSafe(profilePath);
-        return content?.includes(TEAMAI_ENV_START) ?? false;
+        const { listPendingLearnings } = await import('./utils/pending-learnings.js');
+        return (await listPendingLearnings(localConfig)).length === 0;
       },
-      fix: 'Run `teamai pull` to inject env variables into shell profile',
+      fix: 'Run `teamai pull` to publish them. If they stay queued, check that you '
+        + 'can push to the team repo (run with --verbose to see the push error).',
     },
-    ...specialHostDiagnostics.checks,
+    ...buildClaudeRootCheck(localConfig, toolPaths),
+    ...await buildEnabledToolChecks(ctx),
+    ...await buildHookChecks(toolPaths, hookToolPaths, baseDir, localConfig),
+    ...await buildDeliveryChecks(ctx),
+    // Built only for `doctor`: the work is in building these, not in running
+    // them, so skipping them post-pull is what keeps the budget for the rest.
+    ...(stage === 'doctor' ? await buildRulesDeliveryChecks(ctx) : []),
+    ...(stage === 'doctor' ? await buildAgentsDeliveryChecks(ctx) : []),
+    ...await buildMcpDeliveryChecks(ctx),
+    ...await buildDocsCheck(ctx),
+    ...await buildEnvDeliveryCheck(ctx),
+    ...await buildEntryResolutionChecks(ctx),
+    ...await buildEntryScopeKeyCheck(ctx),
   );
 
-  const checkResults: DoctorCheckResult[] = [];
-  for (const { id, name, check, fix } of checks) {
-    try {
-      const ok = await check();
-      checkResults.push({ id, name, ok, ...(!ok && fix ? { fix } : {}) });
-    } catch (error) {
-      checkResults.push({
-        id,
-        name,
-        ok: false,
-        ...(fix ? { fix } : {}),
-        detail: error instanceof Error ? error.message : String(error),
-      });
-    }
-  }
-  const allPassed = checkResults.every((result) => result.ok);
-  const report: DoctorReport = {
-    schemaVersion: 1,
-    ok: allPassed,
-    scope,
-    projectRoot: localConfig?.projectRoot ?? null,
-    provider: providerName,
-    hosts,
-    notices: specialHostDiagnostics.notices,
-    checks: checkResults,
-  };
+  return checks;
+}
 
-  if (options.json) {
-    console.log(JSON.stringify(report, null, 2));
-    return report;
+/**
+ * Run every check once, in registry order. `onResult` reports each one as it
+ * lands, so the human rendering keeps streaming while a slow check (a provider
+ * CLI auth probe) is still running.
+ */
+export async function runChecks(
+  checks: Check[],
+  onResult?: (result: CheckResult) => void,
+): Promise<CheckResult[]> {
+  const results: CheckResult[] = [];
+  for (const { id, name, check, fix } of checks) {
+    const ok = await check();
+    const result: CheckResult = ok ? { name, ok } : { name, ok, fix };
+    result.id = id ?? `check.${name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/-$/, '')}`;
+    results.push(result);
+    onResult?.(result);
   }
+  return results;
+}
+
+/** The only writer of the JSON channel. */
+function emitReport(report: DoctorReport): void {
+  console.log(JSON.stringify(report, null, 2));
+}
+
+/**
+ * The human rendering of one finished check, as lines. Exported because `pull`
+ * prints the same shape through the logger rather than stdout — one definition
+ * of the glyphs and the indent, two sinks.
+ */
+export function formatCheckResult({ name, ok, fix }: CheckResult): string[] {
+  if (ok) return [`  ✔ ${name}`];
+  return fix ? [`  ✖ ${name}`, `    → ${fix}`] : [`  ✖ ${name}`];
+}
+
+function renderResult(result: CheckResult): void {
+  for (const line of formatCheckResult(result)) console.log(line);
+}
+
+export async function doctor(options: DoctorOptions): Promise<boolean> {
+  const jsonMode = options.json === true;
+  // In JSON mode stdout is a data channel: route every log line to stderr so a
+  // consumer can parse stdout whole (same trick as hook-dispatch commands).
+  if (jsonMode) setStderrOnly(true);
 
   log.info('Running diagnostics...\n');
-  console.log(`  Scope: ${scope}${scope === 'project' && localConfig?.projectRoot ? ` (${localConfig.projectRoot})` : ''}\n`);
-  console.log(`  DSH: ${hosts.dsh.selected ? `selected (${hosts.dsh.root})` : 'not selected'}`);
-  console.log(`  WorkBuddy: ${hosts.workbuddy.selected ? `selected (${hosts.workbuddy.root})` : 'not selected'}`);
-  if (hosts.dsh.selected) {
-    console.log(`  DSH shared Agents root: ${process.env.DSH_AGENTS_HOME?.trim() || '~/.agents'} (read-only compatibility path; TeamAI does not manage it as DSH)`);
+  const ctx = await resolveDoctorContext();
+  const hosts = await buildSpecialHostReports(ctx?.localConfig ?? null);
+  const metadata = { schemaVersion: 1 as const, hosts, projectRoot: ctx?.localConfig.projectRoot ?? null, provider: ctx?.localConfig.provider ?? ctx?.teamConfig?.provider ?? 'unknown' };
+  if (!ctx) {
+    const notInitialized: CheckResult = {
+      id: 'config.initialized',
+      name: 'TeamAI is not initialized',
+      ok: false,
+      fix: 'Run `teamai init <repo-url>` in a project, or add `--scope user` for all projects',
+    };
+    if (jsonMode) {
+      emitReport({ ...metadata, ok: false, scope: 'user', notices: [], checks: [notInitialized] });
+    } else {
+      console.log('  Scope: not initialized\n');
+      renderResult(notInitialized);
+      console.log('');
+    }
+    log.warn('Initialization is required before diagnostics can run.');
+    return false;
   }
-  console.log('');
-  for (const notice of specialHostDiagnostics.notices) console.log(`  ⚠ ${notice}`);
-  if (specialHostDiagnostics.notices.length > 0) console.log('');
-  for (const result of checkResults) {
-    console.log(`  ${result.ok ? '✔' : '✖'} ${result.name}`);
-    if (result.detail) console.log(`    → ${result.detail}`);
-    if (!result.ok && result.fix) console.log(`    → ${result.fix}`);
+
+  const { localConfig, toolPaths, baseDir } = ctx;
+  const scope = localConfig.scope ?? 'user';
+  if (!jsonMode) {
+    const scopeLabel = `${scope}${scope === 'project' && localConfig.projectRoot ? ` (${localConfig.projectRoot})` : ''}`;
+    console.log(`  Scope: ${scopeLabel}\n`);
+  }
+
+  const special = await buildSpecialHostDiagnostics(localConfig, ctx.teamConfig, hosts);
+  const results = await runChecks([...await buildChecks(ctx), ...special.checks], jsonMode ? undefined : renderResult);
+  let allPassed = results.every((r) => r.ok);
+
+  const { pkgDoctorReport } = await import('./pkg/commands.js');
+  const packageReport = await pkgDoctorReport(localConfig, process.cwd());
+  if (packageReport) {
+    results.push({ id: 'packages', name: 'Declared packages are ready', ok: packageReport.allPassed });
+    if (!packageReport.allPassed) allPassed = false;
+  }
+
+  // Codex trust-gate reminder: even when hooks are installed, Codex may not run
+  // them until the user reviews/trusts them. Note only — teamai never writes
+  // [hooks.state] to auto-trust.
+  const codexNote = await hasInstalledCodexHooks(toolPaths, baseDir)
+    ? codexTrustReminder()
+    : null;
+  // Info, not checks: which namespace item or entry replaces which root one
+  // (#707).
+  const notes = [
+    ...special.notices,
+    ...await buildNamespaceNotes(ctx),
+    ...await entryNamespaceNotes(ctx),
+    ...(codexNote ? [codexNote] : []),
+  ];
+
+  if (jsonMode) {
+    emitReport({
+      ...metadata,
+      notices: notes,
+      ok: allPassed,
+      scope,
+      checks: results,
+      // pkgDoctorReport renders its own lines; they are human text, not checks.
+      ...(packageReport ? { packages: { ok: packageReport.allPassed, lines: packageReport.lines } } : {}),
+      ...(notes.length > 0 ? { notes } : {}),
+    });
+    return allPassed;
+  }
+
+  if (packageReport) {
+    for (const line of packageReport.lines) console.log(line);
+  }
+
+  if (notes.length > 0) {
+    console.log('');
+    for (const note of notes) log.info(note);
   }
 
   console.log('');
@@ -373,5 +605,5 @@ export async function doctor(options: DoctorOptions): Promise<DoctorReport> {
   } else {
     log.warn('Some checks failed. See suggestions above.');
   }
-  return report;
+  return allPassed;
 }

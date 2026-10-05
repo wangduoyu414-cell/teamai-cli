@@ -2,10 +2,12 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { log } from './utils/logger.js';
+import { RELAY_TO_USER_PREFIX, relayWhenHidden } from './utils/hook-output.js';
 import { readJson, writeJson, ensureDir } from './utils/fs.js';
-import { readEvents, aggregateSessionMetrics } from './dashboard-collector.js';
+import { readEvents, aggregateSessionMetrics, scanTranscriptStop, hookScopeDir } from './dashboard-collector.js';
 import { readRecallQuality } from './recall-quality.js';
 import { deriveSessionId } from './utils/session-id.js';
+import { resolveHookCwd } from './utils/hook-cwd.js';
 import { redactWithEnv } from './utils/redact.js';
 import type { ContributeState, DashboardEvent, SessionFriction } from './types.js';
 import {
@@ -23,6 +25,7 @@ import {
   CONTRIBUTE_SKILL_BONUS,
   CONTRIBUTE_DIVERSITY_BONUS_MAX,
 } from './types.js';
+import { getUserHome } from './utils/home.js';
 
 // ─── Contribute check data flow (Stop hook) ────────────────
 //
@@ -61,7 +64,7 @@ import {
  *
  * sessionId may originate from:
  *   1. hookData.session_id (typically a hex UUID — already safe)
- *   2. process.env.CLAUDE_SESSION_ID
+ *   2. the agent's session variable (e.g. CLAUDE_CODE_SESSION_ID)
  *   3. PID fallback `pid-{pid}-{cwd}` — embeds cwd which contains "/"
  *
  * The PID fallback is the dangerous case: a literal "/" in the filename
@@ -103,7 +106,7 @@ function normalizePromptSummary(raw?: string): string | undefined {
   if (typeof raw !== 'string') return undefined;
   const normalized = redactWithEnv(raw)
     .replace(/[\r\n\t]+/g, ' ')
-    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/g, '')
+    .replace(/\p{Cc}/gu, '')
     .replace(/\s+/g, ' ')
     .trim();
   if (!normalized) return undefined;
@@ -117,7 +120,7 @@ function normalizePromptSummary(raw?: string): string | undefined {
 /** Get session state file path: ~/.teamai/sessions/{sanitized-sessionId}.json */
 function getSessionPath(sessionId: string): string {
   return path.join(
-    process.env.HOME ?? '',
+    getUserHome(),
     '.teamai',
     'sessions',
     `${sanitizeSessionId(sessionId)}.json`,
@@ -150,6 +153,7 @@ export async function readContributeState(sessionId: string): Promise<Contribute
         promptSummary: typeof raw.promptSummary === 'string'
           ? normalizePromptSummary(raw.promptSummary)
           : undefined,
+        pendingHint: typeof raw.pendingHint === 'string' ? raw.pendingHint : undefined,
       };
     }
     return defaultState();
@@ -334,7 +338,12 @@ export function applyPhase2Adjustments(
 }
 
 /** Read STDIN and extract sessionId from hook JSON. */
-async function readStdinAndDeriveSession(): Promise<{ sessionId: string; cwd?: string } | null> {
+async function readStdinAndDeriveSession(): Promise<{
+  sessionId: string;
+  cwd?: string;
+  transcriptPath?: string;
+  hookData: Record<string, unknown>;
+} | null> {
   if (process.stdin.isTTY) return null;
 
   const chunks: Buffer[] = [];
@@ -348,8 +357,11 @@ async function readStdinAndDeriveSession(): Promise<{ sessionId: string; cwd?: s
     const hookData = JSON.parse(raw) as Record<string, unknown>;
     // Derive session ID: session_id field > env > PID+cwd fallback
     const sessionId = deriveSessionId(hookData, { includeCwd: true });
-    const cwd = typeof hookData.cwd === 'string' ? hookData.cwd : undefined;
-    return { sessionId, cwd };
+    const cwd = resolveHookCwd(hookData);
+    const transcriptPath = typeof hookData.transcript_path === 'string'
+      ? hookData.transcript_path
+      : undefined;
+    return { sessionId, cwd, transcriptPath, hookData };
   } catch {
     return null;
   }
@@ -368,21 +380,36 @@ function countUniqueTools(events: DashboardEvent[]): number {
 /**
  * Extract friction signals for a session from its events.
  *
- * - interrupt / toolReject / toolError: from the latest Stop event's interventions
- *   snapshot (idempotent full total; toolError absent on pre-existing events → 0).
+ * - interrupt / toolReject / toolError: prefer the freshly-scanned transcript
+ *   results (`transcriptFriction`) when provided. These three signals normally
+ *   live on the latest Stop event's interventions snapshot, but that Stop event
+ *   is written asynchronously by a detached background process and may not be
+ *   flushed to events.jsonl yet when this check runs — so a live transcript scan
+ *   eliminates the cross-process race. When `transcriptFriction` is absent
+ *   (backward compatibility / no transcript path), fall back to the latest Stop
+ *   event's interventions snapshot (idempotent full total; toolError absent on
+ *   pre-existing events → 0).
  * - correction: derived by aggregateSessionMetrics from the stop→prompt_submit
  *   pattern (not present on any single event), so we reuse it rather than re-scan.
  */
-function extractFriction(events: DashboardEvent[], sessionId: string): SessionFriction {
+function extractFriction(
+  events: DashboardEvent[],
+  sessionId: string,
+  transcriptFriction?: { interrupt: number; toolReject: number; toolError: number },
+): SessionFriction {
   let interrupt = 0;
   let toolReject = 0;
   let toolError = 0;
-  for (const e of events) {
-    if (e.type === 'stop' && e.interventions) {
-      // Latest Stop wins (snapshots are cumulative & idempotent).
-      interrupt = e.interventions.interrupt;
-      toolReject = e.interventions.toolReject;
-      toolError = e.interventions.toolError ?? 0;
+  if (transcriptFriction) {
+    ({ interrupt, toolReject, toolError } = transcriptFriction);
+  } else {
+    for (const e of events) {
+      if (e.type === 'stop' && e.interventions) {
+        // Latest Stop wins (snapshots are cumulative & idempotent).
+        interrupt = e.interventions.interrupt;
+        toolReject = e.interventions.toolReject;
+        toolError = e.interventions.toolError ?? 0;
+      }
     }
   }
   const correction = aggregateSessionMetrics(events).get(sessionId)?.correction ?? 0;
@@ -445,10 +472,9 @@ function buildHint({ friction, promptSummary, isKnowledgeGap }: HintContext): st
   }
   const task = promptSummary ? `\n\nTask: ${promptSummary}` : '';
   const action = isKnowledgeGap
-    ? 'Consider running /teamai-share-learnings to summarize what you learned, share it with your team, and fill the knowledge gap.'
-    : 'Consider running /teamai-share-learnings to summarize what you learned and share it with your team.';
-  const body = `${headline}${task}\n\n${action}`;
-  return `Print the following message verbatim to the user (do NOT paraphrase, summarize, or explain its origin):\n\n${body}`;
+    ? 'Consider running `/teamai share what this session taught me` to summarize what you learned, share it with your team, and fill the knowledge gap (or run `teamai skill get share`).'
+    : 'Consider running `/teamai share what this session taught me` to summarize what you learned and share it with your team (or run `teamai skill get share`).';
+  return `${headline}${task}\n\n${action}`;
 }
 
 /**
@@ -483,6 +509,8 @@ function buildHint({ friction, promptSummary, isKnowledgeGap }: HintContext): st
 export async function contributeCheckForSession(
   sessionId: string,
   cwd?: string,
+  transcriptPath?: string,
+  stashInsteadOfReturn = false,
 ): Promise<{ hint: string | null }> {
   const state = await readContributeState(sessionId);
   const now = Date.now();
@@ -538,7 +566,16 @@ export async function contributeCheckForSession(
   } else {
     const allEvents = await readEvents();
     const sessionEvents = allEvents.filter((e) => e.sessionId === sessionId);
-    friction = extractFriction(sessionEvents, sessionId);
+    if (transcriptPath) {
+      const scan = await scanTranscriptStop(transcriptPath, { frictionOnly: true });
+      friction = extractFriction(sessionEvents, sessionId, {
+        interrupt: scan.interrupt,
+        toolReject: scan.toolReject,
+        toolError: scan.toolError,
+      });
+    } else {
+      friction = extractFriction(sessionEvents, sessionId);
+    }
     promptSummary = extractPromptSummary(sessionEvents);
     score = computeSmartScore(sessionEvents, friction);
     toolCount = countToolUseEvents(sessionEvents);
@@ -569,6 +606,10 @@ export async function contributeCheckForSession(
   // almost no work (e.g. a single rejected command). Requires real activity.
   const willHint = score >= CONTRIBUTE_SMART_THRESHOLD && toolCount >= CONTRIBUTE_BASE_THRESHOLD;
 
+  // Build the hint text once; it is either returned (Stop stdout) or stashed for
+  // UserPromptSubmit delivery, never both.
+  const hintText = willHint ? buildHint({ friction, promptSummary, isKnowledgeGap }) : null;
+
   // Single write: re-read first to avoid clobbering parallel /contribute marks.
   // Skip the write on cache hit + low score (state is already current).
   if (needsPersist || willHint) {
@@ -588,6 +629,14 @@ export async function contributeCheckForSession(
     if (latest.hinted || willHint) {
       updated.hinted = true;
     }
+    // For tools whose Stop hook ignores stdout, stash the hint in this same
+    // write for delivery on the next UserPromptSubmit — no second write.
+    if (willHint && stashInsteadOfReturn) {
+      // The stash is delivered as UserPromptSubmit context, which the host does
+      // not display, so this copy asks the model to relay it. The Stop copy
+      // returned below does not: Claude Code prints that one itself (#719).
+      updated.pendingHint = hintText ? RELAY_TO_USER_PREFIX + hintText : undefined;
+    }
     await writeContributeState(sessionId, updated);
   }
 
@@ -596,7 +645,25 @@ export async function contributeCheckForSession(
     return { hint: null };
   }
 
-  return { hint: buildHint({ friction, promptSummary, isKnowledgeGap }) };
+  // stashInsteadOfReturn callers receive null here (the hint was persisted as
+  // pendingHint above); everyone else gets the hint to write to Stop stdout.
+  return { hint: stashInsteadOfReturn ? null : hintText };
+}
+
+/**
+ * Read and clear a pending share-learnings hint for this session, if any.
+ * Returns the hint text (to inject via UserPromptSubmit additionalContext) or
+ * null. Clearing preserves all other state (including `hinted`), so the
+ * one-hint-per-session guarantee holds. If the user already contributed between
+ * the stash and now, the stale nudge is cleared and dropped (returns null).
+ */
+export async function takePendingHint(sessionId: string): Promise<string | null> {
+  const state = await readContributeState(sessionId);
+  if (!state.pendingHint) return null;
+  const hint = state.pendingHint;
+  // Clear regardless; if the user already contributed, drop the stale nudge.
+  await writeContributeState(sessionId, { ...state, pendingHint: undefined });
+  return state.contributed ? null : hint;
 }
 
 /**
@@ -621,11 +688,33 @@ export async function contributeCheck(toolArg?: string): Promise<void> {
     log.debug('contribute-check: no STDIN data or no session ID');
     return;
   }
+  // Hooks of older installs still call this command in every project; a
+  // directory without teamai has no team to share with (#748). The session's
+  // cwd, never the one this process started in; a removed worktree's session
+  // keeps its recorded scope (#810).
+  const scopeDir = await hookScopeDir(stdinData.hookData, toolArg ?? 'claude');
+  const { resolveConfigForDir } = await import('./config.js');
+  if (!(await resolveConfigForDir(scopeDir))) {
+    log.debug('contribute-check: teamai is not set up here, skipping');
+    return;
+  }
 
-  const { hint } = await contributeCheckForSession(stdinData.sessionId, stdinData.cwd);
+  // The same gate as the dispatcher's handler: hooks written before it still
+  // call this command, and must not nudge towards a `share` that refuses.
+  const { contributeHintAllowed } = await import('./skill-content.js');
+  if (!(await contributeHintAllowed(scopeDir))) return;
+
+  const { stopStdoutUnsupported } = await import('./utils/tool-names.js');
+  const tool = toolArg?.toLowerCase() ?? 'claude';
+  const { hint } = await contributeCheckForSession(
+    stdinData.sessionId,
+    stdinData.cwd,
+    stdinData.transcriptPath,
+    stopStdoutUnsupported(tool),
+  );
   if (hint !== null) {
     const { formatStopHookOutput } = await import('./utils/hook-output.js');
-    process.stdout.write(formatStopHookOutput(hint, toolArg ?? 'claude'));
+    process.stdout.write(formatStopHookOutput(relayWhenHidden(hint, tool), tool));
   }
 }
 

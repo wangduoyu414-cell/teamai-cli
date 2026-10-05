@@ -5,13 +5,22 @@ import fse from 'fs-extra';
 import YAML from 'yaml';
 
 // Mock external dependencies before importing modules
-vi.mock('../config.js', () => ({
+vi.mock('../config.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../config.js')>()),
   requireInit: vi.fn(),
   detectProjectConfig: vi.fn().mockResolvedValue(null),
 }));
 
 vi.mock('../utils/git.js', () => ({
   pullRepo: vi.fn().mockResolvedValue('Already up to date.'),
+  isDedicatedRepoRoot: vi.fn().mockResolvedValue(true),
+}));
+
+const reportsMocks = vi.hoisted(() => ({
+  readableReportsWorktree: vi.fn(),
+}));
+vi.mock('../utils/reports-branch.js', () => ({
+  readableReportsWorktree: (...args: unknown[]) => reportsMocks.readableReportsWorktree(...args),
 }));
 
 vi.mock('../utils/logger.js', () => ({
@@ -32,7 +41,7 @@ vi.mock('../utils/logger.js', () => ({
   })),
 }));
 
-import { getMemberConfig, listMembers } from '../members.js';
+import { getMemberConfig, listMembers, memberReadRoots, mergeMemberConfig, readMemberConfig } from '../members.js';
 import { requireInit } from '../config.js';
 import { log } from '../utils/logger.js';
 
@@ -136,11 +145,22 @@ describe('getMemberConfig', () => {
 
 describe('listMembers', () => {
   let tmpDir: string;
+  let cloneDir: string;
+  let reportsDir: string;
   let consoleSpy: ReturnType<typeof vi.spyOn>;
+
+  async function writeReportsMember(filename: string, data: string | Record<string, unknown>): Promise<void> {
+    const body = typeof data === 'string' ? data : YAML.stringify(data);
+    await fse.writeFile(path.join(reportsDir, 'members', filename), body);
+  }
 
   beforeEach(async () => {
     tmpDir = await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-test-'));
-    await fse.ensureDir(path.join(tmpDir, 'members'));
+    cloneDir = path.join(tmpDir, 'team-repo');
+    reportsDir = path.join(tmpDir, 'reports-wt');
+    await fse.ensureDir(path.join(cloneDir, 'members'));
+    await fse.ensureDir(path.join(reportsDir, 'members'));
+    reportsMocks.readableReportsWorktree.mockReset().mockResolvedValue(reportsDir);
     consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
     vi.mocked(log.info).mockClear();
     vi.mocked(log.warn).mockClear();
@@ -151,34 +171,66 @@ describe('listMembers', () => {
     await fse.remove(tmpDir);
   });
 
-  it('should show "No team members registered" when members dir is empty', async () => {
-    mockRequireInit(tmpDir);
+  it('should show "No team members registered" when no root has member files', async () => {
+    mockRequireInit(cloneDir);
 
     await listMembers({});
 
     expect(log.info).toHaveBeenCalledWith('No team members registered');
     expect(consoleSpy).not.toHaveBeenCalled();
+    // Listing is read-only: it reads through the helper that never publishes the reports branch.
+    expect(reportsMocks.readableReportsWorktree).toHaveBeenCalledOnce();
+  });
+
+  it('stops with exit 1 on a reports checkout teamai refused, whose warning was printed (#808)', async () => {
+    mockRequireInit(cloneDir);
+    const { CheckoutRefusedError } = await import('../utils/branch-worktree.js');
+    reportsMocks.readableReportsWorktree.mockRejectedValueOnce(
+      new CheckoutRefusedError('an old checkout has uncommitted changes', 'an old checkout is in the way'),
+    );
+    try {
+      await expect(listMembers({})).resolves.toBeUndefined();
+      expect(process.exitCode).toBe(1);
+    } finally {
+      process.exitCode = undefined;
+    }
+    expect(consoleSpy).not.toHaveBeenCalled();
+  });
+
+  it('lists members registered before the reports switch from the default-branch clone', async () => {
+    mockRequireInit(cloneDir);
+    await fse.writeFile(
+      path.join(cloneDir, 'members', 'stale.yaml'),
+      YAML.stringify({
+        username: 'stale',
+        displayName: 'Leftover on clone',
+        registeredAt: '2025-01-01T00:00:00.000Z',
+      }),
+    );
+
+    await listMembers({});
+
+    const allOutput = consoleSpy.mock.calls.map((c) => c[0]).join('\n');
+    expect(allOutput).toContain('stale');
+    expect(allOutput).toContain('Leftover on clone');
+    expect(allOutput).toContain('Team members (1)');
+    // Listing is read-only: it reads through the helper that never publishes the reports branch.
+    expect(reportsMocks.readableReportsWorktree).toHaveBeenCalledOnce();
   });
 
   it('should display members without role tags', async () => {
-    await fse.writeFile(
-      path.join(tmpDir, 'members', 'alice.yaml'),
-      YAML.stringify({
-        username: 'alice',
-        displayName: 'Alice Chen',
-        registeredAt: '2025-01-01T00:00:00.000Z',
-      }),
-    );
-    await fse.writeFile(
-      path.join(tmpDir, 'members', 'bob.yaml'),
-      YAML.stringify({
-        username: 'bob',
-        displayName: 'Bob Li',
-        registeredAt: '2025-01-01T00:00:00.000Z',
-      }),
-    );
+    await writeReportsMember('alice.yaml', {
+      username: 'alice',
+      displayName: 'Alice Chen',
+      registeredAt: '2025-01-01T00:00:00.000Z',
+    });
+    await writeReportsMember('bob.yaml', {
+      username: 'bob',
+      displayName: 'Bob Li',
+      registeredAt: '2025-01-01T00:00:00.000Z',
+    });
 
-    mockRequireInit(tmpDir, 'alice');
+    mockRequireInit(cloneDir, 'alice');
 
     await listMembers({});
 
@@ -192,24 +244,18 @@ describe('listMembers', () => {
   });
 
   it('should mark only the current user with (you)', async () => {
-    await fse.writeFile(
-      path.join(tmpDir, 'members', 'alice.yaml'),
-      YAML.stringify({
-        username: 'alice',
-        displayName: 'Alice',
-        registeredAt: '2025-01-01T00:00:00.000Z',
-      }),
-    );
-    await fse.writeFile(
-      path.join(tmpDir, 'members', 'bob.yaml'),
-      YAML.stringify({
-        username: 'bob',
-        displayName: 'Bob',
-        registeredAt: '2025-01-01T00:00:00.000Z',
-      }),
-    );
+    await writeReportsMember('alice.yaml', {
+      username: 'alice',
+      displayName: 'Alice',
+      registeredAt: '2025-01-01T00:00:00.000Z',
+    });
+    await writeReportsMember('bob.yaml', {
+      username: 'bob',
+      displayName: 'Bob',
+      registeredAt: '2025-01-01T00:00:00.000Z',
+    });
 
-    mockRequireInit(tmpDir, 'bob');
+    mockRequireInit(cloneDir, 'bob');
 
     await listMembers({});
 
@@ -221,15 +267,12 @@ describe('listMembers', () => {
   });
 
   it('should omit display name separator when displayName is empty', async () => {
-    await fse.writeFile(
-      path.join(tmpDir, 'members', 'nodisplay.yaml'),
-      YAML.stringify({
-        username: 'nodisplay',
-        registeredAt: '2025-01-01T00:00:00.000Z',
-      }),
-    );
+    await writeReportsMember('nodisplay.yaml', {
+      username: 'nodisplay',
+      registeredAt: '2025-01-01T00:00:00.000Z',
+    });
 
-    mockRequireInit(tmpDir, 'other');
+    mockRequireInit(cloneDir, 'other');
 
     await listMembers({});
 
@@ -239,16 +282,13 @@ describe('listMembers', () => {
   });
 
   it('should show registeredAt in verbose mode', async () => {
-    await fse.writeFile(
-      path.join(tmpDir, 'members', 'alice.yaml'),
-      YAML.stringify({
-        username: 'alice',
-        displayName: 'Alice',
-        registeredAt: '2025-06-15T10:30:00.000Z',
-      }),
-    );
+    await writeReportsMember('alice.yaml', {
+      username: 'alice',
+      displayName: 'Alice',
+      registeredAt: '2025-06-15T10:30:00.000Z',
+    });
 
-    mockRequireInit(tmpDir, 'alice');
+    mockRequireInit(cloneDir, 'alice');
 
     await listMembers({ verbose: true });
 
@@ -257,16 +297,13 @@ describe('listMembers', () => {
   });
 
   it('should not show registeredAt in non-verbose mode', async () => {
-    await fse.writeFile(
-      path.join(tmpDir, 'members', 'alice.yaml'),
-      YAML.stringify({
-        username: 'alice',
-        displayName: 'Alice',
-        registeredAt: '2025-06-15T10:30:00.000Z',
-      }),
-    );
+    await writeReportsMember('alice.yaml', {
+      username: 'alice',
+      displayName: 'Alice',
+      registeredAt: '2025-06-15T10:30:00.000Z',
+    });
 
-    mockRequireInit(tmpDir, 'alice');
+    mockRequireInit(cloneDir, 'alice');
 
     await listMembers({});
 
@@ -275,12 +312,9 @@ describe('listMembers', () => {
   });
 
   it('should warn on invalid member YAML files', async () => {
-    await fse.writeFile(
-      path.join(tmpDir, 'members', 'broken.yaml'),
-      '{{broken yaml [[[',
-    );
+    await writeReportsMember('broken.yaml', '{{broken yaml [[[');
 
-    mockRequireInit(tmpDir, 'other');
+    mockRequireInit(cloneDir, 'other');
 
     await listMembers({});
 
@@ -288,22 +322,171 @@ describe('listMembers', () => {
   });
 
   it('should handle legacy YAML with extra role field gracefully', async () => {
-    await fse.writeFile(
-      path.join(tmpDir, 'members', 'legacy.yaml'),
-      YAML.stringify({
-        username: 'legacy',
-        displayName: 'Legacy User',
-        registeredAt: '2025-01-01T00:00:00.000Z',
-        role: 'readonly',
-      }),
-    );
+    await writeReportsMember('legacy.yaml', {
+      username: 'legacy',
+      displayName: 'Legacy User',
+      registeredAt: '2025-01-01T00:00:00.000Z',
+      role: 'readonly',
+    });
 
-    mockRequireInit(tmpDir, 'other');
+    mockRequireInit(cloneDir, 'other');
 
     await listMembers({});
 
     const allOutput = consoleSpy.mock.calls.map((c) => c[0]).join('\n');
     expect(allOutput).not.toContain('[readonly]');
     expect(allOutput).toContain('legacy');
+  });
+
+  it('lists the union of reports-branch and default-branch members', async () => {
+    await writeReportsMember('alice.yaml', {
+      username: 'alice',
+      displayName: 'Alice Chen',
+      registeredAt: '2025-01-01T00:00:00.000Z',
+    });
+    await fse.writeFile(
+      path.join(cloneDir, 'members', 'stale.yaml'),
+      YAML.stringify({
+        username: 'stale',
+        displayName: 'Leftover on clone',
+        registeredAt: '2025-01-01T00:00:00.000Z',
+      }),
+    );
+
+    mockRequireInit(cloneDir, 'alice');
+
+    await listMembers({});
+
+    const allOutput = consoleSpy.mock.calls.map((c) => c[0]).join('\n');
+    expect(allOutput).toContain('alice');
+    expect(allOutput).toContain('stale');
+    expect(allOutput).toContain('Team members (2)');
+  });
+
+  it('prefers the reports-branch copy when both roots have the same member file', async () => {
+    await writeReportsMember('alice.yaml', {
+      username: 'alice',
+      displayName: 'Alice (branch)',
+      registeredAt: '2025-06-01T00:00:00.000Z',
+    });
+    await fse.writeFile(
+      path.join(cloneDir, 'members', 'alice.yaml'),
+      YAML.stringify({
+        username: 'alice',
+        displayName: 'Alice (pre-switch clone)',
+        registeredAt: '2025-01-01T00:00:00.000Z',
+      }),
+    );
+
+    mockRequireInit(cloneDir, 'alice');
+
+    await listMembers({ verbose: true });
+
+    const allOutput = consoleSpy.mock.calls.map((c) => c[0]).join('\n');
+    expect(allOutput).toContain('Alice (branch)');
+    expect(allOutput).not.toContain('Alice (pre-switch clone)');
+    expect(allOutput).toContain('Team members (1)');
+    expect(allOutput).toContain('registered: 2025-06-01T00:00:00.000Z');
+  });
+});
+
+describe('memberReadRoots', () => {
+  it('adds the default-branch clone as an inherited root behind the primary', () => {
+    const localConfig = {
+      repo: { localPath: '/data/team-repo', remote: 'https://git.example.com/team/repo.git' },
+      username: 'alice',
+    } as never;
+    expect(memberReadRoots('/data/reports-wt', localConfig)).toEqual(['/data/reports-wt', '/data/team-repo']);
+  });
+
+  it('returns a single root when the primary is the clone itself (HTTP path)', () => {
+    const localConfig = {
+      repo: { localPath: '/data/team-repo', remote: 'https://git.example.com/team/repo.git', kind: 'http' },
+      username: 'alice',
+    } as never;
+    expect(memberReadRoots('/data/team-repo', localConfig)).toEqual(['/data/team-repo']);
+  });
+});
+
+describe('readMemberConfig', () => {
+  let tmpDir: string;
+  let primaryRoot: string;
+  let inheritedRoot: string;
+
+  beforeEach(async () => {
+    tmpDir = await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-test-'));
+    primaryRoot = path.join(tmpDir, 'reports-wt');
+    inheritedRoot = path.join(tmpDir, 'team-repo');
+    await fse.ensureDir(path.join(primaryRoot, 'members'));
+    await fse.ensureDir(path.join(inheritedRoot, 'members'));
+  });
+
+  afterEach(async () => {
+    await fse.remove(tmpDir);
+  });
+
+  it('falls back to the inherited root when the primary has no copy', async () => {
+    await fse.writeFile(
+      path.join(inheritedRoot, 'members', 'bob.yaml'),
+      YAML.stringify({ username: 'bob', registeredAt: '2025-01-01T00:00:00.000Z' }),
+    );
+
+    const result = await readMemberConfig([primaryRoot, inheritedRoot], 'bob');
+    expect(result?.username).toBe('bob');
+  });
+
+  it('prefers the primary root copy on conflict', async () => {
+    await fse.writeFile(
+      path.join(primaryRoot, 'members', 'bob.yaml'),
+      YAML.stringify({ username: 'bob', registeredAt: '2025-06-01T00:00:00.000Z' }),
+    );
+    await fse.writeFile(
+      path.join(inheritedRoot, 'members', 'bob.yaml'),
+      YAML.stringify({ username: 'bob', registeredAt: '2025-01-01T00:00:00.000Z' }),
+    );
+
+    const result = await readMemberConfig([primaryRoot, inheritedRoot], 'bob');
+    expect(result?.registeredAt).toBe('2025-06-01T00:00:00.000Z');
+  });
+
+  it('returns null when no root has the member', async () => {
+    expect(await readMemberConfig([primaryRoot, inheritedRoot], 'nobody')).toBeNull();
+  });
+});
+
+describe('mergeMemberConfig', () => {
+  it('registers a brand-new member with projects', () => {
+    const { config, changed } = mergeMemberConfig(null, { username: 'alice', projects: ['hai'] });
+    expect(changed).toBe(true);
+    expect(config.username).toBe('alice');
+    expect(config.displayName).toBe('alice');
+    expect(config.projects).toEqual(['hai']);
+    expect(config.registeredAt).toBeTruthy();
+  });
+
+  it('appends + dedupes projects onto an existing member (union roster)', () => {
+    const existing = { username: 'alice', displayName: 'Alice', registeredAt: '2026-01-01T00:00:00Z', projects: ['hai'] };
+    const { config, changed } = mergeMemberConfig(existing, { username: 'alice', projects: ['billing', 'hai'] });
+    expect(changed).toBe(true);
+    expect(config.projects).toEqual(['hai', 'billing']); // append order preserved, hai deduped
+    expect(config.registeredAt).toBe('2026-01-01T00:00:00Z'); // preserved
+    expect(config.displayName).toBe('Alice'); // preserved
+  });
+
+  it('reports no change when the project is already on the roster', () => {
+    const existing = { username: 'alice', displayName: '', registeredAt: '2026-01-01T00:00:00Z', projects: ['hai'] };
+    const { changed } = mergeMemberConfig(existing, { username: 'alice', projects: ['hai'] });
+    expect(changed).toBe(false);
+  });
+
+  it('overwrites role when supplied, preserves it otherwise', () => {
+    const existing = { username: 'alice', displayName: '', registeredAt: '2026-01-01T00:00:00Z', role: 'dev', projects: ['hai'] };
+    expect(mergeMemberConfig(existing, { username: 'alice', role: 'pm' }).config.role).toBe('pm');
+    expect(mergeMemberConfig(existing, { username: 'alice' }).config.role).toBe('dev');
+  });
+
+  it('omits projects key entirely when there are none', () => {
+    const { config } = mergeMemberConfig(null, { username: 'bob' });
+    expect(config.projects).toBeUndefined();
   });
 });

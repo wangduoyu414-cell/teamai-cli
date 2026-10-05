@@ -1,7 +1,15 @@
+import { getTeamaiHome } from './types.js';
+import { managedManifestTargetPaths, loadManagedResourceManifest, uninstallManagedResources } from './managed-resources.js';
+import { EXPLICIT_ONLY_HOSTS, normalizeHostId, usesManagedPolicy } from './host-adapters.js';
 import path from 'node:path';
 import { autoDetectInit, saveLocalConfig, saveLocalConfigForScope } from './config.js';
 import { reconcileHooks, hasTeamaiHooks } from './hooks.js';
-import { removeOpenClawHooks, OPENCLAW_HOOK_DIR, resolveOpenClawHooksDir } from './openclaw-hooks.js';
+import {
+  removeOpenClawHooks,
+  OPENCLAW_HOOK_DIR,
+  resolveOpenClawHooksDir,
+  resolveOpenclawWorkspaceDir,
+} from './openclaw-hooks.js';
 import {
   TEAMAI_RULES_START,
   TEAMAI_RULES_END,
@@ -11,12 +19,15 @@ import {
   TEAMAI_CLAUDEMD_END,
   TEAMAI_RECALL_RULES_START,
   TEAMAI_RECALL_RULES_END,
-  TEAMAI_ENV_START,
-  TEAMAI_ENV_END,
-  getTeamaiHome,
+  getDataHome,
   getManagedHooksPath,
+  isAgentExcluded,
   managedMcpManifestPath,
   resolveBaseDir,
+  resolveHookScope,
+  resolveLegacyProjectHookScope,
+  resolveToolBaseDir,
+  scopedToolPaths,
   type GlobalOptions,
   type TeamaiConfig,
   type LocalConfig,
@@ -24,8 +35,23 @@ import {
   type ManagedMcpManifest,
 } from './types.js';
 import { BUILTIN_RULE_NAMES } from './builtin-rules.js';
+import { ruleStemFromFilename } from './resources/rule-format.js';
+import { agentStemFromFilename } from './resources/agent-format.js';
+import { resolveDocsDestination } from './resources/docs.js';
+import { listTeamAgentDirs } from './resources/agents.js';
+import { isToolInstalledForConfig } from './resources/base.js';
 import { BUILTIN_AGENT_NAMES } from './builtin-agents.js';
-import { BUILTIN_SKILL_NAMES } from './builtin-skills.js';
+import {
+  BUILTIN_SKILL_NAMES,
+  LEGACY_BUILTIN_SKILL_NAMES,
+  ownedSkillFiles,
+  isCliOwnedSkillName,
+  prunedWhole,
+  removeOwnedFiles,
+  skillsGuardBase,
+} from './builtin-skills.js';
+import { getHermesHome } from './hermes-home.js';
+import { CODEX_TOOL, SHARED_AGENT_SKILLS_PATH } from './resources/skills.js';
 import {
   pathExists,
   readFileSafe,
@@ -33,13 +59,19 @@ import {
   writeFile,
   remove,
   listDirs,
+  listFiles,
   listFilesRecursive,
   expandHome,
 } from './utils/fs.js';
+import { listQueuesIn } from './utils/pending-learnings.js';
 import { log } from './utils/logger.js';
 import { askConfirmation } from './utils/prompt.js';
-import { managedManifestTargetPaths, uninstallManagedResources } from './managed-resources.js';
-import { EXPLICIT_ONLY_HOSTS, homeDir, normalizeHostId, resolveHostResourcePath, supportsStaticResource } from './host-adapters.js';
+import { getUserHome } from './utils/home.js';
+import {
+  detectShellProfile,
+  findEnvBlockFor,
+  SHELL_PROFILE_CANDIDATE_NAMES,
+} from './utils/shell-profile.js';
 
 // ─── Types ─────────────────────────────────────────────
 
@@ -49,30 +81,47 @@ interface UninstallOptions extends GlobalOptions {
 }
 
 interface RemovalPlan {
-  /** Tool settings files that contain teamai hooks. */
-  hookFiles: Array<{ path: string; tool: string }>;
+  /** Tool settings files that contain teamai hooks (each with the manifest that
+   *  recorded its team hooks — HOME/user or a legacy <projectRoot>/project one). */
+  hookFiles: Array<{ path: string; tool: string; manifestPath: string }>;
   /** OpenClaw-style hook dirs (<base>/.<tool>/hooks) holding teamai HOOK.md+handler.ts. */
   openclawHookDirs: Array<{ hooksDir: string; tool: string }>;
+  /** OpenCode teamai plugin files (.opencode/plugin/teamai-*.ts) to delete. */
+  opencodeHookScopes: Array<{ baseDir: string; scope: Scope }>;
+  /** teamai-managed OMP extension file (~/.omp/agent/extensions/teamai-hooks.ts), if present. */
+  ompHookFile: string | null;
+  /** Pi extension files owned by this scope (global for user, legacy project copy for project). */
+  piHookFiles: string[];
+  /** TeamAI-managed DeepSeek Harness patch (~/.teamai/dsh/cordis.patch.yml), if present. */
+  dshHookFile: string | null;
+  /** Manifest used by the primary hook injection scope. */
+  hookManifestPath: string;
   /** CLAUDE.md files with teamai rules blocks. */
   claudeMdFiles: string[];
-  /** Skill directories synced from team repo. */
-  skillDirs: string[];
+  /**
+   * Skill directories synced from team repo, each with the base directory its
+   * skills root hangs off: the prune refuses a link anywhere below that base.
+   */
+  skillDirs: SkillDirEntry[];
   /** Rule .md files synced from team repo (plus CLI built-in rules). */
   ruleFiles: string[];
   /** Built-in agent .md files deployed by the CLI (e.g. teamai-recall). */
   agentFiles: string[];
   /** teamai-managed MCP servers from managed-mcp.json (`tool/server` or `tool:project/server`). */
   mcpServers: string[];
-  /** Shell profile path containing env block (null if none). */
-  shellProfile: string | null;
+  /** Shell profile paths carrying a teamai env block (usually one, but see #682/#693). */
+  shellProfiles: string[];
   /** Docs directory (null if doesn't exist). */
   docsDir: string | null;
   /** The .teamai home directory path. */
   teamaiHome: string;
   /** Whether teamaiHome exists on disk. */
   teamaiHomeExists: boolean;
-  /** Managed-hooks manifest path (for team-hook cleanup). */
-  managedHooksPath: string;
+  /**
+   * Queues of learnings not published yet that deleting teamaiHome takes with
+   * it, each with how many it holds; empty when teamaiHome stays.
+   */
+  unpublishedQueues: Array<{ dir: string; count: number }>;
   /** Whether shared resources (docs / ~/.teamai / shell profile) are part of this removal. */
   includeShared: boolean;
   /** Whether this removal targets Hermes (clears its SOUL.md block + config.yaml hook). */
@@ -82,11 +131,21 @@ interface RemovalPlan {
 }
 
 /** Per-tool findings collected during discovery (tool-specific resources only). */
+/** A skill directory to remove, and the base the link guard starts from. */
+interface SkillDirEntry {
+  dir: string;
+  baseDir: string;
+}
+
 interface ToolResources {
-  hookFiles: Array<{ path: string; tool: string }>;
+  hookFiles: Array<{ path: string; tool: string; manifestPath: string }>;
   openclawHookDirs: Array<{ hooksDir: string; tool: string }>;
+  opencodeHookScopes: Array<{ baseDir: string; scope: Scope }>;
+  ompHookFile: string | null;
+  piHookFiles: string[];
+  dshHookFile: string | null;
   claudeMdFiles: string[];
-  skillDirs: string[];
+  skillDirs: SkillDirEntry[];
   ruleFiles: string[];
   agentFiles: string[];
 }
@@ -95,6 +154,10 @@ function hasToolResources(r: ToolResources): boolean {
   return (
     r.hookFiles.length > 0 ||
     r.openclawHookDirs.length > 0 ||
+    r.opencodeHookScopes.length > 0 ||
+    r.ompHookFile !== null ||
+    r.piHookFiles.length > 0 ||
+    r.dshHookFile !== null ||
     r.claudeMdFiles.length > 0 ||
     r.skillDirs.length > 0 ||
     r.ruleFiles.length > 0 ||
@@ -110,15 +173,6 @@ const CLAUDEMD_MARKER_PAIRS: Array<[string, string]> = [
   [TEAMAI_CLAUDEMD_START, TEAMAI_CLAUDEMD_END],
   [TEAMAI_RECALL_RULES_START, TEAMAI_RECALL_RULES_END],
 ];
-
-function detectShellProfile(): string | null {
-  const home = homeDir();
-  const shell = process.env.SHELL ?? '';
-  if (shell.includes('zsh')) {
-    return path.join(home, '.zshrc');
-  }
-  return path.join(home, '.bashrc');
-}
 
 /**
  * Collect team repo skill names, handling both flat and namespaced layouts.
@@ -164,6 +218,24 @@ async function collectTeamRuleNames(repoPath: string): Promise<Set<string>> {
   );
 }
 
+/**
+ * Collect custom agent names from canonical YAML and legacy Markdown files,
+ * at the root and one level of `agents/<namespace>/` (role-scoped agents
+ * deploy flattened, so their stems are removal candidates too).
+ */
+async function collectTeamAgentNames(repoPath: string): Promise<Set<string>> {
+  const teamAgentsDir = path.join(repoPath, 'agents');
+  if (!await pathExists(teamAgentsDir)) return new Set();
+
+  const names = new Set<string>();
+  for (const { dir } of await listTeamAgentDirs(teamAgentsDir)) {
+    for (const file of await listFiles(dir)) {
+      if (file.endsWith('.yaml') || file.endsWith('.md')) names.add(file.replace(/\.(yaml|md)$/, ''));
+    }
+  }
+  return names;
+}
+
 /** Detect hooks cleared to empty arrays — a residue of prior teamai installation. */
 function isEmptyHooksResidue(parsed: Record<string, unknown> | null): boolean {
   if (parsed == null || !('hooks' in parsed) || typeof parsed.hooks !== 'object' || parsed.hooks == null) return false;
@@ -171,53 +243,164 @@ function isEmptyHooksResidue(parsed: Record<string, unknown> | null): boolean {
   return entries.length > 0 && entries.every((v) => Array.isArray(v) && v.length === 0);
 }
 
+/**
+ * OpenCode plugin locations to sweep on uninstall.
+ *
+ * teamai writes a single plugin into the user dir (`~/.config/opencode/plugin`),
+ * so that one is always checked. A project-scope uninstall additionally checks
+ * `<projectRoot>/.opencode/plugin`, where an earlier layout wrote a second copy
+ * that OpenCode would load alongside the user one.
+ */
+function opencodePluginTargets(baseDir: string, scope: Scope): Array<{ baseDir: string; scope: Scope }> {
+  const home = getUserHome();
+  const targets: Array<{ baseDir: string; scope: Scope }> = [{ baseDir: home, scope: 'user' }];
+  if (scope === 'project' && path.resolve(baseDir) !== path.resolve(home)) {
+    targets.push({ baseDir, scope: 'project' });
+  }
+  return targets;
+}
+
 // ─── Discovery ─────────────────────────────────────────
 
 async function discoverToolResources(
   tool: string,
   toolPath: TeamaiConfig['toolPaths'][string],
-  localConfig: LocalConfig,
+  baseDir: string,
+  /** Home, or the project root: where the skills link guard starts (`skillsGuardBase`). */
+  scopeRoot: string,
   teamSkillNames: Set<string>,
   teamRuleNames: Set<string>,
-  managedHooksPath: string,
+  teamAgentNames: Set<string>,
+  hookTargets: Array<{ baseDir: string; manifestPath: string }>,
+  standaloneHookManifestPath: string,
+  scope: Scope,
+  /**
+   * The settings file's path at the scope hooks were injected into
+   * (`resolveHookScope`), which is not the config's scope for a non-self project
+   * scope. Only hook discovery uses it: a tool whose user-scope prefix differs
+   * from its project-scope one (Qoder CN: `~/.qoder-cn` vs `<root>/.qoder`) would
+   * otherwise be searched for in the other build's file, leaving its hooks in
+   * HOME forever.
+   */
+  hookSettingsPath?: string,
+  managedStaticHosts = false,
 ): Promise<ToolResources> {
   const res: ToolResources = {
-    hookFiles: [], openclawHookDirs: [], claudeMdFiles: [],
-    skillDirs: [], ruleFiles: [], agentFiles: [],
+    hookFiles: [], openclawHookDirs: [], opencodeHookScopes: [], ompHookFile: null, piHookFiles: [], dshHookFile: null,
+    claudeMdFiles: [], skillDirs: [], ruleFiles: [], agentFiles: [],
   };
-  const baseDir = resolveBaseDir(localConfig);
+  if (managedStaticHosts && EXPLICIT_ONLY_HOSTS.has(normalizeHostId(tool))) return res;
 
-  // Special hosts have product-owned roots and a deliberately narrow contract.
-  // Legacy name-based cleanup may inspect only their supported Skills path;
-  // settings, hooks, rules, agents, MCP, and instruction files stay untouched
-  // unless the ownership ledger has an exact record for them.
-  if (EXPLICIT_ONLY_HOSTS.has(normalizeHostId(tool))) {
-    if (toolPath.skills && supportsStaticResource(tool, 'skills', localConfig.scope)) {
-      const skillsDir = resolveHostResourcePath(tool, 'skills', localConfig);
-      if (skillsDir && await pathExists(skillsDir)) {
-        for (const dir of await listDirs(skillsDir)) {
-          if (teamSkillNames.has(dir)) res.skillDirs.push(path.join(skillsDir, dir));
+  // (a) Hooks — settings.json / hooks.json
+  if (toolPath.hooks) {
+    const hooksPath = path.join(baseDir, toolPath.hooks);
+    if (await pathExists(hooksPath)
+      && (await hasTeamaiHooks(hooksPath, tool, standaloneHookManifestPath)
+        || isEmptyHooksResidue(await readJson<Record<string, unknown>>(hooksPath)))) {
+      res.hookFiles.push({
+        path: hooksPath,
+        tool,
+        manifestPath: standaloneHookManifestPath,
+      });
+    }
+  } else if (tool === 'dsh') {
+    const { resolveDshPatchPath } = await import('./dsh-hooks.js');
+    const patchPath = resolveDshPatchPath();
+    if (await pathExists(patchPath)) res.dshHookFile = patchPath;
+  } else if (tool === 'opencode') {
+    // OpenCode has no settings file; its teamai hooks are plugin .ts files under
+    // <base>/.config/opencode/plugin (where teamai writes them) or
+    // <base>/.opencode/plugin (a project-scope copy from an earlier layout).
+    const { resolveOpencodePluginDir, OPENCODE_HOOK_FILE } = await import('./opencode-hooks.js');
+    for (const target of opencodePluginTargets(baseDir, scope)) {
+      const pluginDir = resolveOpencodePluginDir(target.baseDir, target.scope);
+      if (await pathExists(path.join(pluginDir, OPENCODE_HOOK_FILE))) {
+        res.opencodeHookScopes.push(target);
+      } else if (await pathExists(pluginDir)) {
+        // Agent-hook plugins (teamai-agent-*.ts) may exist without the main hook file.
+        const files = await listFilesRecursive(pluginDir);
+        if (files.some((f) => path.basename(f).startsWith('teamai-agent-'))) {
+          res.opencodeHookScopes.push(target);
         }
       }
     }
-    return res;
-  }
-
-  // (a) Hooks — settings.json / hooks.json
-  if (toolPath.settings) {
-    const settingsPath = path.join(baseDir, toolPath.settings);
-    if (await pathExists(settingsPath)
-      && (await hasTeamaiHooks(settingsPath, tool, managedHooksPath)
-        || isEmptyHooksResidue(await readJson<Record<string, unknown>>(settingsPath)))) {
-      res.hookFiles.push({ path: settingsPath, tool });
+  } else if (tool === 'omp') {
+    // OMP hooks are a single teamai-managed TS extension in the user agent dir
+    // (~/.omp/agent/extensions/teamai-hooks.ts) — the adapter never writes a
+    // project copy, so there is just the one place to look.
+    const { resolveOmpExtensionsDir, OMP_HOOK_FILE } = await import('./omp-hooks.js');
+    const extFile = path.join(resolveOmpExtensionsDir(), OMP_HOOK_FILE);
+    if (await pathExists(extFile)) {
+      res.ompHookFile = extFile;
+    }
+  } else if (tool === 'pi') {
+    const {
+      hasPiHooks,
+      hasPiAgentHook,
+      resolvePiExtensionsDir,
+      resolvePiProjectExtensionsDir,
+      PI_HOOK_FILE,
+    } = await import('./pi-hooks.js');
+    // Mirrors OMP: a targeted uninstall removes the single global extension
+    // outright, regardless of scope. Pi has no way to scope a shared file to
+    // one project — the generated extension fires for every Pi session
+    // machine-wide — so a scoped "preserve for other projects" guarantee was
+    // never actually enforceable, and pretending otherwise just left Pi still
+    // firing hooks for a project that had supposedly uninstalled it.
+    if (await hasPiHooks()) {
+      res.piHookFiles.push(path.join(resolvePiExtensionsDir(), PI_HOOK_FILE));
+    }
+    // Server-pushed agent hooks (teamai-agent-<slug>.ts) always install into
+    // the global extension dir and can exist without the main lifecycle
+    // extension — mirrors OpenCode's discovery, which scans for the same
+    // leftover-plugin pattern so a Pi-only agent-hook install isn't missed.
+    // Each match is marker-checked by its own slug so a same-named file a
+    // user authored by hand is never swept up.
+    for (const file of await listFiles(resolvePiExtensionsDir())) {
+      const base = path.basename(file);
+      if (!base.startsWith('teamai-agent-') || !base.endsWith('.ts')) continue;
+      const slug = base.slice('teamai-agent-'.length, -'.ts'.length);
+      if (await hasPiAgentHook(slug)) {
+        res.piHookFiles.push(path.join(resolvePiExtensionsDir(), file));
+      }
+    }
+    // Clean up a TeamAI-marked legacy project copy left by an earlier
+    // revision, when this discovery pass is scoped to an actual project.
+    if (path.resolve(baseDir) !== path.resolve(getUserHome()) && await hasPiHooks(baseDir)) {
+      res.piHookFiles.push(path.join(resolvePiProjectExtensionsDir(baseDir), PI_HOOK_FILE));
+    }
+  } else if (toolPath.settings) {
+    // Hooks live where resolveHookScope injected them (HOME for a non-self
+    // project scope, per #370) — plus any legacy <projectRoot> copy. Scan every
+    // target and tag each match with the manifest that recorded its team hooks,
+    // so removal strips the right entries at each location. The file name comes
+    // from the same scope decision (`hookSettingsPath`), not from `toolPath` —
+    // except for the legacy copy, written into <projectRoot> by a CLI that knew
+    // nothing about a member's relocated root, so it sits at the team path.
+    for (const { baseDir: hookBaseDir, manifestPath } of hookTargets) {
+      const settingsRel = path.resolve(hookBaseDir) === path.resolve(getUserHome())
+        ? (hookSettingsPath ?? toolPath.settings)
+        : toolPath.settings;
+      const settingsPath = path.join(hookBaseDir, settingsRel);
+      if (await pathExists(settingsPath)
+        && (await hasTeamaiHooks(settingsPath, tool, manifestPath)
+          || isEmptyHooksResidue(await readJson<Record<string, unknown>>(settingsPath)))) {
+        res.hookFiles.push({ path: settingsPath, tool, manifestPath });
+      }
     }
   } else {
     // OpenClaw-style agents (no settings file) inject a HOOK.md + handler.ts
-    // under <hooksDir>/<OPENCLAW_HOOK_DIR>. Check both the default path and
-    // the OPENCLAW_STATE_DIR override to cover imate container environments.
+    // under <hooksDir>/<OPENCLAW_HOOK_DIR>. Check the default path, the
+    // OPENCLAW_STATE_DIR override (imate containers), and the resolved
+    // workspace dir — injection now targets `<workspace>/hooks`, so teardown
+    // must cover it too, otherwise the hook is orphaned on uninstall.
     const defaultHooksDir = path.join(baseDir, `.${tool}`, 'hooks');
     const resolvedHooksDir = resolveOpenClawHooksDir(tool);
     const dirsToCheck = new Set([defaultHooksDir, resolvedHooksDir]);
+    const workspaceDir = await resolveOpenclawWorkspaceDir();
+    if (workspaceDir) {
+      dirsToCheck.add(path.join(workspaceDir, 'hooks'));
+    }
     for (const hooksDir of dirsToCheck) {
       if (await pathExists(path.join(hooksDir, OPENCLAW_HOOK_DIR))) {
         res.openclawHookDirs.push({ hooksDir, tool });
@@ -236,12 +419,37 @@ async function discoverToolResources(
 
   // (c) Skills — only those matching team repo
   if (toolPath.skills) {
-    const skillsDir = path.join(baseDir, toolPath.skills);
-    if (await pathExists(skillsDir)) {
-      const dirs = await listDirs(skillsDir);
-      for (const dir of dirs) {
-        if (teamSkillNames.has(dir)) {
-          res.skillDirs.push(path.join(skillsDir, dir));
+    // Skills root → the base the link guard starts from.
+    const configuredSkills = path.join(baseDir, toolPath.skills);
+    const skillRoots = new Map([[configuredSkills, skillsGuardBase(scopeRoot, configuredSkills)]]);
+    // OpenClaw and Hermes receive skills where team sync and the stub put them
+    // (`skillsDirForTool`): the workspace, and HERMES_HOME.
+    if (tool === 'openclaw') {
+      const workspaceDir = await resolveOpenclawWorkspaceDir();
+      if (workspaceDir) {
+        const workspaceSkills = path.join(workspaceDir, 'skills');
+        skillRoots.set(workspaceSkills, skillsGuardBase(scopeRoot, workspaceSkills));
+      }
+    }
+    if (tool === 'hermes') {
+      const hermesSkills = path.join(getHermesHome(), 'skills');
+      skillRoots.set(hermesSkills, skillsGuardBase(scopeRoot, hermesSkills));
+    }
+    // `resolveSkillDestination` writes Codex's copy into the shared
+    // .agents/skills root whenever that skill already lives there, so uninstall
+    // must look where deployment could have put it — the legacy prune already
+    // does. Codex only: another tool's pass must not reach into it.
+    if (tool === CODEX_TOOL) {
+      const sharedSkills = path.join(baseDir, SHARED_AGENT_SKILLS_PATH);
+      skillRoots.set(sharedSkills, skillsGuardBase(scopeRoot, sharedSkills));
+    }
+    for (const [skillsDir, rootBase] of skillRoots) {
+      if (await pathExists(skillsDir)) {
+        const dirs = await listDirs(skillsDir);
+        for (const dir of dirs) {
+          if (teamSkillNames.has(dir)) {
+            res.skillDirs.push({ dir: path.join(skillsDir, dir), baseDir: rootBase });
+          }
         }
       }
     }
@@ -254,8 +462,10 @@ async function discoverToolResources(
     if (await pathExists(rulesDir)) {
       const files = await listFilesRecursive(rulesDir);
       for (const file of files) {
-        if (!file.endsWith('.md')) continue;
-        const ruleName = file.replace(/\.md$/, '');
+        // Cursor's copies are `.mdc`; match by stem so both extensions are
+        // collected and uninstall does not leave team rules behind.
+        const ruleName = ruleStemFromFilename(file);
+        if (ruleName === null) continue;
         if (teamRuleNames.has(ruleName)) {
           res.ruleFiles.push(path.join(rulesDir, file));
         }
@@ -263,16 +473,17 @@ async function discoverToolResources(
     }
   }
 
-  // (d2) Built-in agents — CLI-deployed subagents (e.g. teamai-recall).
-  // Not synced from the team repo, so match by BUILTIN_AGENT_NAMES.
+  // (d2) Team-synced custom agents plus CLI built-ins. Native output uses
+  // .agent.md for Copilot, .md for most tools, .toml for Codex, and .json for
+  // Kiro, so match by stem.
   if (toolPath.agents) {
     const agentsDir = path.join(baseDir, toolPath.agents);
     if (await pathExists(agentsDir)) {
-      for (const name of BUILTIN_AGENT_NAMES) {
-        const agentFile = path.join(agentsDir, `${name}.md`);
-        if (await pathExists(agentFile)) {
-          res.agentFiles.push(agentFile);
-        }
+      for (const file of await listFiles(agentsDir)) {
+        const name = agentStemFromFilename(path.basename(file));
+        if (name === null) continue;
+        if (!teamAgentNames.has(name) && !BUILTIN_AGENT_NAMES.has(name)) continue;
+        res.agentFiles.push(path.join(agentsDir, file));
       }
     }
   }
@@ -286,7 +497,11 @@ async function buildRemovalPlan(
   agentFilter?: string,
 ): Promise<RemovalPlan> {
   const baseDir = resolveBaseDir(localConfig);
-  const teamaiHome = getTeamaiHome(localConfig.scope, localConfig.projectRoot);
+  const teamaiHome = getDataHome(localConfig);
+  const standaloneHookManifestPath = getManagedHooksPath(
+    localConfig.scope,
+    localConfig.projectRoot,
+  );
 
   // Discover team repo resource names for targeted removal. CLI built-in
   // resources (recall agent/rule, share-learnings skill, …) are deployed by
@@ -296,12 +511,16 @@ async function buildRemovalPlan(
   const repoPath = localConfig.repo.localPath;
   const teamSkillNames = await collectTeamSkillNames(repoPath);
   for (const name of BUILTIN_SKILL_NAMES) teamSkillNames.add(name);
+  // Directories earlier releases deployed: uninstall would otherwise leave the
+  // pre-stub skill trees behind on any machine that upgraded.
+  for (const name of LEGACY_BUILTIN_SKILL_NAMES) teamSkillNames.add(name);
   const teamRuleNames = await collectTeamRuleNames(repoPath);
   for (const name of BUILTIN_RULE_NAMES) teamRuleNames.add(name);
+  const teamAgentNames = await collectTeamAgentNames(repoPath);
 
   // Also include resources installed by local-agent (HTTP distribution)
   const localAgentManifestPath = path.join(
-    homeDir(), '.teamai', 'local-agent', 'manifest.json',
+    getUserHome(), '.teamai', 'local-agent', 'manifest.json',
   );
   if (await pathExists(localAgentManifestPath)) {
     try {
@@ -316,14 +535,57 @@ async function buildRemovalPlan(
     } catch { /* best effort */ }
   }
 
-  // Discover per-tool resources
-  const managedHooksPath = getManagedHooksPath(localConfig.scope, localConfig.projectRoot);
+  // Discover per-tool resources. Hooks are discovered at the injection target
+  // resolveHookScope reports (HOME + user manifest for a non-self project scope,
+  // #370) — the previous code scanned <projectRoot>, so uninstall silently left
+  // the SessionStart hook live in HOME forever. A legacy <projectRoot> copy from
+  // a pre-#370 CLI is swept too, tagged with its project manifest.
+  const primaryHookScope = resolveHookScope(localConfig);
+  const hookTargets = [primaryHookScope];
+  const legacyHookScope = resolveLegacyProjectHookScope(localConfig);
+  if (legacyHookScope) hookTargets.push(legacyHookScope);
+  // Hook discovery resolves its file name at the same scope as the targets: a
+  // non-self project scope discovers under HOME, so the tool paths there must be
+  // the user-scope ones (previously the project-scope name was used, and a tool
+  // whose two scopes differ kept its hooks in HOME forever). Skills, rules,
+  // agents and CLAUDE.md stay on the config-scope paths below — those are real
+  // project resources.
+  const hookToolPaths = scopedToolPaths(teamConfig, { ...localConfig, scope: primaryHookScope.scope });
   const perTool = new Map<string, ToolResources>();
-  for (const [tool, toolPath] of Object.entries(teamConfig.toolPaths)) {
+  for (const [tool, toolPath] of Object.entries(scopedToolPaths(teamConfig, localConfig))) {
     perTool.set(
       tool,
-      await discoverToolResources(tool, toolPath, localConfig, teamSkillNames, teamRuleNames, managedHooksPath),
+      await discoverToolResources(
+        tool,
+        toolPath,
+        resolveToolBaseDir(tool, localConfig),
+        baseDir,
+        teamSkillNames,
+        teamRuleNames,
+        teamAgentNames,
+        hookTargets,
+        standaloneHookManifestPath,
+        localConfig.scope,
+        hookToolPaths[tool]?.settings,
+        usesManagedPolicy(teamConfig, localConfig),
+      ),
     );
+  }
+
+  // A tool only still "uses" a shared resource (AGENTS.md, .teamai/) if it is
+  // actually enabled and installed. Several tools default to the same shared
+  // path — e.g. Hermes/WorkBuddy default to the same project AGENTS.md as Pi —
+  // so a schema entry that merely shares a path must not block cleanup for a
+  // tool that was never enabled or set up. The probe path must be a
+  // tool-specific root (skills/rules/settings), never `claudemd`: that's
+  // exactly the shared, ambiguous path this check exists to disambiguate.
+  const activeTools = new Set<string>();
+  for (const [tool, toolPath] of Object.entries(scopedToolPaths(teamConfig, localConfig))) {
+    if (isAgentExcluded(localConfig, tool)) continue;
+    const probePath = toolPath.skills ?? toolPath.rules ?? toolPath.settings ?? toolPath.claudemd;
+    if (probePath && await isToolInstalledForConfig(tool, probePath, localConfig)) {
+      activeTools.add(tool);
+    }
   }
 
   // Decide which tools to merge and whether to include shared resources
@@ -335,10 +597,10 @@ async function buildRemovalPlan(
     const targetHasResources = targetRes ? hasToolResources(targetRes) : false;
     // Other tools still have teamai resources → keep shared resources.
     const othersHaveResources = [...perTool.entries()]
-      .some(([t, r]) => t !== agentFilter && hasToolResources(r));
+      .some(([t, r]) => t !== agentFilter && activeTools.has(t) && hasToolResources(r));
     // Remove shared resources only when the target itself has resources AND is
     // the last tool using teamai. Targeting a tool with no teamai resources is a
-    // no-op for shared resources (plan will be empty → "没有需要卸载的内容").
+    // no-op for shared resources (plan will be empty → "Nothing to uninstall").
     includeShared = targetHasResources && !othersHaveResources;
   } else {
     toolsToMerge = [...perTool.keys()];
@@ -348,20 +610,37 @@ async function buildRemovalPlan(
   const plan: RemovalPlan = {
     hookFiles: [],
     openclawHookDirs: [],
+    opencodeHookScopes: [],
+    ompHookFile: null,
+    piHookFiles: [],
+    dshHookFile: null,
+    hookManifestPath: hookTargets[0].manifestPath,
     claudeMdFiles: [],
     skillDirs: [],
     ruleFiles: [],
     agentFiles: [],
     mcpServers: [],
-    shellProfile: null,
+    shellProfiles: [],
     docsDir: null,
     teamaiHome,
     teamaiHomeExists: includeShared && await pathExists(teamaiHome),
-    managedHooksPath,
+    unpublishedQueues: includeShared ? await listQueuesIn(teamaiHome) : [],
     includeShared,
     hermesCleanup: toolsToMerge.includes('hermes'),
     scope: localConfig.scope,
   };
+
+  // A single instruction file can be the native target for several agents
+  // (for example project `AGENTS.md` is shared by Pi, Hermes, and WorkBuddy).
+  // Keep its TeamAI blocks when another enabled, installed agent still
+  // references the same file; a targeted uninstall must not remove
+  // instructions owned by that remaining agent.
+  const retainedInstructionFiles = new Set<string>();
+  for (const [tool, resources] of perTool) {
+    if (!toolsToMerge.includes(tool) && activeTools.has(tool)) {
+      for (const file of resources.claudeMdFiles) retainedInstructionFiles.add(file);
+    }
+  }
 
   // Merge tool-specific resources for selected tools
   for (const tool of toolsToMerge) {
@@ -369,7 +648,15 @@ async function buildRemovalPlan(
     if (!res) continue;
     plan.hookFiles.push(...res.hookFiles);
     plan.openclawHookDirs.push(...res.openclawHookDirs);
-    plan.claudeMdFiles.push(...res.claudeMdFiles);
+    plan.opencodeHookScopes.push(...res.opencodeHookScopes);
+    if (res.ompHookFile) plan.ompHookFile = res.ompHookFile;
+    plan.piHookFiles.push(...res.piHookFiles);
+    if (res.dshHookFile) plan.dshHookFile = res.dshHookFile;
+    for (const file of res.claudeMdFiles) {
+      if (!retainedInstructionFiles.has(file) && !plan.claudeMdFiles.includes(file)) {
+        plan.claudeMdFiles.push(file);
+      }
+    }
     plan.skillDirs.push(...res.skillDirs);
     plan.ruleFiles.push(...res.ruleFiles);
     plan.agentFiles.push(...res.agentFiles);
@@ -377,10 +664,13 @@ async function buildRemovalPlan(
 
   if (includeShared) {
     // (d3) teamai-managed MCP servers, tracked in managed-mcp.json (same
-    // ownership model as hooks). These live under ~/.teamai, so they are shared
-    // resources: only removed when the target is the last tool using teamai.
+    // ownership model as hooks). Project scope reads THIS worktree's own
+    // per-worktree manifest; user scope reads the single global file.
     const mcpManifestPath = expandHome(
-      managedMcpManifestPath(localConfig.scope, localConfig.projectRoot),
+      managedMcpManifestPath(
+        getDataHome(localConfig),
+        localConfig.scope === 'project' ? localConfig.projectRoot : undefined,
+      ),
     );
     const mcpManifest = (await readJson<ManagedMcpManifest>(mcpManifestPath)) ?? {};
     for (const [toolKey, records] of Object.entries(mcpManifest)) {
@@ -390,25 +680,41 @@ async function buildRemovalPlan(
     }
     plan.mcpServers.sort();
 
-    // (e) Shell profile env block
-    const shellProfilePath = teamConfig.sharing.env.shellProfilePath
+    // (e) Shell profile env block(s). Scan every profile file teamai could
+    // ever have written to, not just the one detectShellProfile() resolves to
+    // today: the Windows fix (#682) changed which file `pull` prefers, so a
+    // machine last pulled with an older CLI can carry a stale block in a file
+    // the current resolution no longer points at, and a plain uninstall would
+    // silently leave that managed block behind.
+    //
+    // A candidate only counts if one of its blocks names THIS scope's
+    // env.sh (findEnvBlockFor) — matching on the marker alone
+    // would let this uninstall delete a different scope's still-active block
+    // just because it also happens to live in one of the candidate
+    // filenames. This check is deliberately looser than doctor's "does it
+    // load" check: a legacy block written by a pre-#661/#682 CLI (raw
+    // backslashes, or the MSYS drive form) still belongs to this scope and
+    // still has to be found and removed, even though it never worked.
+    const configuredProfilePath = teamConfig.sharing.env.shellProfilePath
       ? expandHome(teamConfig.sharing.env.shellProfilePath)
-      : detectShellProfile();
-    if (shellProfilePath) {
-      const profileContent = await readFileSafe(shellProfilePath);
-      if (profileContent && profileContent.includes(TEAMAI_ENV_START)) {
-        plan.shellProfile = shellProfilePath;
+      : await detectShellProfile();
+    const home = getUserHome();
+    const envShPath = path.join(getDataHome(localConfig), 'env.sh');
+    const candidateProfilePaths = Array.from(new Set([
+      configuredProfilePath,
+      ...SHELL_PROFILE_CANDIDATE_NAMES.map((name) => path.join(home, name)),
+    ]));
+    for (const candidate of candidateProfilePaths) {
+      const profileContent = await readFileSafe(candidate);
+      if (profileContent && findEnvBlockFor(profileContent, envShPath)) {
+        plan.shellProfiles.push(candidate);
       }
     }
 
-    // Index-only docs live solely in the team checkout. Legacy/default copy mode
-    // preserves the existing uninstall behaviour for the copied docs directory.
-    if ((teamConfig.sharing.docs.mode ?? 'copy') !== 'index-only') {
-      const configured = teamConfig.sharing.docs.localDir;
-      const docsDir = localConfig.scope === 'project' && localConfig.projectRoot && configured.startsWith('~/')
-        ? path.join(localConfig.projectRoot, configured.slice(2))
-        : expandHome(configured);
-      if (await pathExists(docsDir)) plan.docsDir = docsDir;
+    // (f) Docs directory
+    const docsDir = resolveDocsDestination(teamConfig, localConfig);
+    if (await pathExists(docsDir)) {
+      plan.docsDir = docsDir;
     }
   }
 
@@ -421,32 +727,35 @@ function isPlanEmpty(plan: RemovalPlan): boolean {
   return (
     plan.hookFiles.length === 0 &&
     plan.openclawHookDirs.length === 0 &&
+    plan.opencodeHookScopes.length === 0 &&
+    plan.ompHookFile === null &&
+    plan.piHookFiles.length === 0 &&
+    plan.dshHookFile === null &&
     plan.claudeMdFiles.length === 0 &&
     plan.skillDirs.length === 0 &&
     plan.ruleFiles.length === 0 &&
     plan.agentFiles.length === 0 &&
     plan.mcpServers.length === 0 &&
-    plan.shellProfile === null &&
+    plan.shellProfiles.length === 0 &&
     plan.docsDir === null &&
     !plan.teamaiHomeExists
   );
 }
 
 function printSummary(plan: RemovalPlan, agentFilter?: string): void {
-  const cn = plan.scope === 'project' ? '项目级' : '用户级';
   console.log('');
-  console.log(`⚠  正在卸载 ${plan.scope} scope（${cn}）— ${plan.teamaiHome}`);
+  console.log(`⚠  Uninstalling ${plan.scope} scope — ${plan.teamaiHome}`);
   if (agentFilter) {
     const sharedNote = plan.includeShared
       ? ' (last tool — shared resources removed too)'
       : ' (shared resources kept for remaining tools)';
     console.log(`⚠  Uninstalling tool only: ${agentFilter}${sharedNote}`);
   }
-  console.log('⚠  以下 teamai 资源将被移除:');
+  console.log('⚠  The following teamai resources will be removed:');
   console.log('');
 
   if (plan.hookFiles.length > 0) {
-    console.log(`   Hooks (${plan.hookFiles.length} 个文件):`);
+    console.log(`   Hooks (${plan.hookFiles.length} files):`);
     for (const { path: p } of plan.hookFiles) {
       console.log(`     ${p}`);
     }
@@ -454,15 +763,41 @@ function printSummary(plan: RemovalPlan, agentFilter?: string): void {
   }
 
   if (plan.openclawHookDirs.length > 0) {
-    console.log(`   OpenClaw Hooks (${plan.openclawHookDirs.length} 个目录):`);
+    console.log(`   OpenClaw Hooks (${plan.openclawHookDirs.length} directories):`);
     for (const { hooksDir } of plan.openclawHookDirs) {
       console.log(`     ${path.join(hooksDir, OPENCLAW_HOOK_DIR)}/`);
     }
     console.log('');
   }
 
+  if (plan.opencodeHookScopes.length > 0) {
+    console.log(`   OpenCode Hooks (${plan.opencodeHookScopes.length} plugin dirs):`);
+    for (const { baseDir, scope } of plan.opencodeHookScopes) {
+      const configDir = scope === 'project' ? '.opencode' : path.join('.config', 'opencode');
+      console.log(`     ${path.join(baseDir, configDir, 'plugin')}/teamai-*.ts`);
+    }
+    console.log('');
+  }
+
+  if (plan.ompHookFile !== null) {
+    console.log('   OMP Hook (extension):');
+    console.log(`     ${plan.ompHookFile}`);
+    console.log('');
+  }
+  if (plan.piHookFiles.length > 0) {
+    console.log(`   Pi Hooks (${plan.piHookFiles.length} files):`);
+    for (const p of plan.piHookFiles) console.log(`     ${p}`);
+    console.log('');
+  }
+
+  if (plan.dshHookFile !== null) {
+    console.log('   DeepSeek Harness hook patch:');
+    console.log(`     ${plan.dshHookFile}`);
+    console.log('');
+  }
+
   if (plan.claudeMdFiles.length > 0) {
-    console.log(`   CLAUDE.md 规则块 (${plan.claudeMdFiles.length} 个文件):`);
+    console.log(`   CLAUDE.md rule blocks (${plan.claudeMdFiles.length} files):`);
     for (const p of plan.claudeMdFiles) {
       console.log(`     ${p}`);
     }
@@ -470,17 +805,28 @@ function printSummary(plan: RemovalPlan, agentFilter?: string): void {
   }
 
   if (plan.skillDirs.length > 0) {
-    console.log(`   Skills (${plan.skillDirs.length} 个目录)`);
+    console.log(`   Skills (${plan.skillDirs.length} directories):`);
+    for (const { dir: skillDir } of plan.skillDirs) {
+      // A CLI-owned directory loses the files TeamAI packaged, not whatever the
+      // member added beside them, so the prompt must not promise the directory.
+      const suffix = isCliOwnedSkillName(path.basename(skillDir))
+        ? '   (TeamAI-packaged files only; anything you added stays)'
+        : '';
+      console.log(`     ${skillDir}${suffix}`);
+    }
     console.log('');
   }
 
   if (plan.ruleFiles.length > 0) {
-    console.log(`   Rules (${plan.ruleFiles.length} 个文件)`);
+    console.log(`   Rules (${plan.ruleFiles.length} files)`);
     console.log('');
   }
 
   if (plan.agentFiles.length > 0) {
-    console.log(`   Agents (${plan.agentFiles.length} 个文件)`);
+    console.log(`   Agents (${plan.agentFiles.length} files):`);
+    for (const agentFile of plan.agentFiles) {
+      console.log(`     ${agentFile}`);
+    }
     console.log('');
   }
 
@@ -492,21 +838,32 @@ function printSummary(plan: RemovalPlan, agentFilter?: string): void {
     console.log('');
   }
 
-  if (plan.shellProfile) {
-    console.log('   Shell profile 环境变量块:');
-    console.log(`     ${plan.shellProfile}`);
+  if (plan.shellProfiles.length > 0) {
+    console.log(`   Shell profile env blocks (${plan.shellProfiles.length}):`);
+    for (const profilePath of plan.shellProfiles) {
+      console.log(`     ${profilePath}`);
+    }
     console.log('');
   }
 
   if (plan.docsDir) {
-    console.log('   Docs 目录:');
+    console.log('   Docs directory:');
     console.log(`     ${plan.docsDir}`);
     console.log('');
   }
 
   if (plan.teamaiHomeExists) {
-    console.log('   TeamAI 主目录:');
+    console.log('   TeamAI home directory:');
     console.log(`     ${plan.teamaiHome}/`);
+    console.log('');
+  }
+
+  if (plan.unpublishedQueues.length > 0) {
+    console.log('⚠  Learnings not published yet, deleted with the home directory:');
+    for (const { dir, count } of plan.unpublishedQueues) {
+      console.log(`     ${count} unpublished learning(s) in ${dir}`);
+    }
+    console.log('   Run `teamai pull` to publish them first, or copy them somewhere safe.');
     console.log('');
   }
 }
@@ -528,12 +885,16 @@ async function teardownPlugins(): Promise<void> {
 }
 
 async function executeRemoval(plan: RemovalPlan): Promise<void> {
-  // (a) Remove hooks from tool settings (built-in A + team B via the manifest)
-  for (const { path: settingsPath, tool } of plan.hookFiles) {
+  // (a) Remove hooks from tool settings (built-in A + team B via the manifest).
+  // Each settings entry carries the manifest for its own location (HOME/user
+  // or a legacy <projectRoot>/project copy), so team hooks are stripped at the
+  // location that owns them. File-based adapters apply their own scope rules
+  // below; in particular, project uninstall never owns Pi's global extension.
+  for (const { path: settingsPath, tool, manifestPath } of plan.hookFiles) {
     try {
-      await reconcileHooks(settingsPath, tool, [], { removeAll: true, manifestPath: plan.managedHooksPath });
+      await reconcileHooks(settingsPath, tool, [], { removeAll: true, manifestPath });
     } catch (e) {
-      log.warn(`移除 hooks 失败 ${settingsPath}: ${(e as Error).message}`);
+      log.warn(`Failed to remove hooks from ${settingsPath}: ${(e as Error).message}`);
     }
   }
 
@@ -542,7 +903,56 @@ async function executeRemoval(plan: RemovalPlan): Promise<void> {
     try {
       await removeOpenClawHooks(hooksDir);
     } catch (e) {
-      log.warn(`移除 OpenClaw hook 失败 ${hooksDir}: ${(e as Error).message}`);
+      log.warn(`Failed to remove OpenClaw hook from ${hooksDir}: ${(e as Error).message}`);
+    }
+  }
+
+  // (a2b) Remove OpenCode teamai plugin files (main hook + any agent-hook plugins).
+  for (const { baseDir, scope } of plan.opencodeHookScopes) {
+    try {
+      const { removeOpencodeHooks, resolveOpencodePluginDir } = await import('./opencode-hooks.js');
+      await removeOpencodeHooks(baseDir, scope);
+      // Sweep leftover teamai-agent-*.ts plugins not tracked in the agent-hook
+      // manifest. listFilesRecursive yields paths relative to pluginDir.
+      const pluginDir = resolveOpencodePluginDir(baseDir, scope);
+      if (await pathExists(pluginDir)) {
+        for (const rel of await listFilesRecursive(pluginDir)) {
+          if (path.basename(rel).startsWith('teamai-agent-')) await remove(path.join(pluginDir, rel));
+        }
+      }
+    } catch (e) {
+      log.warn(`Failed to remove OpenCode hook (${scope} scope): ${(e as Error).message}`);
+    }
+  }
+
+  // (a2c) Remove the teamai OMP extension (single user-agent-dir copy).
+  if (plan.ompHookFile !== null) {
+    try {
+      const { removeOmpHooks } = await import('./omp-hooks.js');
+      await removeOmpHooks();
+    } catch (e) {
+      log.warn(`Failed to remove OMP hook: ${(e as Error).message}`);
+    }
+  }
+
+  // (a2c) Remove the generated Pi extension.
+  for (const hookFile of plan.piHookFiles) {
+    try {
+      await remove(hookFile);
+      log.success(`Removed Pi hook from ${hookFile}`);
+    } catch (e) {
+      log.warn(`Failed to remove Pi hook ${hookFile}: ${(e as Error).message}`);
+    }
+  }
+
+  // (a2d) Remove the DSH bridge config and profile patch through the same
+  // adapter used by `teamai hooks remove`, preserving unrelated hook entries.
+  if (plan.dshHookFile !== null) {
+    try {
+      const { reconcileDshHooks } = await import('./dsh-hooks.js');
+      await reconcileDshHooks([], { manifestPath: plan.hookManifestPath, removeAll: true });
+    } catch (e) {
+      log.warn(`Failed to remove DeepSeek Harness hooks: ${(e as Error).message}`);
     }
   }
 
@@ -578,22 +988,59 @@ async function executeRemoval(plan: RemovalPlan): Promise<void> {
       } else {
         await writeFile(claudeMdPath, content + '\n');
       }
-      log.success(`清理 CLAUDE.md: ${claudeMdPath}`);
+      log.success(`Cleaned CLAUDE.md: ${claudeMdPath}`);
     } catch (e) {
-      log.warn(`清理 CLAUDE.md 失败 ${claudeMdPath}: ${(e as Error).message}`);
+      log.warn(`Failed to clean CLAUDE.md ${claudeMdPath}: ${(e as Error).message}`);
     }
   }
 
-  // (c) Remove synced skills
-  for (const skillDir of plan.skillDirs) {
+  // (c) Remove synced skills.
+  //
+  // A team-repo skill is synced whole, so the whole directory goes. A CLI-owned
+  // one is not: deployment writes only the files in PACKAGED_SKILL_FILES and
+  // never touched a file a member added beside them, so uninstall removes those
+  // same paths and keeps the rest — the same ownership rule pull applies.
+  // Deleting the directory here would undo the guarantee one command over.
+  //
+  // Pull's archive is deliberately not applied: there the member is upgrading
+  // and did not ask for anything to go, here they asked for all of it. Leaving
+  // copies behind would be the thing they ran the command to avoid.
+  let removedSkillDirs = 0;
+  const keptSkillDirs: string[] = [];
+  const linkedSkillDirs: string[] = [];
+  const failedSkillDirs: { skillDir: string; first: { file: string; error: string } }[] = [];
+  for (const { dir: skillDir, baseDir } of plan.skillDirs) {
     try {
-      await remove(skillDir);
+      const name = path.basename(skillDir);
+      if (isCliOwnedSkillName(name)) {
+        const result = await removeOwnedFiles(skillDir, await ownedSkillFiles(name), baseDir);
+        if (prunedWhole(result)) removedSkillDirs++;
+        else if (result.skippedSymlink) linkedSkillDirs.push(skillDir);
+        // A delete that failed is not a member's file: say what happened, not
+        // "the packaged files were removed".
+        else if (result.notRemoved.length > 0) failedSkillDirs.push({ skillDir, first: result.notRemoved[0] });
+        else keptSkillDirs.push(skillDir);
+      } else {
+        await remove(skillDir);
+        removedSkillDirs++;
+      }
     } catch (e) {
-      log.warn(`移除 skill 失败 ${skillDir}: ${(e as Error).message}`);
+      log.warn(`Failed to remove skill ${skillDir}: ${(e as Error).message}`);
     }
   }
-  if (plan.skillDirs.length > 0) {
-    log.success(`移除了 ${plan.skillDirs.length} 个 skill 目录`);
+  if (removedSkillDirs > 0) {
+    log.success(`Removed ${removedSkillDirs} skill directories`);
+  }
+  for (const skillDir of keptSkillDirs) {
+    log.warn(`Kept ${skillDir}: it holds files TeamAI did not put there. The packaged files were removed; delete the rest yourself once you have saved what you need.`);
+  }
+  // A different reason, so a different sentence: nothing here was touched, and
+  // "delete the rest yourself" would send the member into the link target.
+  for (const skillDir of linkedSkillDirs) {
+    log.warn(`Kept ${skillDir}: it is reached through a symlink, so TeamAI left it and whatever the link points at alone.`);
+  }
+  for (const { skillDir, first } of failedSkillDirs) {
+    log.warn(`Could not delete packaged files under ${skillDir}. First: ${first.file} — ${first.error}. Fix the permissions and run \`teamai uninstall\` again, or delete the directory yourself.`);
   }
 
   // (d) Remove synced rules
@@ -601,11 +1048,11 @@ async function executeRemoval(plan: RemovalPlan): Promise<void> {
     try {
       await remove(ruleFile);
     } catch (e) {
-      log.warn(`移除 rule 失败 ${ruleFile}: ${(e as Error).message}`);
+      log.warn(`Failed to remove rule ${ruleFile}: ${(e as Error).message}`);
     }
   }
   if (plan.ruleFiles.length > 0) {
-    log.success(`移除了 ${plan.ruleFiles.length} 个 rule 文件`);
+    log.success(`Removed ${plan.ruleFiles.length} rule files`);
   }
 
   // (d2) Remove built-in agent files (e.g. teamai-recall)
@@ -613,29 +1060,31 @@ async function executeRemoval(plan: RemovalPlan): Promise<void> {
     try {
       await remove(agentFile);
     } catch (e) {
-      log.warn(`移除 agent 失败 ${agentFile}: ${(e as Error).message}`);
+      log.warn(`Failed to remove agent ${agentFile}: ${(e as Error).message}`);
     }
   }
   if (plan.agentFiles.length > 0) {
-    log.success(`移除了 ${plan.agentFiles.length} 个 agent 文件`);
+    log.success(`Removed ${plan.agentFiles.length} agent files`);
   }
 
-  // (e) Clean shell profile env block
-  if (plan.shellProfile) {
+  // (e) Clean shell profile env block(s) — every file discovered in
+  // buildRemovalPlan, not just the one detectShellProfile() resolves to today.
+  // Only this scope's own block: another scope's may share the file (#876).
+  const envShPath = path.join(plan.teamaiHome, 'env.sh');
+  for (const profilePath of plan.shellProfiles) {
     try {
-      const content = await readFileSafe(plan.shellProfile);
+      const content = await readFileSafe(profilePath);
       if (content) {
-        const startIdx = content.indexOf(TEAMAI_ENV_START);
-        const endIdx = content.indexOf(TEAMAI_ENV_END);
-        if (startIdx !== -1 && endIdx !== -1) {
-          const before = content.substring(0, startIdx).replace(/\n+$/, '\n');
-          const after = content.substring(endIdx + TEAMAI_ENV_END.length).replace(/^\n+/, '\n');
-          await writeFile(plan.shellProfile, before + after);
-          log.success(`清理 shell profile: ${plan.shellProfile}`);
+        const block = findEnvBlockFor(content, envShPath);
+        if (block && block.end !== null) {
+          const before = content.substring(0, block.start).replace(/\n+$/, '\n');
+          const after = content.substring(block.end).replace(/^\n+/, '\n');
+          await writeFile(profilePath, before + after);
+          log.success(`Cleaned shell profile: ${profilePath}`);
         }
       }
     } catch (e) {
-      log.warn(`清理 shell profile 失败: ${(e as Error).message}`);
+      log.warn(`Failed to clean shell profile ${profilePath}: ${(e as Error).message}`);
     }
   }
 
@@ -643,9 +1092,9 @@ async function executeRemoval(plan: RemovalPlan): Promise<void> {
   if (plan.docsDir) {
     try {
       await remove(plan.docsDir);
-      log.success(`移除 docs: ${plan.docsDir}`);
+      log.success(`Removed docs: ${plan.docsDir}`);
     } catch (e) {
-      log.warn(`移除 docs 失败: ${(e as Error).message}`);
+      log.warn(`Failed to remove docs: ${(e as Error).message}`);
     }
   }
 
@@ -655,9 +1104,9 @@ async function executeRemoval(plan: RemovalPlan): Promise<void> {
     await teardownPlugins();
     try {
       await remove(plan.teamaiHome);
-      log.success(`移除 ${plan.teamaiHome}/`);
+      log.success(`Removed ${plan.teamaiHome}/`);
     } catch (e) {
-      log.warn(`移除 ${plan.teamaiHome} 失败: ${(e as Error).message}`);
+      log.warn(`Failed to remove ${plan.teamaiHome}: ${(e as Error).message}`);
     }
   }
 
@@ -683,11 +1132,11 @@ export async function uninstall(opts: UninstallOptions): Promise<void> {
   let teamConfig: TeamaiConfig | null = null;
 
   try {
-    const result = await autoDetectInit({ readOnly: !!(opts.dryRun || opts.plan) });
+    const result = await autoDetectInit(undefined, { dryRun: !!(opts.plan || opts.dryRun) });
     localConfig = result.localConfig;
     teamConfig = result.teamConfig;
   } catch {
-    log.warn('teamai 配置未找到或无效');
+    log.warn('teamai configuration not found or invalid');
   }
 
   if (localConfig && teamConfig) {
@@ -695,8 +1144,7 @@ export async function uninstall(opts: UninstallOptions): Promise<void> {
     let agentKey: string | undefined = opts.agent;
     if (opts.agent) {
       const tools = Object.keys(teamConfig.toolPaths);
-      const requested = normalizeHostId(opts.agent);
-      const matched = tools.find((t) => normalizeHostId(t) === requested);
+      const matched = tools.find((t) => normalizeHostId(t) === normalizeHostId(opts.agent!));
       if (!matched) {
         log.error(`Unknown tool "${opts.agent}". Available tools: ${tools.join(', ')}`);
         process.exitCode = 2;
@@ -704,53 +1152,75 @@ export async function uninstall(opts: UninstallOptions): Promise<void> {
       }
       agentKey = matched; // normalize to canonical toolPaths key
     }
-    const configAgentKey = agentKey ? normalizeHostId(agentKey) : undefined;
     const lifecycleHome = getTeamaiHome(localConfig.scope, localConfig.projectRoot);
     const lifecyclePlan = await uninstallManagedResources(lifecycleHome, { tool: agentKey, plan: true });
     const managedPaths = await managedManifestTargetPaths(lifecycleHome);
     const plan = await buildRemovalPlan(localConfig, teamConfig, agentKey);
-    // Legacy discovery remains for hooks, rules and installations made by older
-    // CLIs. Never let it remove a path already governed by the ownership ledger.
-    plan.skillDirs = plan.skillDirs.filter((entry) => !managedPaths.has(entry));
-    plan.agentFiles = plan.agentFiles.filter((entry) => !managedPaths.has(entry));
-    plan.claudeMdFiles = plan.claudeMdFiles.filter((entry) => !managedPaths.has(entry));
+    plan.skillDirs = plan.skillDirs.filter((entry) => !managedPaths.has(path.resolve(entry.dir)));
+    plan.agentFiles = plan.agentFiles.filter((entry) => !managedPaths.has(path.resolve(entry)));
+    plan.claudeMdFiles = plan.claudeMdFiles.filter((entry) => !managedPaths.has(path.resolve(entry)));
 
-    const hasTargetConfigState = configAgentKey !== undefined && (
-      localConfig.hostRoots?.[configAgentKey] !== undefined
-      || localConfig.enabledAgents?.some((tool) => normalizeHostId(tool) === configAgentKey) === true
-    );
+    const hasTargetConfigState = agentKey && (localConfig.enabledAgents?.map(normalizeHostId).includes(agentKey) || localConfig.hostRoots?.[normalizeHostId(agentKey)]);
     if (isPlanEmpty(plan) && lifecyclePlan.planned.length === 0 && lifecyclePlan.conflicts.length === 0 && !hasTargetConfigState) {
-      log.info('没有需要卸载的内容');
+      log.info('Nothing to uninstall');
       return;
     }
 
-    printSummary(plan, agentKey);
-    if (lifecyclePlan.planned.length > 0 || lifecyclePlan.conflicts.length > 0) {
-      console.log(`   Managed resources (${lifecyclePlan.planned.length} safe, ${lifecyclePlan.conflicts.length} protected)`);
-      console.log('');
+    // A binding with no deployed files still needs explicit unbinding, not removal of the shared home.
+    if (agentKey && lifecyclePlan.planned.length === 0 && [...managedPaths].length === 0 && localConfig.hostRoots?.[agentKey]) {
+      plan.includeShared = false; plan.teamaiHomeExists = false;
     }
+    printSummary(plan, agentKey);
 
     if (opts.dryRun || opts.plan) {
-      log.info('Dry run — 未做任何更改');
+      log.info('Dry run — no changes made');
       return;
     }
 
     if (!opts.force) {
-      const confirmed = await askConfirmation('确认卸载? [y/N] ');
+      const confirmed = await askConfirmation('Confirm uninstall? [y/N] ');
       if (!confirmed) {
-        log.info('已取消');
+        log.info('Cancelled');
         return;
       }
     }
 
-    // Ownership-ledger cleanup precedes all name-based legacy discovery. This is
-    // the only path that can restore an original file replaced during installation.
-    const lifecycleResult = await uninstallManagedResources(lifecycleHome, { tool: agentKey });
-    for (const conflict of lifecycleResult.conflicts) log.warn(`Preserved local change: ${conflict}`);
-    if (lifecycleResult.conflicts.length > 0) {
-      // Keep the ledger and backup data so a later safe retry can still resolve
-      // the conflict. The rest of the requested teardown remains best-effort.
+    const lifecycle = await uninstallManagedResources(lifecycleHome, { tool: agentKey });
+    if (lifecycle.conflicts.length > 0) {
+      for (const conflict of lifecycle.conflicts) log.warn(`Preserved local change: ${conflict}`);
+      process.exitCode = 1;
+      return;
+    }
+    const remaining = await loadManagedResourceManifest(lifecycleHome);
+    if (Object.keys(remaining.resources).length > 0) {
+      plan.includeShared = false;
       plan.teamaiHomeExists = false;
+    }
+
+    // Model profiles are machine-global, independent of a project's resources.
+    // Only removal of the user-scope TeamAI home may restore them. Run this
+    // gate before MCP cleanup so a model conflict cannot partially uninstall
+    // integrations in this or another worktree.
+    if (plan.includeShared && localConfig.scope === 'user') {
+      let modelRestoreIncomplete = false;
+      try {
+        const { ALL_MODEL_AGENTS, restoreModelProfiles } = await import('./models/switch.js');
+        const results = await restoreModelProfiles(ALL_MODEL_AGENTS);
+        const restored = results.filter((result) => result.status === 'restored').length;
+        if (restored > 0) log.info(`Restored model settings for ${restored} agent(s)`);
+        for (const result of results.filter((item) => item.status === 'failed' || item.status === 'skipped')) {
+          log.warn(result.message);
+          modelRestoreIncomplete = true;
+        }
+      } catch (e) {
+        log.warn(`Failed to restore TeamAI-managed model settings: ${(e as Error).message}`);
+        modelRestoreIncomplete = true;
+      }
+      if (modelRestoreIncomplete) {
+        log.error('Cannot remove TeamAI home while model restoration is incomplete. Resolve the model conflict or run `teamai models restore` first.');
+        process.exitCode = 1;
+        return;
+      }
     }
 
     // MCP cleanup must run before executeRemoval deletes ~/.teamai/: ownership is
@@ -762,9 +1232,30 @@ export async function uninstall(opts: UninstallOptions): Promise<void> {
     if (plan.includeShared) {
       try {
         const { reconcileMcpForConfig } = await import('./mcp-reconcile.js');
-        const { changes } = await reconcileMcpForConfig(teamConfig, localConfig, { removeAll: true });
-        const removed = changes.filter((c) => c.action === 'removed');
-        if (removed.length > 0) log.info(`Removed ${removed.length} teamai-managed MCP server(s)`);
+        // Project scope: the managed-mcp manifests are PER-WORKTREE under the
+        // shared partition (#374 P1-2C), and each worktree's MCP config lives in
+        // its own checkout. Since executeRemoval deletes the whole shared
+        // partition, we must first remove the managed MCP servers from EVERY
+        // linked worktree — otherwise a sibling worktree is left with an injected
+        // server whose ownership record just got deleted (orphaned). User scope
+        // has a single global manifest, so the current config is enough.
+        const configs: LocalConfig[] = [localConfig];
+        if (localConfig.scope === 'project' && localConfig.projectRoot) {
+          const { listWorktrees } = await import('./utils/git.js');
+          const { resolveProjectDataHome } = await import('./config.js');
+          const worktrees = await listWorktrees(localConfig.projectRoot);
+          for (const wt of worktrees) {
+            if (wt === localConfig.projectRoot) continue;
+            const dataHome = await resolveProjectDataHome(wt);
+            configs.push({ ...localConfig, projectRoot: wt, dataHome });
+          }
+        }
+        let removedTotal = 0;
+        for (const cfg of configs) {
+          const { changes } = await reconcileMcpForConfig(teamConfig, cfg, { removeAll: true });
+          removedTotal += changes.filter((c) => c.action === 'removed').length;
+        }
+        if (removedTotal > 0) log.info(`Removed ${removedTotal} teamai-managed MCP server(s)`);
       } catch (e) {
         log.warn(`Failed to remove MCP servers: ${(e as Error).message}`);
       }
@@ -776,22 +1267,22 @@ export async function uninstall(opts: UninstallOptions): Promise<void> {
     // hook) does not resurrect this tool's resources. Only meaningful when the
     // shared ~/.teamai home survives (non-last-tool uninstall); on a last-tool
     // uninstall the home is deleted and there is nothing to persist.
-    if (agentKey && configAgentKey && !plan.includeShared) {
+    if (agentKey && !plan.includeShared) {
       const cfg = localConfig!;
       // Only prune an existing whitelist. Leaving `enabledAgents` undefined
       // (meaning "all tools") as-is is important: collapsing it to [] would be
       // read by the hook path as "whitelist nothing" and stop hook sync for the
       // remaining tools too. The disabledAgents exclusion below is what actually
       // keeps the uninstalled tool out on the next pull.
+      if (cfg.hostRoots) {
+        delete cfg.hostRoots[normalizeHostId(agentKey)];
+        if (Object.keys(cfg.hostRoots).length === 0) delete cfg.hostRoots;
+      }
       if (cfg.enabledAgents) {
-        cfg.enabledAgents = cfg.enabledAgents.filter((t) => normalizeHostId(t) !== configAgentKey);
+        cfg.enabledAgents = cfg.enabledAgents.map(normalizeHostId).filter((t) => t !== agentKey);
       }
       const prevDisabled = cfg.disabledAgents ?? [];
-      cfg.disabledAgents = [...new Set([...prevDisabled.map(normalizeHostId), configAgentKey])];
-      if (lifecycleResult.conflicts.length === 0 && cfg.hostRoots?.[configAgentKey]) {
-        const { [configAgentKey]: _removed, ...remainingRoots } = cfg.hostRoots;
-        cfg.hostRoots = Object.keys(remainingRoots).length > 0 ? remainingRoots : undefined;
-      }
+      cfg.disabledAgents = [...new Set([...prevDisabled, agentKey])];
       if (cfg.scope === 'project') {
         await saveLocalConfigForScope(cfg, cfg.scope, cfg.projectRoot);
       } else {
@@ -799,7 +1290,7 @@ export async function uninstall(opts: UninstallOptions): Promise<void> {
       }
     }
 
-    log.success('teamai 卸载完成');
+    log.success('teamai uninstalled');
   } else {
     // Minimal uninstall — just try to remove ~/.teamai/
     if (opts.agent) {
@@ -807,38 +1298,58 @@ export async function uninstall(opts: UninstallOptions): Promise<void> {
       process.exitCode = 2;
       return;
     }
-    const home = path.join(homeDir(), '.teamai');
+    const home = path.join(getUserHome(), '.teamai');
     if (!await pathExists(home)) {
-      log.info('没有需要卸载的内容');
+      log.info('Nothing to uninstall');
       return;
     }
 
+    if ((await managedManifestTargetPaths(home)).size > 0) {
+      log.error('Managed resources remain. Restore the TeamAI configuration before uninstalling.');
+      process.exitCode = 1;
+      return;
+    }
     console.log('');
-    console.log('⚠  正在卸载 user scope（用户级，未检测到有效配置，仅清理主目录）');
-    console.log('⚠  将移除 TeamAI 主目录:');
+    console.log('⚠  Uninstalling user scope (no valid configuration detected — home directory only)');
+    console.log('⚠  The following TeamAI home directory will be removed:');
     console.log(`     ${home}/`);
     console.log('');
 
     if (opts.dryRun || opts.plan) {
-      log.info('Dry run — 未做任何更改');
+      log.info('Dry run — no changes made');
       return;
     }
 
     if (!opts.force) {
-      const confirmed = await askConfirmation('确认卸载? [y/N] ');
+      const confirmed = await askConfirmation('Confirm uninstall? [y/N] ');
       if (!confirmed) {
-        log.info('已取消');
+        log.info('Cancelled');
         return;
       }
     }
 
     try {
+      try {
+        const { ALL_MODEL_AGENTS, restoreModelProfiles } = await import('./models/switch.js');
+        const results = await restoreModelProfiles(ALL_MODEL_AGENTS);
+        const incomplete = results.filter((result) => result.status === 'failed' || result.status === 'skipped');
+        if (incomplete.length > 0) {
+          for (const result of incomplete) log.warn(result.message);
+          log.error('Cannot remove TeamAI home while model restoration is incomplete.');
+          process.exitCode = 1;
+          return;
+        }
+      } catch (e) {
+        log.warn(`Failed to restore TeamAI-managed model settings: ${(e as Error).message}`);
+        process.exitCode = 1;
+        return;
+      }
       await teardownPlugins();
       await remove(home);
-      log.success(`移除 ${home}/`);
-      log.success('teamai 卸载完成');
+      log.success(`Removed ${home}/`);
+      log.success('teamai uninstalled');
     } catch (e) {
-      log.warn(`移除 ${home} 失败: ${(e as Error).message}`);
+      log.warn(`Failed to remove ${home}: ${(e as Error).message}`);
     }
   }
 }

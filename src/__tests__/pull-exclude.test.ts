@@ -3,7 +3,8 @@ import fse from 'fs-extra';
 import os from 'node:os';
 import path from 'node:path';
 
-vi.mock('../config.js', () => ({
+vi.mock('../config.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../config.js')>()),
   detectProjectConfig: vi.fn().mockResolvedValue(null),
   loadLocalConfigForScope: vi.fn(),
   loadStateForScope: vi.fn().mockResolvedValue({ lastPull: null, lastPullRev: null }),
@@ -35,13 +36,20 @@ vi.mock('../roles.js', () => ({
       id: 'dev',
       name: 'Dev',
       description: '',
-      resources: { knowledge: ['common'], skills: ['common'], learnings: ['common'] },
+      resources: { knowledge: ['common'], skills: ['common'], learnings: ['common'], agents: [] },
     }],
     defaults: { shareTarget: 'primary-role' },
   }),
   resolveRoleResourceNamespaces: vi.fn(() => ({
-    knowledge: ['common'], skills: ['common'], learnings: ['common'],
+    knowledge: ['common'], skills: ['common'], learnings: ['common'], agents: [],
   })),
+}));
+
+// Isolation: pull() takes a real ~/.teamai/.sync-lock. Parallel vitest workers
+// sharing that path race and skip/error, so these tests mock the lock.
+vi.mock('../update.js', () => ({
+  acquireLock: vi.fn().mockResolvedValue(true),
+  releaseLock: vi.fn().mockResolvedValue(undefined),
 }));
 
 import { detectProjectConfig, loadLocalConfigForScope, loadTeamConfig } from '../config.js';
@@ -114,7 +122,9 @@ describe('pull with excluded skills', () => {
   it('removes a previously installed excluded skill', async () => {
     const installed = path.join(homeDir, '.claude', 'skills', 'excluded-skill');
     await fse.ensureDir(installed);
-    await fse.writeFile(path.join(installed, 'SKILL.md'), '# stale copy');
+    // Deployed copy is byte-identical to the team-repo source (a real pull copies
+    // it verbatim), so the data-safety gate lets cleanup delete it.
+    await fse.writeFile(path.join(installed, 'SKILL.md'), '---\nname: excluded-skill\ndescription: excluded\n---\n');
 
     await pull({ force: true });
 

@@ -15,12 +15,17 @@ vi.mock('../codebase.js', () => ({
     generateCodebaseMd: vi.fn().mockResolvedValue('# Codebase\n\n生成的 codebase 文档内容\n'),
 }));
 
+vi.mock('../codebase-extract.js', () => ({
+    extractCodebase: vi.fn(),
+}));
+
 vi.mock('../utils/prompt.js', () => ({
     askQuestion: vi.fn().mockResolvedValue('y'),
     askConfirmation: vi.fn().mockResolvedValue(true),
 }));
 
-vi.mock('../config.js', () => ({
+vi.mock('../config.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../config.js')>()),
     autoDetectInit: vi.fn().mockRejectedValue(new Error('no config in test')),
 }));
 
@@ -29,6 +34,7 @@ vi.mock('../config.js', () => ({
 import { importFromRepo } from '../import-repo.js';
 import { shallowClone, shallowFetch } from '../clone.js';
 import { generateCodebaseMd } from '../codebase.js';
+import { extractCodebase } from '../codebase-extract.js';
 
 // ─── Constants ──────────────────────────────────────────
 
@@ -80,6 +86,11 @@ describe('importFromRepo — incremental mode', () => {
         });
 
         vi.mocked(generateCodebaseMd).mockResolvedValue('# Codebase\n\n生成的 codebase 文档内容\n');
+        vi.mocked(extractCodebase).mockImplementation(async (opts) => {
+            const evidenceDir = path.join(opts.path!, 'teamwiki', 'evidence', 'code', opts.project!);
+            await fs.ensureDir(evidenceDir);
+            await fs.writeFile(path.join(evidenceDir, 'overview.md'), '---\ntitle: test\n---\n\n# Overview\n');
+        });
     });
 
     afterEach(async () => {
@@ -92,7 +103,6 @@ describe('importFromRepo — incremental mode', () => {
         await importFromRepo({
             url: TEST_URL,
             incremental: true,
-            interactive: false,
         });
 
         expect(shallowClone).toHaveBeenCalledTimes(1);
@@ -105,7 +115,6 @@ describe('importFromRepo — incremental mode', () => {
         await importFromRepo({
             url: TEST_URL,
             incremental: true,
-            interactive: false,
         });
 
         expect(shallowFetch).toHaveBeenCalledTimes(1);
@@ -119,7 +128,6 @@ describe('importFromRepo — incremental mode', () => {
         await importFromRepo({
             url: TEST_URL,
             incremental: true,
-            interactive: false,
         });
 
         expect(shallowFetch).toHaveBeenCalledTimes(1);
@@ -132,7 +140,6 @@ describe('importFromRepo — incremental mode', () => {
         await importFromRepo({
             url: TEST_URL,
             incremental: false,
-            interactive: false,
         });
 
         expect(shallowClone).toHaveBeenCalledTimes(1);
@@ -143,7 +150,6 @@ describe('importFromRepo — incremental mode', () => {
         await importFromRepo({
             url: TEST_URL,
             incremental: false,
-            interactive: false,
         });
 
         const lastSyncPath = path.join(workdir, 'cache', 'github', 'owner', 'testrepo', 'LAST_SYNC');

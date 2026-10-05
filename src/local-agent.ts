@@ -1,12 +1,12 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import readline from 'node:readline';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import fse from 'fs-extra';
-import YAML from 'yaml';
 import { log } from './utils/logger.js';
+import { detachChild } from './utils/exec.js';
+import { parseFrontmatter } from './utils/frontmatter.js';
 import {
   ensureDir,
   listDirs,
@@ -19,37 +19,71 @@ import {
   writeJson,
   writeJsonAtomic,
 } from './utils/fs.js';
-import { ResourceHandler } from './resources/base.js';
+import { isToolInstalledForConfig, ResourceHandler } from './resources/base.js';
 import { RulesHandler, SkillsHandler } from './resources/index.js';
 import { injectHooksToAllTools, applyAgentHook, removeAgentHook, isAgentHookSupportedTool, isAgentHookEvent, OPENCLAW_TOOLS } from './hooks.js';
 import { parseHookEvent } from './dashboard-collector.js';
+import { resolveHookCwd } from './utils/hook-cwd.js';
+import { isInteractive } from './utils/prompt.js';
 import { getAgentVersion } from './agent-version.js';
 import { getMachineId, deriveLocalAgentId } from './machine-id.js';
 import { EXCLUDED_RULE_NAMES } from './builtin-rules.js';
+import { ruleStemFromFilename } from './resources/rule-format.js';
 import { resolveTeamaiEntryScript } from './builtin-hooks.js';
 import { resolveOpenclawWorkspaceDir } from './openclaw-hooks.js';
 import { assertSafeResourceName } from './utils/path-safety.js';
+import {
+  detectMcpFormat,
+  supportsTransport,
+  renderJsonEntry,
+  renderCodexBlock,
+  entryHash,
+  MCP_SERVER_KEY,
+} from './resources/mcp-format.js';
+import {
+  readJsonDoc,
+  writeJsonDoc,
+  writeCodexAtomic,
+  spliceCodexBlock,
+  codexServerNames,
+} from './mcp-reconcile.js';
 import { normalizeAgentType } from './utils/tool-names.js';
 import { logHttpRequest, logHttpResponse } from './utils/http-log.js';
+import { injectClaudeMdSection, removeClaudeMdSection } from './utils/claudemd.js';
 import { reconcilePlugins, teardownAllPlugins, parseGetConfig, substituteVars, unresolvedPlaceholders, type ReconcileDeps, type PluginState } from './plugin-lifecycle.js';
 import {
   resolveBaseDir,
-  TEAMAI_HOME,
-  TEAMAI_TOKEN_PATH,
+  resolveToolBaseDir,
+  scopedToolPaths,
+  applyToolRoots,
+  resolveToolRootDir,
+  CLAUDE_TOOL_ID,
+  DEFAULT_CLAUDE_ROOT,
+  COPILOT_TOOL_ID,
+  getTokenPath,
   TEAMAI_CLAUDEMD_START,
   TEAMAI_CLAUDEMD_END,
   TeamaiConfigSchema,
+  managedMcpManifestPath,
+  managedMcpManifestKey,
+  managedMcpWorkspaceId,
   type DashboardEvent,
   type LocalConfig,
-  type Scope,
+  type ManagedMcpManifest,
+  type ManagedMcpRecord,
+  type McpServerDef,
+  type McpTransport,
   type TeamaiConfig,
 } from './types.js';
+import { getUserHome } from './utils/home.js';
+import { resolveAnchors } from './utils/git.js';
 
 const execFileAsync = promisify(execFile);
 
 const LOCAL_AGENT_DIR = 'local-agent';
 const CONFIG_FILE = 'config.json';
 const MANIFEST_FILE = 'manifest.json';
+const MODEL_MANIFEST_FILE = 'model-manifest.json';
 const REPORTER_ERROR_LOG = 'reporter/errors.jsonl';
 
 /**
@@ -192,6 +226,54 @@ interface LocalAgentCommand {
   event?: string;
   matcher?: string;
   timeout?: number;
+  mcp_config?: {
+    transport: string;
+    url?: string;
+    headers?: Record<string, string>;
+    command?: string;
+    args?: string[];
+    env?: Record<string, string>;
+    timeout?: number;
+    requires?: string[];
+  };
+}
+
+interface DeliveredModel {
+  provider: string;
+  model_id: string;
+  name: string;
+  base_url: string;
+  api_key: string;
+  max_tokens?: number;
+  context_window?: number;
+}
+
+interface BuddyModelManifest {
+  codebuddy?: Record<string, string>;
+  workbuddy?: Record<string, string>;
+  providersByAgent?: Record<string, Record<string, string>>;
+}
+
+interface ModelConfigManifest extends BuddyModelManifest {
+  claudeEnv?: Record<string, string>;
+  /**
+   * model_id → provider for every model this reporter has applied. Claude
+   * stores its gateway as plain ANTHROPIC_* env vars that carry no provider,
+   * so this is the only way to report back the provider the server sent.
+   */
+  providers?: Record<string, string>;
+  workspaceModels?: Record<string, BuddyModelManifest>;
+}
+
+type ModelAgentKind = 'codebuddy' | 'workbuddy' | 'claude';
+type BuddyAgentKind = 'codebuddy' | 'workbuddy';
+
+function modelAgentKind(tool: string | undefined): ModelAgentKind | undefined {
+  const normalized = normalizeAgentType(tool ?? '');
+  if (normalized === 'codebuddy' || normalized === 'codebuddy-internal') return 'codebuddy';
+  if (normalized === 'workbuddy') return 'workbuddy';
+  if (normalized === 'claude') return 'claude';
+  return undefined;
 }
 
 /**
@@ -215,7 +297,7 @@ interface LocalAgentContext {
 }
 
 function getTeamaiHomePath(): string {
-  return path.join(process.env.HOME ?? '', '.teamai');
+  return path.join(getUserHome(), '.teamai');
 }
 
 function getLocalAgentHome(): string {
@@ -228,6 +310,10 @@ function getConfigPath(): string {
 
 function getManifestPath(): string {
   return path.join(getLocalAgentHome(), MANIFEST_FILE);
+}
+
+function getModelManifestPath(): string {
+  return path.join(getLocalAgentHome(), MODEL_MANIFEST_FILE);
 }
 
 function getErrorLogPath(): string {
@@ -278,7 +364,7 @@ export function resolveRoute(config: Pick<LocalAgentConfig, 'routes'>, name: Rou
  * Note: install_path only feeds the local hash — it never leaves the machine.
  */
 function resolveAgentInstallPath(agentType: string): string {
-  const home = process.env.HOME ?? '';
+  const home = getUserHome();
   const skillsRel = createLocalAgentTeamConfig('').toolPaths[agentType]?.skills;
   const rel = skillsRel ? path.dirname(skillsRel) : `.${agentType}`;
   return path.join(home, rel);
@@ -376,13 +462,33 @@ async function saveAgentHookManifest(manifest: AgentHookManifest): Promise<void>
   await writeJsonAtomic(getAgentHookManifestPath(), manifest);
 }
 
+/**
+ * The member's per-machine tool roots, from the teamai config that governs this
+ * directory: the project one when there is one, else the user-scope one.
+ *
+ * The local agent carries no LocalConfig — it addresses tool roots under $HOME
+ * directly — but it writes the same files `teamai pull` does, so a root the
+ * member relocated (CLAUDE_CONFIG_DIR, recorded by `teamai init`) has to reach
+ * them too. No config, or no entry, leaves the paths exactly as they were.
+ */
+async function memberToolRoots(workspacePath?: string): Promise<Record<string, string> | undefined> {
+  const { resolveMemberToolRoots } = await import('./config.js');
+  return resolveMemberToolRoots(workspacePath ?? process.cwd());
+}
+
+/** Claude Code's user root on this machine, honoring a relocated CLAUDE_CONFIG_DIR. */
+async function claudeUserRoot(): Promise<string> {
+  return resolveToolRootDir(CLAUDE_TOOL_ID, DEFAULT_CLAUDE_ROOT, await memberToolRoots());
+}
+
 /** Resolve the current tool's settings file absolute path (user scope, $HOME base). */
-function resolveToolSettingsPath(config: LocalAgentConfig, tool: string): string {
-  const toolPath = createLocalAgentTeamConfig(config.endpoint).toolPaths[tool];
+async function resolveToolSettingsPath(config: LocalAgentConfig, tool: string): Promise<string> {
+  const teamConfig = createLocalAgentTeamConfig(config.endpoint);
+  const toolPath = applyToolRoots(teamConfig.toolPaths, await memberToolRoots())[tool];
   if (!toolPath?.settings) {
     throw new Error(`unsupported tool: ${tool} (no settings path)`);
   }
-  return path.join(process.env.HOME ?? '', toolPath.settings);
+  return path.join(getUserHome(), toolPath.settings);
 }
 
 function getPluginStatePath(): string {
@@ -484,9 +590,22 @@ export async function loadLocalAgentConfig(): Promise<LocalAgentConfig | null> {
       workspaceBindings: fileConfig.workspaceBindings ?? {},
     };
     // Migrate: clear legacy group-based bindings (groupId without projectId)
+    const removedLegacyPaths: string[] = [];
     for (const [wsPath, binding] of Object.entries(config.workspaceBindings)) {
       if ('groupId' in binding && !('projectId' in (binding as Record<string, unknown>))) {
         delete config.workspaceBindings[wsPath];
+        removedLegacyPaths.push(wsPath);
+      }
+    }
+    if (removedLegacyPaths.length > 0) {
+      log.warn(
+        `Removed ${removedLegacyPaths.length} legacy group-based workspace binding(s); ` +
+          `you will be prompted to re-bind on the next session.`,
+      );
+      try {
+        await saveLocalAgentConfig(config);
+      } catch (e) {
+        log.debug(`local-agent: failed to persist binding cleanup: ${(e as Error).message}`);
       }
     }
     // Migrate: canonicalize binding keys to their physical on-disk path so
@@ -504,6 +623,29 @@ export async function loadLocalAgentConfig(): Promise<LocalAgentConfig | null> {
       await saveLocalAgentConfig(config);
     }
     return config;
+  }
+
+  // Backfill: if config.json is missing but a legacy ~/.teamai/config.yaml has
+  // an HTTP team repo, auto-create config.json so v0.17.x upgraders keep capability.
+  const { loadLocalConfig } = await import('./config.js');
+  const { resolveApiKey } = await import('./api-key.js');
+  const legacy = await loadLocalConfig();
+  if (legacy?.repo?.kind === 'http' && legacy.repo.url) {
+    const endpoint = normalizeEndpoint(legacy.repo.url);
+    const token = resolveApiKey() ?? undefined;
+    const backfilled: LocalAgentConfig = {
+      endpoint,
+      token,
+      createdAt: new Date().toISOString(),
+      workspaceBindings: {},
+    };
+    try {
+      await saveLocalAgentConfig(backfilled);
+      log.debug('local-agent: backfilled config.json from legacy ~/.teamai/config.yaml (http repo)');
+    } catch (e) {
+      log.debug(`local-agent: backfill persist failed, using in-memory config: ${(e as Error).message}`);
+    }
+    return backfilled;
   }
 
   const envEndpoint =
@@ -536,12 +678,12 @@ function createLocalAgentTeamConfig(endpoint: string): TeamaiConfig {
   });
 }
 
-function createResourceLocalConfig(
+async function createResourceLocalConfig(
   config: LocalAgentConfig,
   scope: LocalAgentScope,
   repoPath: string,
   workspacePath?: string,
-): LocalConfig {
+): Promise<LocalConfig> {
   const projectScope = scope === 'project';
   return {
     repo: { localPath: repoPath, remote: config.endpoint },
@@ -549,12 +691,23 @@ function createResourceLocalConfig(
     scope: projectScope ? 'project' : 'user',
     projectRoot: projectScope ? workspacePath : undefined,
     additionalRoles: [],
+    // User-scope paths resolve under $HOME here, so a tool the member relocated
+    // must be addressed at its recorded root — the same one `teamai pull` uses.
+    ...(projectScope ? {} : { toolRoots: await memberToolRoots(workspacePath) }),
   };
 }
 
-function getResourceRepoPath(scope: LocalAgentScope, workspacePath?: string): string {
+async function getResourceRepoPath(scope: LocalAgentScope, workspacePath?: string): Promise<string> {
   if (scope === 'project' && workspacePath) {
-    return path.join(workspacePath, '.teamai', LOCAL_AGENT_DIR, 'resources');
+    // Project resource cache is A1 (per-project) AND per-worktree: the resource
+    // cache (claudemd/skills/rules fragments) is what each worktree installs
+    // independently, and syncClaudemd merges EVERY file in this dir. The partition
+    // data home is shared by all linked worktrees, so the cache must live in a
+    // per-worktree subdir — otherwise worktree B's CLAUDE.md would merge in
+    // worktree A's instructions. Mirror managed-mcp's per-worktree layout.
+    const { resolveDataHomeForScope } = await import('./config.js');
+    const dataHome = await resolveDataHomeForScope('project', workspacePath);
+    return path.join(dataHome, 'workspaces', managedMcpWorkspaceId(workspacePath), LOCAL_AGENT_DIR, 'resources');
   }
   return path.join(getLocalAgentHome(), 'resources', scope);
 }
@@ -594,7 +747,7 @@ async function localAgentFetch<T>(
   const url = `${config.endpoint}${resolveRoute(config, route)}`;
   const headers: Record<string, string> = {
     ...authHeaders(config, init?.body !== undefined),
-    ...((init?.headers as Record<string, string> | undefined) ?? {}),
+    ...(init?.headers as Record<string, string> | undefined),
   };
   logHttpRequest(tag, method, url, headers, init?.body);
 
@@ -652,7 +805,7 @@ function redactSecrets(s: string): string {
   return s
     .replace(new RegExp(`(--(?:${names})[= ]+)\\S+`, 'gi'), '$1***')
     .replace(new RegExp(`((?:${names})"?\\s*[:=]\\s*"?)[^"\\s,}]+`, 'gi'), '$1***')
-    .replace(/(bearer\s+)[\w.\-]+/gi, '$1***');
+    .replace(/(bearer\s+)[\w.-]+/gi, '$1***');
 }
 
 /**
@@ -663,30 +816,21 @@ function redactSecrets(s: string): string {
  * emit 'close', producing a false timeout even though the command itself finished.
  * Rejects on non-zero exit, termination by signal, or timeout.
  */
-async function execPluginCommand(cmd: string, timeoutMs: number): Promise<void> {
+export async function execPluginCommand(cmd: string, timeoutMs: number): Promise<void> {
   const { spawn } = await import('node:child_process');
   await new Promise<void>((resolve, reject) => {
     const child = process.platform === 'win32'
       ? spawn('cmd', ['/c', cmd], { windowsHide: true, stdio: ['ignore', 'ignore', 'pipe'] })
-      : spawn('/bin/sh', ['-lc', cmd], { stdio: ['ignore', 'ignore', 'pipe'] });
+      : spawn('bash', ['-lc', cmd], { stdio: ['ignore', 'ignore', 'pipe'] });
     let stderr = '';
     let settled = false;
     let timer: ReturnType<typeof setTimeout>;
     child.stderr?.on('data', (d) => { stderr += d.toString(); if (stderr.length > 8192) stderr = stderr.slice(-8192); });
-    const detachStderr = (): void => {
-      // Drain and unref the stderr pipe without closing it: a daemonized child may still hold
-      // the write end, and closing our read end would send it SIGPIPE. Unref-ing lets this
-      // worker process exit without waiting on — or killing — the daemon.
-      child.stderr?.removeAllListeners('data');
-      child.stderr?.resume();
-      (child.stderr as unknown as { unref?: () => void } | undefined)?.unref?.();
-    };
     const finish = (fn: () => void): void => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      detachStderr();
-      child.unref();
+      detachChild(child);
       fn();
     };
     timer = setTimeout(() => {
@@ -751,7 +895,7 @@ async function maybeReconcilePlugins(context: LocalAgentContext): Promise<void> 
     const { spawn } = await import('node:child_process');
     if (!process.argv[1]) { log.debug('[local-agent] plugin reconcile: no CLI entrypoint (argv[1]), skipping'); return; }
     const child = spawn(process.execPath, [process.argv[1], 'source', 'reconcile-plugins'],
-      { detached: true, stdio: 'ignore', env: { ...process.env, TEAMAI_PLUGIN_LOCAL_AGENT_ID: localAgentId } });
+      { detached: true, windowsHide: true, stdio: 'ignore', env: { ...process.env, TEAMAI_PLUGIN_LOCAL_AGENT_ID: localAgentId } });
     child.unref();
   } catch (e) { log.debug(`[local-agent] plugin reconcile spawn skipped: ${(e as Error).message}`); }
 }
@@ -827,33 +971,18 @@ export async function runPluginReconcileWorker(): Promise<void> {
 }
 
 async function askViaTty(prompt: string): Promise<string | null> {
-  if (process.stdin.isTTY) {
-    const { askQuestion } = await import('./utils/prompt.js');
-    return askQuestion(prompt, '');
-  }
-
-  if (process.platform === 'win32') return null;
-
-  let fd: number | null = null;
-  let input: fs.ReadStream | null = null;
-  let output: fs.WriteStream | null = null;
-  let rl: readline.Interface | null = null;
-  try {
-    fd = fs.openSync('/dev/tty', 'r+');
-    input = fs.createReadStream('', { fd, autoClose: false });
-    output = fs.createWriteStream('', { fd, autoClose: false });
-    rl = readline.createInterface({ input, output });
-    return await new Promise<string>((resolve) => {
-      rl!.question(prompt, (answer) => resolve(answer.trim()));
-    });
-  } catch {
-    return null;
-  } finally {
-    rl?.close();
-    input?.destroy();
-    output?.destroy();
-    if (fd !== null) try { fs.closeSync(fd); } catch {}
-  }
+  // Only prompt on a real interactive terminal (e.g. the user running
+  // `teamai bind-project` directly). In non-interactive contexts such as an
+  // IDE-invoked hook, stdin is piped; opening /dev/tty there succeeds when the
+  // host GUI keeps a controlling terminal, and readline then blocks forever
+  // waiting for input that never comes — hanging the hook until the host's
+  // timeout and stalling the IDE. Callers fall back to injecting a stdout
+  // binding hint when this returns null, so degrade to that instead.
+  // The decline stays synchronous — this runs on the hook path, where loading
+  // the prompt module only to say no is work nobody asked for.
+  if (!isInteractive()) return null;
+  const { askQuestion } = await import('./utils/prompt.js');
+  return askQuestion(prompt, '');
 }
 
 async function promptForProjectBinding(
@@ -881,6 +1010,71 @@ async function promptForProjectBinding(
   return projects[index - 1];
 }
 
+/**
+ * Persist a ClawPro binding decision for the current checkout.
+ *
+ * Binding is a per-project decision, so it is recorded on the `projectAnchor`
+ * (the main checkout, shared by a repo and all of its git worktrees — issue
+ * #374 / #387). It is ALSO stamped on the current `workspaceRoot` so this
+ * checkout is reported with the project_id immediately and its resources land
+ * in the current worktree (#387's workspaceRoot model — every AI tool discovers
+ * resources by scanning up from the launch dir, never via git-common-dir). For a
+ * plain repo the two anchors coincide and this writes a single entry. Falls back
+ * to `resolvedPath` when `cwd` is not inside a git repo.
+ *
+ * Existing fields (e.g. a stamped `ideType`) on any touched entry are preserved.
+ */
+async function persistWorkspaceBinding(
+  config: LocalAgentConfig,
+  cwd: string | undefined,
+  resolvedPath: string,
+  projectId: number,
+  projectName: string,
+): Promise<void> {
+  const anchors = await resolveAnchors(cwd);
+  const keys = new Set<string>([resolvedPath]);
+  if (anchors) {
+    keys.add(anchors.projectAnchor);
+    keys.add(anchors.workspaceRoot);
+  }
+  const boundAt = new Date().toISOString();
+  for (const key of keys) {
+    config.workspaceBindings[key] = {
+      ...config.workspaceBindings[key],
+      projectId,
+      projectName,
+      boundAt,
+    };
+  }
+  await saveLocalAgentConfig(config);
+}
+
+/**
+ * If the current checkout is an unbound git worktree whose main checkout
+ * (`projectAnchor`) is already bound or skipped, copy that decision onto the
+ * current `workspaceRoot` and report success — so a repo is never re-prompted
+ * for binding once per new worktree (a `--skip` on the main checkout silences
+ * all of them too). Returns true when the worktree inherited a binding.
+ */
+async function inheritWorktreeBinding(
+  config: LocalAgentConfig,
+  cwd: string | undefined,
+  resolvedPath: string,
+): Promise<boolean> {
+  const anchors = await resolveAnchors(cwd);
+  if (!anchors || anchors.projectAnchor === anchors.workspaceRoot) return false;
+  const anchorBinding = config.workspaceBindings[anchors.projectAnchor];
+  if (!anchorBinding) return false;
+  config.workspaceBindings[resolvedPath] = {
+    ...config.workspaceBindings[resolvedPath],
+    projectId: anchorBinding.projectId,
+    projectName: anchorBinding.projectName,
+    boundAt: new Date().toISOString(),
+  };
+  await saveLocalAgentConfig(config);
+  return true;
+}
+
 export async function bindWorkspaceToProject(
   workspacePath: string,
   projectId?: number,
@@ -901,8 +1095,9 @@ export async function bindWorkspaceToProject(
     projectName: project.name,
     boundAt: new Date().toISOString(),
   };
-  config.workspaceBindings[workspacePath] = binding;
-  await saveLocalAgentConfig(config);
+  // Record on the projectAnchor (shared across the repo's worktrees) and the
+  // current workspaceRoot; workspacePath is already the resolved checkout root.
+  await persistWorkspaceBinding(config, workspacePath, workspacePath, project.id, project.name);
   log.success(`已将工作区绑定到项目：${project.name} [id=${project.id}]`);
   return binding;
 }
@@ -911,8 +1106,11 @@ async function ensureWorkspaceBinding(
   config: LocalAgentConfig,
   workspacePath: string,
   sessionId?: string,
+  cwd?: string,
 ): Promise<void> {
   if (config.workspaceBindings[workspacePath]) return;
+  // A worktree inherits its main checkout's binding/skip decision — never prompt.
+  if (await inheritWorktreeBinding(config, cwd, workspacePath)) return;
 
   const markerKey = sessionId || `ppid-${process.ppid}`;
   const hintMarker = path.join(os.tmpdir(), `teamai-bind-session-${markerKey}`);
@@ -931,12 +1129,7 @@ async function ensureWorkspaceBinding(
 
   const project = await promptForProjectBinding(workspacePath, projects);
   if (project) {
-    config.workspaceBindings[workspacePath] = {
-      projectId: project.id,
-      projectName: project.name,
-      boundAt: new Date().toISOString(),
-    };
-    await saveLocalAgentConfig(config);
+    await persistWorkspaceBinding(config, cwd, workspacePath, project.id, project.name);
     return;
   }
 
@@ -970,12 +1163,28 @@ function isBindPromptEnabled(): boolean {
   return normalized !== '0' && normalized !== 'false';
 }
 
+/**
+ * ClawPro project binding only backs CodeBuddy/WorkBuddy (the ClawPro-native
+ * agents); the prompt is noise for every other host (Claude, Cursor, Codex, …),
+ * which drove the poor UX. Gate the whole prompt — both the SessionStart TTY
+ * prompt and the UserPromptSubmit hint — on the current tool being a buddy
+ * agent. Reuses `modelAgentKind` so tool-name variants like `codebuddy-internal`
+ * still match (a raw Set would miss them).
+ */
+function isBindPromptTool(tool: string | undefined): boolean {
+  const kind = modelAgentKind(tool);
+  return kind === 'codebuddy' || kind === 'workbuddy';
+}
+
 async function emitBindingHint(
   config: LocalAgentConfig,
   workspacePath: string,
   sessionId?: string,
+  cwd?: string,
 ): Promise<void> {
   if (config.workspaceBindings[workspacePath]) return;
+  // A worktree inherits its main checkout's binding/skip decision — never hint.
+  if (await inheritWorktreeBinding(config, cwd, workspacePath)) return;
 
   // Only hint once per session — use a temp marker file keyed by sessionId
   const markerKey = sessionId || `ppid-${process.ppid}`;
@@ -1091,10 +1300,16 @@ async function scanRulesFromDisk(
   manifestSlugs: Set<string>,
 ): Promise<ReportedResource[]> {
   if (!(await pathExists(rulesDir))) return [];
-  const files = (await listFilesRecursive(rulesDir)).filter((f) => f.endsWith('.md'));
+  // Cursor stores rules as `.mdc`, every other tool as `.md`; match by stem so
+  // a Cursor agent still reports its installed rules.
+  const files = await listFilesRecursive(rulesDir);
   const results: ReportedResource[] = [];
+  const seen = new Set<string>();
   for (const file of files) {
-    const slug = file.replace(/\.md$/, '');
+    const slug = ruleStemFromFilename(file);
+    if (slug === null) continue;
+    if (seen.has(slug)) continue; // Same rule under both extensions
+    seen.add(slug);
     // Skip CLI built-in / legacy rules (e.g. teamai-recall) so they are not
     // reported as user-installed resources — mirrors the pull/uninstall filter.
     if (EXCLUDED_RULE_NAMES.has(path.basename(slug)) || EXCLUDED_RULE_NAMES.has(slug)) continue;
@@ -1123,6 +1338,148 @@ function collectManifestSlugs(manifest: LocalAgentManifest): { skills: Set<strin
     for (const slug of Object.keys(scope.rules ?? {})) rules.add(slug);
   }
   return { skills, rules };
+}
+
+/**
+ * Scan the managed-mcp manifest for a given scope and return MCP servers as
+ * ReportedResource entries. Only servers tracked in managed-mcp.json (i.e.
+ * installed via HTTP distribution) are reported with source = 'enterprise'.
+ *
+ * Results are scoped to the current `tool` so a report never leaks another
+ * tool's MCP inventory. The manifest is keyed by the same key the installer
+ * writes under (see `installMcpServer`): `tool` at user scope, `${tool}:project`
+ * at project scope. `tool` is the raw hook-context value (not run through
+ * normalizeAgentType), matching how the installer keys the manifest.
+ */
+async function scanMcpFromManifest(
+  scope: 'user' | 'project',
+  tool: string,
+  projectRoot?: string,
+): Promise<ReportedResource[]> {
+  const { resolveDataHomeForScope } = await import('./config.js');
+  const dataHome = await resolveDataHomeForScope(scope, projectRoot);
+
+  // Project scope reads THIS worktree's own manifest file (per-worktree under the
+  // partition; migrates legacy shared records on first read). User scope reads the
+  // single global file. Either way every record in the loaded file belongs to this
+  // scope, so no key filtering is needed.
+  let manifest: ManagedMcpManifest;
+  if (scope === 'project' && projectRoot) {
+    const { loadProjectMcpManifest } = await import('./utils/mcp-manifest.js');
+    ({ manifest } = await loadProjectMcpManifest(dataHome, projectRoot));
+  } else {
+    manifest = (await readJson<ManagedMcpManifest>(managedMcpManifestPath(dataHome))) ?? {};
+  }
+
+  const manifestKey = `${tool}${scope === 'project' ? ':project' : ''}`;
+  const records = manifest[manifestKey];
+  if (!Array.isArray(records)) return [];
+
+  const seen = new Set<string>();
+  const results: ReportedResource[] = [];
+  for (const rec of records) {
+    if (!rec.name || seen.has(rec.name)) continue;
+    seen.add(rec.name);
+    results.push({ slug: rec.name, source: 'enterprise' });
+  }
+  return results.sort((a, b) => a.slug.localeCompare(b.slug));
+}
+
+interface ReportedModel {
+  provider: string;
+  model_id: string;
+  name?: string;
+  source: string;
+}
+
+/**
+ * Scan the models a tool can currently use, as configured on disk. The server
+ * requires both `provider` and `model_id`, so entries that cannot supply them
+ * are dropped rather than reported as incomplete. `source` is derived from the
+ * model manifest, mirroring how skills/rules classify enterprise vs local.
+ *
+ * Only CodeBuddy, WorkBuddy, and Claude keep a discoverable model config;
+ * every other tool reports nothing. User-owned models are omitted: the
+ * backend cannot resolve them, so only entries still matching a TeamAI
+ * delivery are reported.
+ */
+function buddyModelsPath(agentKind: BuddyAgentKind, workspacePath?: string): string {
+  return workspacePath
+    ? path.join(workspacePath, '.codebuddy', 'models.json')
+    : path.join(getUserHome(), `.${agentKind}`, 'models.json');
+}
+
+function modelConfigDisplayPath(filePath: string): string {
+  if (filePath.endsWith(`${path.sep}.codebuddy${path.sep}models.json`)) {
+    return '.codebuddy/models.json';
+  }
+  if (filePath.endsWith(`${path.sep}.workbuddy${path.sep}models.json`)) {
+    return '~/.workbuddy/models.json';
+  }
+  return path.basename(filePath);
+}
+
+async function scanModelsFromDisk(tool: string, workspacePath?: string): Promise<ReportedModel[]> {
+  const manifest = (await readJson<ModelConfigManifest>(getModelManifestPath())) ?? {};
+  const agentKind = modelAgentKind(tool);
+
+  if (agentKind === 'codebuddy' || agentKind === 'workbuddy') {
+    const scopeManifest = workspacePath ? manifest.workspaceModels?.[workspacePath] : manifest;
+    const providers = scopeManifest?.providersByAgent?.[agentKind]
+      ?? (!workspacePath && agentKind !== 'workbuddy' ? manifest.providers : undefined)
+      ?? {};
+    const raw = await readJson<unknown>(buddyModelsPath(agentKind, workspacePath));
+    const entries = Array.isArray(raw)
+      ? raw
+      : (Array.isArray((raw as { models?: unknown } | null)?.models)
+        ? (raw as { models: unknown[] }).models
+        : []);
+    const owned = (agentKind === 'codebuddy'
+      ? scopeManifest?.codebuddy
+      : scopeManifest?.workbuddy) ?? {};
+    const results: ReportedModel[] = [];
+    for (const entry of entries) {
+      if (typeof entry !== 'object' || entry === null) continue;
+      const { id, vendor, name } = entry as Record<string, unknown>;
+      if (typeof id !== 'string' || !id) continue;
+      if (typeof vendor !== 'string' || !vendor) continue;
+      // CodeBuddy / WorkBuddy may normalize a model entry by adding capability
+      // metadata. The manifest's model id is the durable proof that TeamAI
+      // delivered it; requiring an exact object hash would hide such entries.
+      if (owned[id] === undefined || providers[id] !== vendor) continue;
+      results.push({
+        provider: vendor,
+        model_id: id,
+        ...(typeof name === 'string' && name ? { name } : {}),
+        source: 'enterprise',
+      });
+    }
+    return results;
+  }
+
+  if (agentKind === 'claude' && !workspacePath) {
+    const providers = manifest.providersByAgent?.claude ?? manifest.providers ?? {};
+    const settings = await readJson<{ env?: unknown }>(
+      path.join(await claudeUserRoot(), 'settings.json'),
+    );
+    const env = settings?.env;
+    if (typeof env !== 'object' || env === null || Array.isArray(env)) return [];
+    const { ANTHROPIC_CUSTOM_MODEL_OPTION: modelId, ANTHROPIC_CUSTOM_MODEL_OPTION_NAME: name } =
+      env as Record<string, unknown>;
+    if (typeof modelId !== 'string' || !modelId) return [];
+    const managed = manifest.claudeEnv?.ANTHROPIC_CUSTOM_MODEL_OPTION;
+    if (managed === undefined || entryHash(modelId) !== managed) return [];
+    const provider = providers[modelId];
+    if (!provider) return [];
+    return [{
+      provider,
+      model_id: modelId,
+      ...(typeof name === 'string' && name ? { name } : {}),
+      source: 'enterprise',
+    }];
+  }
+
+  return [];
 }
 
 /**
@@ -1214,12 +1571,21 @@ export async function buildReportPayload(
   // ones) are reported. `source` is derived from the manifest: slugs recorded
   // there are `enterprise`, the rest `local`.
   const tool = context.tool ?? 'workbuddy';
-  const toolPaths = createLocalAgentTeamConfig(config.endpoint).toolPaths;
-  const toolPath = toolPaths[tool];
+  const teamConfig = createLocalAgentTeamConfig(config.endpoint);
   const manifestSlugs = collectManifestSlugs(manifest);
 
-  const scanScope = async (baseDir: string): Promise<{ skills: ReportedResource[]; rules: ReportedResource[] }> => {
+  // Resolve paths through the same user-scope seam the installers use: tools
+  // that relocate their user customization root (copilot via $COPILOT_HOME) or
+  // lay user scope out differently from project scope declare a `userScope`
+  // block. Reading the raw toolPaths map against $HOME would scan the project
+  // layout under the wrong base — e.g. ~/.github/skills for copilot, a path
+  // teamai never writes to — and silently report nothing.
+  const scanScope = async (workspacePath?: string): Promise<{ skills: ReportedResource[]; rules: ReportedResource[] }> => {
+    const scope: LocalAgentScope = workspacePath ? 'project' : 'user';
+    const localConfig = await createResourceLocalConfig(config, scope, workspacePath ?? getUserHome(), workspacePath);
+    const toolPath = scopedToolPaths(teamConfig, localConfig)[tool];
     if (!toolPath) return { skills: [], rules: [] };
+    const baseDir = resolveToolBaseDir(tool, localConfig);
     const skills = toolPath.skills
       ? await scanSkillsFromDisk(path.join(baseDir, toolPath.skills), manifestSlugs.skills)
       : [];
@@ -1229,11 +1595,17 @@ export async function buildReportPayload(
     return { skills, rules };
   };
 
-  const userScope = await scanScope(process.env.HOME ?? '');
+  const userScope = await scanScope();
 
   const userLevel: Record<string, unknown> = { group_id: config.userGroupId };
   if (userScope.skills.length > 0) userLevel.skills = userScope.skills;
   if (userScope.rules.length > 0) userLevel.rules = userScope.rules;
+  const userMcps = await scanMcpFromManifest('user', tool);
+  if (userMcps.length > 0) userLevel.mcps = userMcps;
+  // Omitted when empty for the same full-sync reason as skills/rules: the
+  // server treats a present array as a snapshot, so [] would wipe the models.
+  const userModels = await scanModelsFromDisk(tool);
+  if (userModels.length > 0) userLevel.models = userModels;
 
   const payload: Record<string, unknown> = {
     agent_type: normalizeAgentType(tool),
@@ -1266,6 +1638,10 @@ export async function buildReportPayload(
         };
         if (wsScope.skills.length > 0) workspace.skills = wsScope.skills;
         if (wsScope.rules.length > 0) workspace.rules = wsScope.rules;
+        const wsMcps = await scanMcpFromManifest('project', tool, wsPath);
+        if (wsMcps.length > 0) workspace.mcps = wsMcps;
+        const wsModels = await scanModelsFromDisk(tool, wsPath);
+        if (wsModels.length > 0) workspace.models = wsModels;
         return workspace;
       }),
     );
@@ -1502,14 +1878,7 @@ async function findMarkdownFile(extractDir: string, preferredName: string): Prom
 async function readFrontmatter(filePath: string): Promise<Record<string, unknown>> {
   const content = await readFileSafe(filePath);
   if (!content) return {};
-  const match = content.match(/^---\n([\s\S]*?)\n---/);
-  if (!match) return {};
-  try {
-    const parsed = YAML.parse(match[1]);
-    return parsed && typeof parsed === 'object' ? parsed as Record<string, unknown> : {};
-  } catch {
-    return {};
-  }
+  return parseFrontmatter(content).data;
 }
 
 /**
@@ -1545,8 +1914,12 @@ async function installDownloadedResource(input: {
     throw new Error(`Missing download_url for ${input.command.type ?? 'install_skill'}`);
   }
 
-  const repoPath = getResourceRepoPath(input.scope, input.workspacePath);
-  if (input.scope === 'project' && input.workspacePath) {
+  const repoPath = await getResourceRepoPath(input.scope, input.workspacePath);
+  if (input.scope === 'project' && input.workspacePath
+      && repoPath.startsWith(path.join(input.workspacePath, '.teamai') + path.sep)) {
+    // Only gitignore when the cache actually lands inside the workspace (a legacy,
+    // un-migrated install). A partitioned install keeps it under ~/.teamai, so
+    // there is nothing in the workspace to ignore.
     await ensureProjectGitignore(input.workspacePath);
   }
   await ensureDir(repoPath);
@@ -1560,7 +1933,7 @@ async function installDownloadedResource(input: {
       throw new Error(`Unknown tool "${tool}": no toolPaths entry found`);
     }
     const teamConfig = { ...fullTeamConfig, toolPaths: { [tool]: toolPath } };
-    const localConfig = createResourceLocalConfig(input.config, input.scope, repoPath, input.workspacePath);
+    const localConfig = await createResourceLocalConfig(input.config, input.scope, repoPath, input.workspacePath);
     // Ensure the tool root directory exists before dispatch so isToolInstalled
     // gate does not skip the resource when the workspace is freshly bound.
     // Restricted to project scope: user-scope installs use $HOME as baseDir and
@@ -1649,7 +2022,7 @@ async function uninstallResource(input: {
   workspacePath?: string;
   tool?: string;
 }): Promise<void> {
-  const repoPath = getResourceRepoPath(input.scope, input.workspacePath);
+  const repoPath = await getResourceRepoPath(input.scope, input.workspacePath);
   const fullTeamConfig = createLocalAgentTeamConfig(input.config.endpoint);
   const tool = input.tool ?? 'workbuddy';
   const toolPath = fullTeamConfig.toolPaths[tool];
@@ -1657,7 +2030,7 @@ async function uninstallResource(input: {
     throw new Error(`Unknown tool "${tool}": no toolPaths entry found`);
   }
   const teamConfig = { ...fullTeamConfig, toolPaths: { [tool]: toolPath } };
-  const localConfig = createResourceLocalConfig(input.config, input.scope, repoPath, input.workspacePath);
+  const localConfig = await createResourceLocalConfig(input.config, input.scope, repoPath, input.workspacePath);
   const manifest = await loadManifest();
   const scopeManifest = getManifestScope(manifest, input.scope, input.workspacePath);
 
@@ -1713,14 +2086,10 @@ async function syncClaudemd(
   const block = compileClaudemdBlock(contents);
   let syncedAny = false;
 
-  const defaultBaseDir = localConfig.scope === 'project' && localConfig.projectRoot
-    ? localConfig.projectRoot
-    : process.env.HOME ?? '';
-
-  for (const [tool, toolPath] of Object.entries(teamConfig.toolPaths)) {
+  for (const [tool, toolPath] of Object.entries(scopedToolPaths(teamConfig, localConfig))) {
     if (!toolPath.claudemd) continue;
 
-    let baseDir = defaultBaseDir;
+    let baseDir = resolveToolBaseDir(tool, localConfig);
     let resolvedAbsPath: string | null = null;
 
     if (tool === 'openclaw' && localConfig.scope !== 'project') {
@@ -1738,6 +2107,8 @@ async function syncClaudemd(
 
     const toolInstalled = resolvedAbsPath
       ? await pathExists(resolvedAbsPath)
+      : tool === COPILOT_TOOL_ID && localConfig.scope === 'user'
+        ? await isToolInstalledForConfig(tool, toolPath.claudemd, localConfig)
       : toolPath.claudemd.includes('/')
         ? await ResourceHandler.isToolInstalled(toolPath.claudemd, baseDir)
         : await pathExists(path.join(baseDir, `.${tool}`));
@@ -1748,7 +2119,6 @@ async function syncClaudemd(
 
     const claudeMdPath = resolvedAbsPath ?? path.join(baseDir, toolPath.claudemd);
     try {
-      const { injectClaudeMdSection } = await import('./utils/claudemd.js');
       if (block) {
         await injectClaudeMdSection(claudeMdPath, TEAMAI_CLAUDEMD_START, TEAMAI_CLAUDEMD_END, block);
         log.debug(`local-agent: synced CLAUDE.md instructions to ${tool}`);
@@ -1766,21 +2136,6 @@ async function syncClaudemd(
   if (files.length > 0 && !syncedAny) {
     throw new Error('CLAUDE.md sync landed on no tool: every configured target was skipped');
   }
-}
-
-async function removeClaudeMdSection(
-  filePath: string,
-  startMarker: string,
-  endMarker: string,
-): Promise<void> {
-  const existing = await readFileSafe(filePath);
-  if (!existing) return;
-  const startIdx = existing.indexOf(startMarker);
-  const endIdx = existing.indexOf(endMarker);
-  if (startIdx === -1 || endIdx === -1 || endIdx < startIdx) return;
-  const before = existing.substring(0, startIdx).replace(/\n+$/, '\n');
-  const after = existing.substring(endIdx + endMarker.length).replace(/^\n+/, '\n');
-  await writeFile(filePath, (before + after).trimEnd() + '\n');
 }
 
 async function ackCommand(
@@ -1801,6 +2156,417 @@ async function ackCommand(
       version,
     }),
   });
+}
+
+function requireModelString(
+  value: unknown,
+  field: keyof Pick<DeliveredModel, 'provider' | 'model_id' | 'name' | 'base_url' | 'api_key'>,
+): string {
+  if (typeof value !== 'string' || !value.trim()) {
+    throw new Error(`apply_model_config: ${field} must be a non-empty string`);
+  }
+  return value.trim();
+}
+
+/** CodeBuddy maxOutputTokens when the backend omits max_tokens or sends 0 (Go zero value). */
+const DEFAULT_MAX_TOKENS = 4096;
+
+function optionalPositiveInteger(value: unknown, field: 'max_tokens' | 'context_window'): number | undefined {
+  if (value === undefined || value === null || value === '') return undefined;
+  const normalized = typeof value === 'string' && /^\d+$/.test(value)
+    ? Number(value)
+    : value;
+  if (!Number.isSafeInteger(normalized) || (normalized as number) < 0) {
+    throw new Error(`apply_model_config: ${field} must be a positive integer`);
+  }
+  // 0 is the Go zero value for an unset int, not a real output/context cap.
+  if ((normalized as number) === 0) return undefined;
+  return normalized as number;
+}
+
+function parseDeliveredModels(raw: string | undefined): { models: DeliveredModel[]; fullSnapshot: boolean } {
+  if (!raw) throw new Error('apply_model_config: missing cmd');
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error('apply_model_config: cmd must be valid JSON');
+  }
+  const fullSnapshot = (
+    typeof parsed === 'object' &&
+    parsed !== null &&
+    'models' in parsed
+  );
+  const values = fullSnapshot ? (parsed as { models?: unknown }).models : [parsed];
+  if (!Array.isArray(values)) {
+    throw new Error('apply_model_config: models must be an array');
+  }
+
+  const seen = new Set<string>();
+  const models = values.map((value) => {
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+      throw new Error('apply_model_config: each model must be an object');
+    }
+    const input = value as Record<string, unknown>;
+    const modelId = requireModelString(input.model_id, 'model_id');
+    if (modelId === '__proto__' || modelId === 'prototype' || modelId === 'constructor') {
+      throw new Error(`apply_model_config: reserved model_id "${modelId}"`);
+    }
+    const model: DeliveredModel = {
+      provider: requireModelString(input.provider, 'provider'),
+      model_id: modelId,
+      name: requireModelString(input.name, 'name'),
+      base_url: requireModelString(input.base_url, 'base_url'),
+      api_key: requireModelString(input.api_key, 'api_key'),
+      max_tokens: optionalPositiveInteger(input.max_tokens, 'max_tokens') ?? DEFAULT_MAX_TOKENS,
+      context_window: optionalPositiveInteger(input.context_window, 'context_window'),
+    };
+    let parsedUrl: URL;
+    try {
+      parsedUrl = new URL(model.base_url);
+    } catch {
+      throw new Error('apply_model_config: base_url must be a valid URL');
+    }
+    if (parsedUrl.protocol !== 'http:' && parsedUrl.protocol !== 'https:') {
+      throw new Error('apply_model_config: base_url must use http or https');
+    }
+    if (seen.has(model.model_id)) {
+      throw new Error(`apply_model_config: duplicate model_id "${model.model_id}"`);
+    }
+    seen.add(model.model_id);
+    return model;
+  });
+  return { models, fullSnapshot };
+}
+
+function buddyModelEntry(model: DeliveredModel): Record<string, unknown> {
+  const baseUrl = model.base_url.replace(/\/+$/, '');
+  return {
+    id: model.model_id,
+    name: model.name,
+    vendor: model.provider,
+    apiKey: model.api_key,
+    ...(model.context_window === undefined ? {} : { maxInputTokens: model.context_window }),
+    ...(model.max_tokens === undefined ? {} : { maxOutputTokens: model.max_tokens }),
+    url: baseUrl.endsWith('/chat/completions') ? baseUrl : `${baseUrl}/chat/completions`,
+    supportsToolCall: true,
+  };
+}
+
+async function readJsonObject(filePath: string): Promise<Record<string, unknown>> {
+  const source = await readFileSafe(filePath);
+  if (source === null) return {};
+  try {
+    const parsed = JSON.parse(source);
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+      throw new Error('root must be an object');
+    }
+    return parsed as Record<string, unknown>;
+  } catch (error) {
+    throw new Error(
+      `apply_model_config: cannot parse ${modelConfigDisplayPath(filePath)}: ${(error as Error).message}`,
+    );
+  }
+}
+
+/** Atomically update a model dotfile without replacing a user-managed symlink. */
+async function writeModelJson(filePath: string, data: unknown): Promise<void> {
+  let targetPath = filePath;
+  try {
+    if ((await fs.promises.lstat(filePath)).isSymbolicLink()) {
+      targetPath = await fs.promises.realpath(filePath);
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+  // Set the temp file's mode before the atomic rename. A post-rename chmod
+  // would introduce a symlink-following TOCTOU window.
+  await writeJsonAtomic(targetPath, data, { mode: 0o600 });
+}
+
+async function ensureWorkspaceModelGitignore(workspacePath: string): Promise<void> {
+  const gitignorePath = path.join(workspacePath, '.codebuddy', '.gitignore');
+  const existing = await readFileSafe(gitignorePath);
+  if (existing === null) {
+    await writeFile(gitignorePath, '# Local model credentials\nmodels.json\n');
+    return;
+  }
+  if (existing.split(/\r?\n/).some((line) => line.trim() === 'models.json')) return;
+  await writeFile(gitignorePath, `${existing.trimEnd()}\nmodels.json\n`);
+}
+
+async function readBuddyModelEntries(
+  filePath: string,
+): Promise<{ existing: unknown[]; doc?: Record<string, unknown> }> {
+  const source = await readFileSafe(filePath);
+  // The current WorkBuddy / CodeBuddy documentation uses an object wrapper.
+  // Product releases also accept the legacy top-level array, so preserve that
+  // shape when a user already has one instead of forcing a migration.
+  if (source === null) return { existing: [], doc: {} };
+  try {
+    const parsed = JSON.parse(source);
+    if (Array.isArray(parsed)) return { existing: parsed };
+    if (typeof parsed !== 'object' || parsed === null) {
+      throw new Error('root must be an object or array');
+    }
+    const doc = parsed as Record<string, unknown>;
+    const existing = doc.models === undefined ? [] : doc.models;
+    if (!Array.isArray(existing)) {
+      throw new Error('models must be an array');
+    }
+    return { existing, doc };
+  } catch (error) {
+    throw new Error(
+      `apply_model_config: cannot parse ${modelConfigDisplayPath(filePath)}: ${(error as Error).message}`,
+    );
+  }
+}
+
+async function reconcileBuddyModels(
+  models: DeliveredModel[],
+  fullSnapshot: boolean,
+  scopeManifest: BuddyModelManifest,
+  agentKind: BuddyAgentKind,
+  workspacePath?: string,
+): Promise<void> {
+  const targetFile = buddyModelsPath(agentKind, workspacePath);
+  const { existing, doc } = await readBuddyModelEntries(targetFile);
+  const previouslyManaged = (agentKind === 'codebuddy'
+    ? scopeManifest.codebuddy
+    : scopeManifest.workbuddy) ?? {};
+  const nextManaged: Record<string, string> = fullSnapshot ? {} : { ...previouslyManaged };
+  const incomingIds = new Set(models.map((model) => model.model_id));
+  const removedManaged = new Set<string>();
+  const preserved: unknown[] = [];
+  const occupiedIds = new Set<string>();
+  for (const entry of existing) {
+    const id = typeof entry === 'object' && entry !== null && typeof (entry as { id?: unknown }).id === 'string'
+      ? (entry as { id: string }).id
+      : undefined;
+    if (id && previouslyManaged[id] && entryHash(entry) === previouslyManaged[id]) {
+      if (fullSnapshot || incomingIds.has(id)) {
+        removedManaged.add(id);
+        continue;
+      }
+      preserved.push(entry);
+      occupiedIds.add(id);
+      continue;
+    }
+    preserved.push(entry);
+    if (id) occupiedIds.add(id);
+    if (id && previouslyManaged[id]) delete nextManaged[id];
+  }
+
+  for (const model of models) {
+    if (occupiedIds.has(model.model_id)) continue;
+    const entry = buddyModelEntry(model);
+    preserved.push(entry);
+    nextManaged[model.model_id] = entryHash(entry);
+  }
+
+  if (workspacePath) await ensureWorkspaceModelGitignore(workspacePath);
+  if (doc) {
+    doc.models = preserved;
+    if (Array.isArray(doc.availableModels) && doc.availableModels.length > 0) {
+      const available = doc.availableModels.filter(
+        (id): id is string => typeof id === 'string' && !removedManaged.has(id),
+      );
+      for (const id of Object.keys(nextManaged)) {
+        if (!available.includes(id)) available.push(id);
+      }
+      doc.availableModels = available;
+    }
+    await writeModelJson(targetFile, doc);
+  } else {
+    await writeModelJson(targetFile, preserved);
+  }
+  if (agentKind === 'codebuddy') scopeManifest.codebuddy = nextManaged;
+  else scopeManifest.workbuddy = nextManaged;
+}
+
+function claudeEnvForModel(model: DeliveredModel): Record<string, string> {
+  const baseUrl = model.base_url.replace(/\/+$/, '').replace(/\/v1$/, '');
+  return {
+    ANTHROPIC_BASE_URL: baseUrl,
+    ANTHROPIC_AUTH_TOKEN: model.api_key,
+    ANTHROPIC_CUSTOM_MODEL_OPTION: model.model_id,
+    ANTHROPIC_CUSTOM_MODEL_OPTION_NAME: model.name,
+  };
+}
+
+/**
+ * Drop the gateway env and model profile the agent delivered into `claudeRoot`,
+ * and forget them in the manifest. For `teamai init` moving the Claude root:
+ * the credentials would otherwise stay in a profile nothing syncs any more.
+ * No-op when the agent never delivered a model.
+ */
+export async function releaseClaudeModelConfig(claudeRoot: string): Promise<void> {
+  const manifest = (await readJson<ModelConfigManifest>(getModelManifestPath())) ?? {};
+  if (Object.keys(manifest.claudeEnv ?? {}).length === 0) return;
+  await reconcileClaudeModels([], manifest, claudeRoot);
+  await writeJsonAtomic(getModelManifestPath(), manifest);
+  log.info(`Removed the delivered Claude model config from ${claudeRoot}`);
+}
+
+async function reconcileClaudeModels(
+  models: DeliveredModel[],
+  manifest: ModelConfigManifest,
+  claudeRoot?: string,
+): Promise<void> {
+  claudeRoot ??= await claudeUserRoot();
+  const settingsPath = path.join(claudeRoot, 'settings.json');
+  const profilePath = path.join(claudeRoot, 'teamai-models.json');
+  const previousHashes = manifest.claudeEnv ?? {};
+  const settings = await readJsonObject(settingsPath);
+  const rawEnv = settings.env === undefined ? {} : settings.env;
+  if (typeof rawEnv !== 'object' || rawEnv === null || Array.isArray(rawEnv)) {
+    throw new Error(`apply_model_config: env must be an object in ${settingsPath}`);
+  }
+  const env = { ...(rawEnv as Record<string, unknown>) };
+
+  if (models.length === 0) {
+    const canRemoveGateway = Object.entries(previousHashes).every(
+      ([key, hash]) => entryHash(env[key]) === hash,
+    );
+    if (canRemoveGateway && Object.keys(previousHashes).length > 0) {
+      for (const key of Object.keys(previousHashes)) delete env[key];
+      settings.env = env;
+      await writeModelJson(settingsPath, settings);
+    }
+    await remove(profilePath);
+    manifest.claudeEnv = {};
+    return;
+  }
+
+  // Claude supports one active custom gateway in settings. The first model
+  // seeds that gateway; other candidates remain discoverable from its
+  // /v1/models endpoint when the gateway implements model discovery.
+  const desired = claudeEnvForModel(models[0]);
+  await writeModelJson(profilePath, { env: desired });
+
+  // Any of these keys, if the user already set them, means they have their own
+  // Claude gateway/model config we must not silently take over. Beyond the keys
+  // we write, this also covers auth the gateway swap would break
+  // (ANTHROPIC_API_KEY, ANTHROPIC_CUSTOM_HEADERS) and the user's model choice
+  // (ANTHROPIC_DEFAULT_{OPUS,SONNET,HAIKU}_MODEL).
+  const conflictKeys = new Set([
+    ...Object.keys(desired),
+    'ANTHROPIC_API_KEY',
+    'ANTHROPIC_CUSTOM_HEADERS',
+    'ANTHROPIC_DEFAULT_OPUS_MODEL',
+    'ANTHROPIC_DEFAULT_SONNET_MODEL',
+    'ANTHROPIC_DEFAULT_HAIKU_MODEL',
+  ]);
+  // A value is TeamAI-managed if it matches what we recorded last time or the
+  // value currently in settings.json (settings.json is our own output, so a
+  // process.env var equal to it is Claude re-injecting settings.json.env into
+  // the hook, not a user's independent shell config).
+  const isManagedValue = (key: string, value: unknown): boolean => (
+    (previousHashes[key] !== undefined && entryHash(value) === previousHashes[key]) ||
+    (env[key] !== undefined && entryHash(value) === entryHash(env[key]))
+  );
+  // The guard must see config the user set outside settings.json too. Users who
+  // run Claude via shell `export ANTHROPIC_*` keep no gateway in settings.json,
+  // so a settings-only check reads env[key] === undefined and wrongly seizes the
+  // slot — settings.json then outranks the shell env and breaks their setup.
+  // But Claude injects settings.json.env into the hook's own environment, so we
+  // must NOT treat our own re-injected managed values as a user conflict — doing
+  // so would block every follow-up sync and strand the user on stale config.
+  const userOwnsInShell = (key: string): boolean => {
+    const value = process.env[key];
+    if (typeof value !== 'string' || value.trim() === '') return false;
+    return !isManagedValue(key, value);
+  };
+  const shellConflicts = [...conflictKeys].filter(userOwnsInShell);
+  if (shellConflicts.length > 0) {
+    // The user has their own gateway/model config in the shell. Skip the write,
+    // but keep manifest.claudeEnv intact: this is not the user editing our
+    // managed settings.json entry, so we must stay able to reconcile once the
+    // shell config goes away.
+    await appendErrorLog({
+      apply_model_config: 'skipped claude gateway: user owns conflicting shell env',
+      conflicts: shellConflicts,
+    });
+    return;
+  }
+
+  const canManage = [...conflictKeys].every((key) => (
+    env[key] === undefined ||
+    (previousHashes[key] !== undefined && entryHash(env[key]) === previousHashes[key])
+  ));
+  if (!canManage) {
+    manifest.claudeEnv = {};
+    return;
+  }
+
+  for (const [key, hash] of Object.entries(previousHashes)) {
+    if (entryHash(env[key]) === hash) delete env[key];
+  }
+  Object.assign(env, desired);
+  settings.env = env;
+  await writeModelJson(settingsPath, settings);
+  manifest.claudeEnv = Object.fromEntries(
+    Object.entries(desired).map(([key, value]) => [key, entryHash(value)]),
+  );
+}
+
+async function applyModelConfig(
+  config: LocalAgentConfig,
+  command: LocalAgentCommand,
+  context: LocalAgentContext,
+): Promise<void> {
+  const { models, fullSnapshot } = parseDeliveredModels(command.cmd);
+  const manifest = (await readJson<ModelConfigManifest>(getModelManifestPath())) ?? {};
+  const agentKind = modelAgentKind(context.tool);
+  if (!agentKind) {
+    throw new Error(`apply_model_config: unsupported agent "${context.tool ?? ''}"`);
+  }
+
+  const scope = normalizeScope(command.scope);
+  const workspacePath = scope === 'project'
+    ? await resolveWorkspacePath(command.workspace_path ?? context.cwd)
+    : undefined;
+  if (scope === 'project' && !workspacePath) {
+    throw new Error('apply_model_config: workspace command is missing workspace_path');
+  }
+  if (workspacePath && config.workspaceBindings[workspacePath] === undefined) {
+    throw new Error(
+      `apply_model_config: workspace "${path.basename(workspacePath)}" is not a registered binding`,
+    );
+  }
+  if (agentKind === 'claude' && workspacePath) {
+    throw new Error('apply_model_config: workspace scope is unsupported for claude');
+  }
+  if (!workspacePath) {
+    // An explicit profile switch takes precedence over server delivery. Keep
+    // both the Agent config and delivery manifest intact for a later restore.
+    const { isModelProfileManaged } = await import('./models/switch.js');
+    if (await isModelProfileManaged(agentKind)) return;
+  }
+
+  let scopeManifest: BuddyModelManifest = manifest;
+  if (workspacePath) {
+    manifest.workspaceModels ??= {};
+    manifest.workspaceModels[workspacePath] ??= {};
+    scopeManifest = manifest.workspaceModels[workspacePath];
+  }
+  const previousProviders = scopeManifest.providersByAgent?.[agentKind]
+    ?? (!workspacePath && agentKind !== 'workbuddy' ? manifest.providers : undefined)
+    ?? {};
+  const providers = {
+    ...(fullSnapshot ? {} : previousProviders),
+    ...Object.fromEntries(models.map((model) => [model.model_id, model.provider])),
+  };
+  scopeManifest.providersByAgent = {
+    ...scopeManifest.providersByAgent,
+    [agentKind]: providers,
+  };
+  if (agentKind === 'claude') {
+    await reconcileClaudeModels(models, manifest);
+  } else {
+    await reconcileBuddyModels(models, fullSnapshot, scopeManifest, agentKind, workspacePath);
+  }
+  await writeJsonAtomic(getModelManifestPath(), manifest);
 }
 
 /**
@@ -1969,8 +2735,14 @@ async function runHookRuleCommand(
       } else if (OPENCLAW_TOOLS.has(rec.tool)) {
         const { removeOpenClawAgentHook } = await import('./openclaw-hooks.js');
         await removeOpenClawAgentHook({ slug, tool: rec.tool });
+      } else if (rec.tool === 'opencode') {
+        const { removeOpencodeAgentHook } = await import('./opencode-hooks.js');
+        await removeOpencodeAgentHook({ slug, baseDir: getUserHome(), scope: 'user' });
+      } else if (rec.tool === 'pi') {
+        const { removePiAgentHook } = await import('./pi-hooks.js');
+        await removePiAgentHook(slug);
       } else {
-        const settingsPath = resolveToolSettingsPath(config, rec.tool);
+        const settingsPath = await resolveToolSettingsPath(config, rec.tool);
         await removeAgentHook(settingsPath, rec.tool, { slug, command: rec.command });
       }
       delete manifest[slug];
@@ -2006,8 +2778,14 @@ async function runHookRuleCommand(
       } else if (OPENCLAW_TOOLS.has(prior.tool)) {
         const { removeOpenClawAgentHook } = await import('./openclaw-hooks.js');
         await removeOpenClawAgentHook({ slug, tool: prior.tool });
+      } else if (prior.tool === 'opencode') {
+        const { removeOpencodeAgentHook } = await import('./opencode-hooks.js');
+        await removeOpencodeAgentHook({ slug, baseDir: getUserHome(), scope: 'user' });
+      } else if (prior.tool === 'pi') {
+        const { removePiAgentHook } = await import('./pi-hooks.js');
+        await removePiAgentHook(slug);
       } else {
-        const priorPath = resolveToolSettingsPath(config, prior.tool);
+        const priorPath = await resolveToolSettingsPath(config, prior.tool);
         await removeAgentHook(priorPath, prior.tool, { slug, command: prior.command });
       }
     } catch (e) {
@@ -2021,8 +2799,15 @@ async function runHookRuleCommand(
   } else if (OPENCLAW_TOOLS.has(tool)) {
     const { applyOpenClawAgentHook } = await import('./openclaw-hooks.js');
     await applyOpenClawAgentHook({ slug, event, command: cmd, tool, matcher, timeout });
+  } else if (tool === 'opencode') {
+    // OpenCode loads plugins from ~/.config/opencode/plugin (user scope).
+    const { applyOpencodeAgentHook } = await import('./opencode-hooks.js');
+    await applyOpencodeAgentHook({ slug, event, command: cmd, baseDir: getUserHome(), scope: 'user', matcher });
+  } else if (tool === 'pi') {
+    const { applyPiAgentHook } = await import('./pi-hooks.js');
+    await applyPiAgentHook({ slug, event, command: cmd, matcher, timeout });
   } else {
-    const settingsPath = resolveToolSettingsPath(config, tool);
+    const settingsPath = await resolveToolSettingsPath(config, tool);
     await applyAgentHook(settingsPath, tool, { slug, event, command: cmd, matcher, timeout });
   }
   manifest[slug] = { tool, event, command: cmd, matcher, timeout };
@@ -2030,11 +2815,237 @@ async function runHookRuleCommand(
   return undefined;
 }
 
+// ─── MCP server install / uninstall (HTTP distribution) ─────
+
+const VALID_MCP_TRANSPORTS = new Set<string>(['stdio', 'http', 'sse']);
+
+function mcpConfigToDef(slug: string, cfg: NonNullable<LocalAgentCommand['mcp_config']>): McpServerDef {
+  if (!VALID_MCP_TRANSPORTS.has(cfg.transport)) {
+    throw new Error(`install_mcp: unsupported transport "${cfg.transport}" for server "${slug}"`);
+  }
+  return {
+    name: slug,
+    transport: cfg.transport as McpTransport,
+    command: cfg.command,
+    args: cfg.args,
+    url: cfg.url,
+    headers: cfg.headers,
+    env: cfg.env,
+    timeout: cfg.timeout,
+    requires: cfg.requires,
+  };
+}
+
+function updateManifestRecord(
+  manifest: ManagedMcpManifest,
+  key: string,
+  name: string,
+  hash: string,
+): void {
+  const records = manifest[key] ?? [];
+  const idx = records.findIndex((r: ManagedMcpRecord) => r.name === name);
+  if (idx >= 0) {
+    records[idx] = { name, hash };
+  } else {
+    records.push({ name, hash });
+  }
+  manifest[key] = records;
+}
+
+async function installMcpServer(
+  config: LocalAgentConfig,
+  command: LocalAgentCommand,
+  tool: string,
+  slug: string,
+  scope: LocalAgentScope,
+  workspacePath?: string,
+): Promise<string | undefined> {
+  if (!command.mcp_config) {
+    throw new Error('install_mcp: missing mcp_config');
+  }
+
+  const def = mcpConfigToDef(slug, command.mcp_config);
+  const fullTeamConfig = createLocalAgentTeamConfig(config.endpoint);
+  // Resolved through the scope seam, so the user-scope MCP file follows a root
+  // the member relocated (`toolRoots`) the way `teamai pull` writes it. Project
+  // scope returns `mcpProject` unchanged — it belongs to the workspace.
+  const localConfig = await createResourceLocalConfig(config, scope, getUserHome(), workspacePath);
+  const toolPath = scopedToolPaths(fullTeamConfig, localConfig)[tool];
+  if (!toolPath) {
+    throw new Error(`install_mcp: unknown tool "${tool}"`);
+  }
+
+  const projectScope = scope === 'project';
+  const mcpRel = projectScope ? toolPath.mcpProject : toolPath.mcp;
+  if (!mcpRel) {
+    throw new Error(`install_mcp: tool "${tool}" has no MCP config path for scope "${scope}"`);
+  }
+
+  const format = detectMcpFormat(tool);
+  if (!format) {
+    throw new Error(`install_mcp: tool "${tool}" has no known MCP format`);
+  }
+  if (!supportsTransport(format, def.transport)) {
+    throw new Error(`install_mcp: tool "${tool}" does not support ${def.transport} transport`);
+  }
+
+  const baseDir = resolveToolBaseDir(tool, localConfig);
+  const targetFile = path.join(baseDir, mcpRel);
+
+  const { resolveDataHomeForScope } = await import('./config.js');
+  const dataHome = await resolveDataHomeForScope(projectScope ? 'project' : 'user', projectScope ? workspacePath : undefined);
+  // Project scope uses THIS worktree's own manifest file (per-worktree under the
+  // partition; migrates legacy shared records on first read). User scope uses the
+  // single global file. The ownership key needs no workspace segment.
+  let manifestPath: string;
+  let manifest: ManagedMcpManifest;
+  if (projectScope && workspacePath) {
+    const { loadProjectMcpManifest } = await import('./utils/mcp-manifest.js');
+    ({ manifestPath, manifest } = await loadProjectMcpManifest(dataHome, workspacePath));
+  } else {
+    manifestPath = managedMcpManifestPath(dataHome);
+    manifest = (await readJson<ManagedMcpManifest>(manifestPath)) ?? {};
+  }
+  const manifestKey = managedMcpManifestKey(tool, projectScope);
+  const owned = manifest[manifestKey] ?? [];
+  const ownedNames = new Set(owned.map((r: ManagedMcpRecord) => r.name));
+
+  if (format === 'codex') {
+    const block = renderCodexBlock(def);
+    const hash = entryHash(block);
+    let source = (await readFileSafe(targetFile)) ?? '';
+    const present = new Set(codexServerNames(source));
+    if (present.has(slug) && !ownedNames.has(slug)) {
+      throw new Error(`install_mcp: server "${slug}" exists in ${tool} config and is not managed by teamai`);
+    }
+    updateManifestRecord(manifest, manifestKey, slug, hash);
+    await writeJsonAtomic(manifestPath, manifest);
+    source = spliceCodexBlock(source, slug, block);
+    await writeCodexAtomic(targetFile, source);
+  } else {
+    const entry = renderJsonEntry(format, def);
+    const serverKey = MCP_SERVER_KEY[format];
+    const hash = entryHash(entry);
+    const allowBare = format === 'copilot' && projectScope;
+    const doc = await readJsonDoc(targetFile, serverKey, allowBare);
+    if (!doc) {
+      throw new Error(`install_mcp: cannot parse ${targetFile}`);
+    }
+    if (doc.servers[slug] !== undefined && !ownedNames.has(slug)) {
+      throw new Error(`install_mcp: server "${slug}" exists in ${tool} config and is not managed by teamai`);
+    }
+    updateManifestRecord(manifest, manifestKey, slug, hash);
+    await writeJsonAtomic(manifestPath, manifest);
+    doc.servers[slug] = entry;
+    await writeJsonDoc(targetFile, serverKey, doc);
+  }
+  log.debug(`local-agent: installed MCP server "${slug}" for ${tool} (scope=${scope})`);
+  return command.version;
+}
+
+async function uninstallMcpServer(
+  config: LocalAgentConfig,
+  tool: string,
+  slug: string,
+  scope: LocalAgentScope,
+  workspacePath?: string,
+): Promise<void> {
+  const fullTeamConfig = createLocalAgentTeamConfig(config.endpoint);
+  // Removal has to look where the install wrote: same scope seam, same root.
+  const localConfig = await createResourceLocalConfig(config, scope, getUserHome(), workspacePath);
+  const toolPath = scopedToolPaths(fullTeamConfig, localConfig)[tool];
+  if (!toolPath) return;
+
+  const projectScope = scope === 'project';
+  const mcpRel = projectScope ? toolPath.mcpProject : toolPath.mcp;
+  if (!mcpRel) return;
+
+  const format = detectMcpFormat(tool);
+  if (!format) return;
+
+  const baseDir = resolveToolBaseDir(tool, localConfig);
+  const targetFile = path.join(baseDir, mcpRel);
+
+  const { resolveDataHomeForScope } = await import('./config.js');
+  const dataHome = await resolveDataHomeForScope(projectScope ? 'project' : 'user', projectScope ? workspacePath : undefined);
+  // Project scope uses THIS worktree's own manifest file (per-worktree under the
+  // partition; migrates legacy shared records on first read). User scope uses the
+  // single global file. The ownership key needs no workspace segment.
+  let manifestPath: string;
+  let manifest: ManagedMcpManifest;
+  if (projectScope && workspacePath) {
+    const { loadProjectMcpManifest } = await import('./utils/mcp-manifest.js');
+    ({ manifestPath, manifest } = await loadProjectMcpManifest(dataHome, workspacePath));
+  } else {
+    manifestPath = managedMcpManifestPath(dataHome);
+    manifest = (await readJson<ManagedMcpManifest>(manifestPath)) ?? {};
+  }
+  const manifestKey = managedMcpManifestKey(tool, projectScope);
+  const owned = manifest[manifestKey] ?? [];
+  const ownedNames = new Set(owned.map((r: ManagedMcpRecord) => r.name));
+
+  if (!ownedNames.has(slug)) return;
+
+  manifest[manifestKey] = owned.filter((r: ManagedMcpRecord) => r.name !== slug);
+  if ((manifest[manifestKey] as ManagedMcpRecord[]).length === 0) delete manifest[manifestKey];
+  await writeJsonAtomic(manifestPath, manifest);
+
+  if (format === 'codex') {
+    let source = (await readFileSafe(targetFile)) ?? '';
+    source = spliceCodexBlock(source, slug, null);
+    await writeCodexAtomic(targetFile, source);
+  } else {
+    const serverKey = MCP_SERVER_KEY[format];
+    const allowBare = format === 'copilot' && projectScope;
+    const doc = await readJsonDoc(targetFile, serverKey, allowBare);
+    if (doc && doc.servers[slug] !== undefined) {
+      delete doc.servers[slug];
+      await writeJsonDoc(targetFile, serverKey, doc);
+    }
+  }
+  log.debug(`local-agent: uninstalled MCP server "${slug}" from ${tool} (scope=${scope})`);
+}
+
+async function runMcpCommand(
+  config: LocalAgentConfig,
+  command: LocalAgentCommand,
+  context: LocalAgentContext,
+): Promise<string | undefined> {
+  const tool = context.tool;
+  if (!tool) {
+    throw new Error(`${command.type}: cannot determine current tool`);
+  }
+  const slug = command.slug;
+  if (!slug) {
+    throw new Error(`${command.type}: missing slug`);
+  }
+  assertSafeResourceName(slug);
+
+  const scope = normalizeScope(command.scope);
+  const workspacePath = scope === 'project'
+    ? await resolveWorkspacePath(command.workspace_path ?? context.cwd)
+    : undefined;
+  if (scope === 'project' && !workspacePath) {
+    throw new Error(`${command.type}: workspace command is missing workspace_path`);
+  }
+
+  if (command.type === 'install_mcp') {
+    return installMcpServer(config, command, tool, slug, scope, workspacePath);
+  }
+
+  await uninstallMcpServer(config, tool, slug, scope, workspacePath);
+  return command.version;
+}
+
 async function executeCommand(
   config: LocalAgentConfig,
   command: LocalAgentCommand,
   context: LocalAgentContext,
 ): Promise<string | undefined> {
+  if (command.type === 'apply_model_config') {
+    await applyModelConfig(config, command, context);
+    return;
+  }
   // uninstall_teamai (clawpro three-phase: cmd = "teamai uninstall --force
   // --agent <tool>") executes its `cmd` string as a restricted teamai subcommand.
   if (command.type === 'uninstall_teamai') {
@@ -2042,6 +3053,9 @@ async function executeCommand(
   }
   if (command.type === 'install_hook_rule' || command.type === 'uninstall_hook_rule') {
     return runHookRuleCommand(config, command, context);
+  }
+  if (command.type === 'install_mcp' || command.type === 'uninstall_mcp') {
+    return runMcpCommand(config, command, context);
   }
   const kind = commandKind(command);
   const action = commandAction(command);
@@ -2071,21 +3085,34 @@ async function processCommands(
   config: LocalAgentConfig,
   commands: LocalAgentCommand[],
   context: LocalAgentContext,
-): Promise<void> {
+): Promise<boolean> {
   const tag = localAgentTag(context);
+  let modelConfigApplied = false;
   for (const command of commands) {
-    if (isUnimplementedCommand(command)) {
+    // Keep these special types aligned with executeCommand's direct branches.
+    // Resource commands are recognized generically by commandKind/action;
+    // everything else is a future protocol extension and must be skipped.
+    if (isUnimplementedCommand(command) || (
+      command.type !== 'apply_model_config' &&
+      command.type !== 'uninstall_teamai' &&
+      command.type !== 'install_hook_rule' &&
+      command.type !== 'uninstall_hook_rule' &&
+      command.type !== 'install_mcp' &&
+      command.type !== 'uninstall_mcp' &&
+      (!commandKind(command) || !commandAction(command))
+    )) {
       log.debug(`${tag} skipping unimplemented command ${command.id} (${command.type})`);
       continue;
     }
     try {
       const version = await executeCommand(config, command, context);
       await ackCommand(config, tag, command, 'success', version);
+      if (command.type === 'apply_model_config') modelConfigApplied = true;
       log.debug(`${tag} command ${command.id} (${command.type ?? ''}) succeeded`);
       // Uninstall succeeded — skip remaining commands; the hook process exits naturally.
       if (command.type === 'uninstall_teamai') {
         log.debug(`${tag} uninstall_teamai completed — remaining commands skipped`);
-        return;
+        return modelConfigApplied;
       }
     } catch (e) {
       const error = (e as Error).message;
@@ -2097,6 +3124,7 @@ async function processCommands(
       }
     }
   }
+  return modelConfigApplied;
 }
 
 export async function reportAndSyncLocalAgent(context: LocalAgentContext): Promise<boolean> {
@@ -2106,16 +3134,18 @@ export async function reportAndSyncLocalAgent(context: LocalAgentContext): Promi
   // Binding prompt is injected via stdout hook context (not HTTP), so it must run
   // even inside the CloudStudio sandbox — the sandbox guard below only skips the
   // HTTP report/sync that would produce a duplicate card. Resolve the workspace
-  // only when the prompt is enabled, so the disabled path forks no git process.
-  if (isBindPromptEnabled()) {
+  // only when the prompt is enabled AND the host is a buddy agent, so every other
+  // path (disabled flag, or a non-buddy tool like Claude/Cursor/Codex) forks no
+  // git process.
+  if (isBindPromptEnabled() && isBindPromptTool(context.tool)) {
     const workspacePath = await resolveWorkspacePath(context.cwd);
     if (workspacePath) {
       const sid = context.event?.sessionId;
       if (context.event?.type === 'session_start') {
-        await ensureWorkspaceBinding(config, workspacePath, sid);
+        await ensureWorkspaceBinding(config, workspacePath, sid, context.cwd);
       }
       if (context.event?.type === 'prompt_submit') {
-        await emitBindingHint(config, workspacePath, sid);
+        await emitBindingHint(config, workspacePath, sid, context.cwd);
       }
     }
   }
@@ -2178,6 +3208,7 @@ export async function reportAndSyncLocalAgent(context: LocalAgentContext): Promi
       tag,
       'sync',
       { method: 'POST', body: JSON.stringify(syncPayload) },
+      { redactResponseLog: true },
     );
     // Prefer the unified cmds[] (source of truth). Fall back to the legacy
     // commands[] for older backends that do not yet emit cmds. An empty cmds[]
@@ -2190,7 +3221,15 @@ export async function reportAndSyncLocalAgent(context: LocalAgentContext): Promi
     const commands = cmds && cmds.length > 0 ? cmds : (syncResponse.commands ?? []);
     if (commands.length > 0) {
       log.debug(`${tag} sync returned ${commands.length} command(s): ${commands.map((c) => `${c.type}#${c.id}`).join(', ')}`);
-      await processCommands(config, commands, context);
+      const modelConfigApplied = await processCommands(config, commands, context);
+      if (modelConfigApplied && !skipReport) {
+        const reportPayload = await buildReportPayload(config, context);
+        await localAgentFetch(config, tag, 'report', {
+          method: 'POST',
+          body: JSON.stringify(reportPayload),
+        });
+        log.debug(`${tag} model config report OK`);
+      }
     }
     log.debug(`${tag} sync OK (${commands.length} command(s))`);
   } catch (e) {
@@ -2219,7 +3258,9 @@ export async function reportAndSyncFromHook(
 ): Promise<string | null> {
   const raw = JSON.stringify(stdin);
   const event = await parseHookEvent(raw, tool);
-  const cwd = typeof stdin.cwd === 'string' ? stdin.cwd : event?.cwd ?? process.cwd();
+  // parseHookEvent resolves cwd via resolveHookCwd too, so event?.cwd would be
+  // identical here — resolve once and fall back to process.cwd().
+  const cwd = resolveHookCwd(stdin) ?? process.cwd();
 
   // SessionStart and UserPromptSubmit run this handler in the *foreground*, where
   // it blocks the host IDE's hook (UserPromptSubmit cap = 10s). Narrow the
@@ -2282,11 +3323,17 @@ export async function initLocalAgentHttp(options: {
   await ensureDir(getLocalAgentHome());
   await saveLocalAgentConfig(config);
   if (options.token) {
-    await writeTokenFile(TEAMAI_TOKEN_PATH, options.token);
+    await writeTokenFile(getTokenPath(), options.token);
   }
 
   const teamConfig = createLocalAgentTeamConfig(endpoint);
-  await injectHooksToAllTools(teamConfig.toolPaths, process.env.HOME ?? '', options.filterAgents);
+  // The local agent is always user-scope and always rooted at HOME, so resolve
+  // the user-scope paths (Qoder CN's user config lives under ~/.qoder-cn).
+  await injectHooksToAllTools(
+    scopedToolPaths(teamConfig, { scope: 'user', toolRoots: await memberToolRoots() }),
+    getUserHome(),
+    options.filterAgents,
+  );
   log.success(`HTTP local agent initialized at ${getConfigPath()}`);
 }
 
@@ -2378,8 +3425,14 @@ export async function removeAllAgentHooks(): Promise<void> {
       } else if (OPENCLAW_TOOLS.has(rec.tool)) {
         const { removeOpenClawAgentHook } = await import('./openclaw-hooks.js');
         await removeOpenClawAgentHook({ slug, tool: rec.tool });
+      } else if (rec.tool === 'opencode') {
+        const { removeOpencodeAgentHook } = await import('./opencode-hooks.js');
+        await removeOpencodeAgentHook({ slug, baseDir: getUserHome(), scope: 'user' });
+      } else if (rec.tool === 'pi') {
+        const { removePiAgentHook } = await import('./pi-hooks.js');
+        await removePiAgentHook(slug);
       } else {
-        const settingsPath = resolveToolSettingsPath(config, rec.tool);
+        const settingsPath = await resolveToolSettingsPath(config, rec.tool);
         await removeAgentHook(settingsPath, rec.tool, { slug, command: rec.command });
       }
     } catch (e) {
@@ -2439,8 +3492,9 @@ export async function bindCurrentProject(options?: { projectId?: number; skip?: 
     if (!config) {
       throw new Error('Local agent not initialized. Run `teamai init --http` first.');
     }
-    config.workspaceBindings[workspacePath] = { projectId: 0, projectName: '__skipped__', boundAt: new Date().toISOString() };
-    await saveLocalAgentConfig(config);
+    // Skip the whole project (main checkout + all its worktrees), not just this
+    // one checkout, so sibling worktrees are not re-prompted.
+    await persistWorkspaceBinding(config, options?.cwd ?? process.cwd(), workspacePath, 0, '__skipped__');
     log.info(`已跳过绑定，以后不再提示此工作区。`);
     return;
   }

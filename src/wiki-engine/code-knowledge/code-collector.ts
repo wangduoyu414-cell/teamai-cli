@@ -8,6 +8,14 @@ import { safeIgnore, toPosix } from "../core/wiki-protocol.js";
 
 const execFileAsync = promisify(execFile);
 
+/**
+ * Every git child below is launched with `windowsHide: true`. A parent with no
+ * console of its own — a GUI or hook host — makes Windows give the child a new
+ * one, which flashes a visible window on every scan. CI has no Windows runner,
+ * so the option is the only guard there is.
+ */
+const GIT_EXEC_OPTIONS = { windowsHide: true } as const;
+
 export interface CodeCollectedFile {
   path: string;
   relativePath: string;
@@ -23,7 +31,8 @@ export const KEY_FILE_PATTERNS: Record<string, RegExp[]> = {
   python: [/main\.py$/, /app\.py$/, /server\.py$/, /routes?\.py$/, /models?\.py$/],
   java: [/Application\.java$/, /Controller\.java$/, /Service\.java$/],
   typescript: [/index\.ts$/, /server\.ts$/, /app\.ts$/, /router\.ts$/],
-  rust: [/main\.rs$/, /lib\.rs$/, /mod\.rs$/]
+  rust: [/main\.rs$/, /lib\.rs$/, /mod\.rs$/],
+  swift: [/main\.swift$/, /App\.swift$/, /Package\.swift$/]
 };
 
 export function isKeyFile(relativePath: string, language: string): boolean {
@@ -123,7 +132,7 @@ async function walk(directory: string, results: string[], includeTests: boolean)
 }
 
 function isCodeFile(filePath: string): boolean {
-  return [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".py", ".go", ".rs", ".java", ".json", ".yaml", ".yml", ".toml", ".sql", ".conf", ".ini"].includes(
+  return [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".py", ".go", ".rs", ".java", ".swift", ".json", ".yaml", ".yml", ".toml", ".sql", ".conf", ".ini"].includes(
     path.extname(filePath).toLowerCase()
   );
 }
@@ -136,7 +145,7 @@ function languageFor(filePath: string): string {
   const ext = path.extname(filePath).toLowerCase();
   const map: Record<string, string> = {
     ".ts": "typescript", ".tsx": "typescript", ".js": "javascript", ".jsx": "javascript",
-    ".py": "python", ".go": "go", ".rs": "rust", ".java": "java",
+    ".py": "python", ".go": "go", ".rs": "rust", ".java": "java", ".swift": "swift",
     ".json": "json", ".yaml": "yaml", ".yml": "yaml",
     ".toml": "toml", ".sql": "sql", ".conf": "toml", ".ini": "toml",
   };
@@ -145,7 +154,7 @@ function languageFor(filePath: string): string {
 
 export async function gitCommit(root: string): Promise<string | undefined> {
   try {
-    const { stdout } = await execFileAsync("git", ["-C", root, "rev-parse", "HEAD"]);
+    const { stdout } = await execFileAsync("git", ["-C", root, "rev-parse", "HEAD"], GIT_EXEC_OPTIONS);
     return stdout.trim() || undefined;
   } catch {
     return undefined;
@@ -159,7 +168,7 @@ export async function gitCommit(root: string): Promise<string | undefined> {
  */
 export async function isWorkingTreeClean(root: string): Promise<boolean> {
   try {
-    const { stdout } = await execFileAsync("git", ["-C", root, "status", "--porcelain"]);
+    const { stdout } = await execFileAsync("git", ["-C", root, "status", "--porcelain"], GIT_EXEC_OPTIONS);
     return stdout.trim().length === 0;
   } catch {
     return false;
@@ -180,7 +189,7 @@ export async function gitDiffNameStatus(
   newSha: string,
 ): Promise<{ added: string[]; changed: string[]; deleted: string[] } | null> {
   try {
-    const { stdout } = await execFileAsync("git", ["-C", root, "-c", "core.quotePath=false", "diff", "--name-status", "-M", "-C", oldSha, newSha]);
+    const { stdout } = await execFileAsync("git", ["-C", root, "-c", "core.quotePath=false", "diff", "--name-status", "-M", "-C", oldSha, newSha], GIT_EXEC_OPTIONS);
     const added: string[] = [];
     const changed: string[] = [];
     const deleted: string[] = [];

@@ -128,6 +128,22 @@ export async function upsertSoulRules(rulesText: string): Promise<void> {
 }
 
 /**
+ * The text inside the teamai-managed block of SOUL.md, or null when the block
+ * is not there. Read-only: `doctor` has to compare what Hermes actually reads
+ * with what `upsertSoulRules` would write, and reusing the writer to find out
+ * would edit the file the command is only meant to describe.
+ */
+export async function readSoulRules(): Promise<string | null> {
+  const content = await readFileSafe(getHermesSoulPath());
+  if (content === null) return null;
+
+  const startIdx = content.indexOf(RULES_BLOCK_START);
+  const endIdx = content.indexOf(RULES_BLOCK_END);
+  if (startIdx === -1 || endIdx === -1 || endIdx < startIdx) return null;
+  return content.slice(startIdx + RULES_BLOCK_START.length, endIdx).trim();
+}
+
+/**
  * Remove the teamai-managed rules block from Hermes SOUL.md, leaving user
  * content intact. No-op when nothing is present.
  */
@@ -162,11 +178,12 @@ interface AllowlistFile {
  * @param event - The hook event name (e.g. `on_session_start`).
  * @param entry - Hook descriptor; `matcher` and `timeout` are omitted when
  *   undefined so the YAML does not contain null values.
+ * @returns Whether config.yaml was written.
  */
 export async function upsertHermesHook(
   event: string,
   entry: { command: string; matcher?: string; timeout?: number },
-): Promise<void> {
+): Promise<boolean> {
   const doc = await readConfigDoc();
 
   // Get current hooks[event] as a plain JS array.
@@ -182,10 +199,11 @@ export async function upsertHermesHook(
 
   const newArr = [...untouched, cleanEntry];
 
-  if (JSON.stringify(arr) === JSON.stringify(newArr)) return;
+  if (JSON.stringify(arr) === JSON.stringify(newArr)) return false;
 
   doc.setIn(['hooks', event], newArr);
   await writeConfigDoc(doc);
+  return true;
 }
 
 /**
@@ -242,18 +260,20 @@ export async function removeHermesHookByCommand(command: string): Promise<void> 
  *
  * @param event   - Hook event name.
  * @param command - Absolute path to the approved script.
+ * @returns Whether the allowlist was written.
  */
-export async function addHermesAllowlist(event: string, command: string): Promise<void> {
+export async function addHermesAllowlist(event: string, command: string): Promise<boolean> {
   const filePath = getHermesAllowlistPath();
   const raw = await readJson<AllowlistFile>(filePath);
   const data: AllowlistFile =
     raw && Array.isArray(raw.approvals) ? raw : { approvals: [] };
 
   const exists = data.approvals.some((a) => a.event === event && a.command === command);
-  if (exists) return;
+  if (exists) return false;
 
   data.approvals.push({ event, command });
   await writeJson(filePath, data);
+  return true;
 }
 
 /**

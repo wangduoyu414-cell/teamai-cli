@@ -7,8 +7,9 @@ import { parseLearningDoc, titleFromFilename } from './utils/search-index.js';
 import { requireInit, detectProjectConfig } from './config.js';
 import { calculateTeamHealth } from './skill-health.js';
 import { createGit } from './utils/git.js';
-import type { GlobalOptions, UserStats, TokenUsage } from './types.js';
+import type { UserStats, TokenUsage } from './types.js';
 import { totalTokens } from './types.js';
+import { mergeDailyStats, summarizeTrendWindow, type TrendPeriod } from './session-trends.js';
 
 interface SkillChange {
   name: string;
@@ -223,20 +224,21 @@ async function getRecentSessions(repoPath: string): Promise<string[]> {
  * Filters by date embedded in filename (YYYY-MM-DD pattern),
  * then parses frontmatter for title metadata.
  */
-async function getRecentLearnings(repoPath: string): Promise<{ recent: LearningInfo[]; total: number }> {
-  const learningsDir = path.join(repoPath, 'learnings');
+async function getRecentLearnings(
+  learningsDirs: readonly string[],
+): Promise<{ recent: LearningInfo[]; total: number }> {
   const recent: LearningInfo[] = [];
   let total = 0;
 
   try {
-    const files = await listFiles(learningsDir);
-    const mdFiles = files.filter((f) => f.endsWith('.md'));
+    const { listLearningFiles } = await import('./utils/learnings-roots.js');
+    const mdFiles = await listLearningFiles(learningsDirs);
     total = mdFiles.length;
 
     // Calculate 7-day cutoff as YYYY-MM-DD string for comparison
     const cutoff = new Date(Date.now() - 7 * 86_400_000).toISOString().slice(0, 10);
 
-    for (const filename of mdFiles) {
+    for (const { file: filename, absPath } of mdFiles) {
       // Extract date from filename pattern: *-YYYY-MM-DD-*.md
       const dateMatch = filename.match(/-(\d{4}-\d{2}-\d{2})-/);
       if (!dateMatch) continue;
@@ -245,7 +247,7 @@ async function getRecentLearnings(repoPath: string): Promise<{ recent: LearningI
       if (fileDate < cutoff) continue;
 
       // Parse frontmatter for title
-      const content = await readFileSafe(path.join(learningsDir, filename));
+      const content = await readFileSafe(absPath);
       if (!content) continue;
 
       const parsed = parseLearningDoc(content, filename);
@@ -362,23 +364,62 @@ export function summarizeConversation(teamStats: UserStats[]): ConversationSumma
   return { totalPrompts, tokens, totalTokens: totalTokens(tokens), ranked };
 }
 
+export function summarizeTeamTrends(teamStats: UserStats[], now = new Date()): ReturnType<typeof summarizeTrendWindow> | null {
+  let daily: NonNullable<UserStats['daily']> = {};
+  for (const user of teamStats) daily = mergeDailyStats(daily, user.daily ?? {});
+  return Object.keys(daily).length > 0 ? summarizeTrendWindow(daily, now) : null;
+}
+
+function formatPercent(value: number | null): string {
+  return value === null ? 'collecting…' : `${Math.round(value * 100)}%`;
+}
+
+function formatAverage(value: number | null, suffix = ''): string {
+  return value === null ? 'collecting…' : `${value.toFixed(1)}${suffix}`;
+}
+
+function formatDuration(value: number | null): string {
+  return value === null ? 'collecting…' : `${Math.round(value / 60_000)}m`;
+}
+
+function formatCost(value: number | null): string {
+  return value === null ? 'collecting…' : `$${(value / 1_000_000).toFixed(3)}`;
+}
+
+function comparison(current: string, previous: string): string {
+  return `${previous} → ${current}`;
+}
+
+export function formatTrendLines(periods: { current: TrendPeriod; previous: TrendPeriod }): string[] {
+  const { current, previous } = periods;
+  return [
+    `  Session success: ${comparison(formatPercent(current.successRate), formatPercent(previous.successRate))} · ${current.sessionsEnded} ended`,
+    `  Avg prompts/session: ${comparison(formatAverage(current.avgPrompts), formatAverage(previous.avgPrompts))}`,
+    `  Avg active duration: ${comparison(formatDuration(current.avgDurationMs), formatDuration(previous.avgDurationMs))}`,
+    `  Avg LLM request cost (est.): ${comparison(formatCost(current.avgRequestCostMicros), formatCost(previous.avgRequestCostMicros))}`,
+    `  Cache read share: ${comparison(formatPercent(current.cacheReadShare), formatPercent(previous.cacheReadShare))}`,
+    `  Correction rate: ${comparison(formatPercent(current.correctionRate), formatPercent(previous.correctionRate))}`,
+  ];
+}
+
 /**
  * Generate and display weekly team digest.
  */
-export async function generateDigest(options: GlobalOptions): Promise<void> {
+export async function generateDigest(): Promise<void> {
   try {
     const projectConfig = await detectProjectConfig();
     const localConfig = projectConfig ?? (await requireInit()).localConfig;
     const repoPath = localConfig.repo.localPath;
 
-    // In self mode, knowledge (learnings, skill git-log) lives under localPath on
-    // main, but report data (stats, sessions) lives on the teamai-reports orphan
-    // branch — read those from the reports worktree, refreshed from origin.
+    // Knowledge (learnings, skill git-log) lives under localPath on the default
+    // branch; report data (stats, sessions) lives on the teamai-reports orphan
+    // branch for non-HTTP repos — read those from the reports worktree.
     let reportsRoot = repoPath;
-    if (localConfig.repo.kind === 'self') {
-      const { ensureReportsWorktree, refreshReportsWorktree } = await import('./utils/reports-branch.js');
-      await refreshReportsWorktree(localConfig);
-      reportsRoot = await ensureReportsWorktree(localConfig);
+    const { usesBranchWorktree } = await import('./types.js');
+    if (usesBranchWorktree(localConfig)) {
+      const { readableReportsWorktree } = await import('./utils/reports-branch.js');
+      // Read-only: never publish a missing reports branch.
+      reportsRoot = await readableReportsWorktree(localConfig);
     }
 
     const teamStats = await loadTeamStats(reportsRoot);
@@ -404,6 +445,15 @@ export async function generateDigest(options: GlobalOptions): Promise<void> {
 
     // Team members active
     console.log(`👥 Active members: ${teamStats.length}`);
+    console.log('');
+
+    const trends = summarizeTeamTrends(teamStats, now);
+    console.log('📈 Session trends (7d vs prior 7d):');
+    if (trends) {
+      for (const line of formatTrendLines(trends)) console.log(line);
+    } else {
+      console.log('  collecting… (daily data starts with the next reported session)');
+    }
     console.log('');
 
     // Most used skills
@@ -432,7 +482,12 @@ export async function generateDigest(options: GlobalOptions): Promise<void> {
     }
 
     // Learnings
-    const { recent: recentLearnings, total: totalLearnings } = await getRecentLearnings(repoPath);
+    // Not another repository's learnings checkout, if one sits where this
+    // project's would (#808).
+    const { indexableLearningsRoots } = await import('./utils/learnings-roots.js');
+    const { recent: recentLearnings, total: totalLearnings } = await getRecentLearnings(
+      await indexableLearningsRoots(localConfig),
+    );
     if (recentLearnings.length > 0) {
       console.log(`📚 New Learnings This Week: ${recentLearnings.length}`);
       for (const learning of recentLearnings) {
@@ -492,10 +547,10 @@ export async function generateDigest(options: GlobalOptions): Promise<void> {
     const conversation = summarizeConversation(teamStats);
     if (conversation) {
       const t = conversation.tokens;
-      console.log('💬 Conversation & Token Usage:');
-      console.log(`  Total human prompts: ${conversation.totalPrompts}`);
+      console.log('💬 Lifetime Conversation & Token Usage:');
+      console.log(`  Lifetime human prompts: ${conversation.totalPrompts}`);
       console.log(
-        `  Total tokens: ${formatTokenCount(conversation.totalTokens)} ` +
+        `  Lifetime tokens: ${formatTokenCount(conversation.totalTokens)} ` +
         `(input ${formatTokenCount(t.input)} · output ${formatTokenCount(t.output)} · ` +
         `cache read ${formatTokenCount(t.cacheRead)} · cache write ${formatTokenCount(t.cacheCreation)})`,
       );

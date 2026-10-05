@@ -1,8 +1,18 @@
+import { isHostSelected, normalizeHostId, resolveHostResourcePath, resolveHostRoot } from './host-adapters.js';
 import path from 'node:path';
 import { pathExists, ensureDir } from './utils/fs.js';
-import { resolveBaseDir } from './types.js';
-import type { LocalConfig, TeamaiConfig } from './types.js';
-import { homeDir, isHostSelected, normalizeHostId, resolveHostResourcePath, resolveHostRoot } from './host-adapters.js';
+import {
+  COPILOT_TOOL_ID,
+  getCopilotHome,
+  resolveBaseDir,
+  resolveToolBaseDir,
+  scopedToolPaths,
+  CLAUDE_TOOL_ID,
+  detectClaudeConfigRoot,
+} from './types.js';
+import { isToolInstalledForConfig } from './resources/base.js';
+import type { LocalConfig, TeamaiConfig, Scope } from './types.js';
+import { getUserHome } from './utils/home.js';
 
 /**
  * Single-repo mode: the AI tools offered when `teamai init .` asks which tool
@@ -10,7 +20,7 @@ import { homeDir, isHostSelected, normalizeHostId, resolveHostResourcePath, reso
  * against the user's HOME in non-interactive contexts. Order is the display order.
  * Kept small on purpose — the common coding agents, not the full KNOWN_AGENTS list.
  */
-export const SELF_MODE_AGENT_CHOICES = ['claude', 'codex', 'cursor', 'codebuddy'] as const;
+export const SELF_MODE_AGENT_CHOICES = ['claude', 'codex', 'cursor', 'copilot', 'pi', 'joycode', 'codebuddy', 'workbuddy'] as const;
 
 /**
  * Normalize the `--agent` option into a deduplicated id list.
@@ -77,6 +87,7 @@ export const KNOWN_AGENTS: KnownAgent[] = [
   { id: 'codex-internal', displayName: 'Codex CLI Internal', category: 'coding', skillsPath: '.codex-internal/skills' },
   { id: 'tcodex', displayName: 'TCodex', category: 'coding', skillsPath: '.tcodex/skills' },
   { id: 'cursor', displayName: 'Cursor', category: 'coding', skillsPath: '.cursor/skills' },
+  { id: 'joycode', displayName: 'JoyCode', category: 'coding', skillsPath: '.joycode/skills' },
   { id: 'codebuddy', displayName: 'CodeBuddy', category: 'coding', skillsPath: '.codebuddy/skills' },
   { id: 'dsh', displayName: 'DeepSeek Harness', category: 'coding', skillsPath: '.dsh/skills', probePath: '.dsh' },
 
@@ -86,18 +97,22 @@ export const KNOWN_AGENTS: KnownAgent[] = [
   { id: 'amp', displayName: 'Amp', category: 'coding', skillsPath: '.amp/skills' },
   { id: 'augment', displayName: 'Augment', category: 'coding', skillsPath: '.augment/skills' },
   { id: 'copilot', displayName: 'Copilot', category: 'coding', skillsPath: '.copilot/skills' },
+  { id: 'pi', displayName: 'Pi Coding Agent', category: 'coding', skillsPath: '.pi/skills' },
   { id: 'factory', displayName: 'Factory Droid', category: 'coding', skillsPath: '.factory/skills' },
   { id: 'hermes', displayName: 'Hermes', category: 'coding', skillsPath: '.hermes/skills' },
   { id: 'junie', displayName: 'Junie', category: 'coding', skillsPath: '.junie/skills' },
   { id: 'kilocode', displayName: 'KiloCode', category: 'coding', skillsPath: '.kilocode/skills' },
   { id: 'kiro', displayName: 'Kiro', category: 'coding', skillsPath: '.kiro/skills' },
   { id: 'ob1', displayName: 'OB1', category: 'coding', skillsPath: '.ob1/skills' },
+  { id: 'omp', displayName: 'Oh My Pi', category: 'coding', skillsPath: '.omp/skills' },
   { id: 'opencode', displayName: 'OpenCode', category: 'coding', skillsPath: '.opencode/skills' },
   { id: 'qoder', displayName: 'Qoder', category: 'coding', skillsPath: '.qoder/skills' },
+  { id: 'qoder-cn', displayName: 'Qoder CN', category: 'coding', skillsPath: '.qoder-cn/skills' },
   { id: 'qwen', displayName: 'Qwen', category: 'coding', skillsPath: '.qwen/skills' },
   { id: 'trae', displayName: 'Trae', category: 'coding', skillsPath: '.trae/skills' },
   { id: 'trae-cn', displayName: 'Trae CN', category: 'coding', skillsPath: '.trae-cn/skills' },
   { id: 'windsurf', displayName: 'Windsurf', category: 'coding', skillsPath: '.windsurf/skills' },
+  { id: 'zcode', displayName: 'ZCode', category: 'coding', skillsPath: '.zcode/skills' },
 
   // Lobster family
   { id: 'openclaw', displayName: 'OpenClaw', category: 'lobster', skillsPath: '.openclaw/skills' },
@@ -105,6 +120,12 @@ export const KNOWN_AGENTS: KnownAgent[] = [
   { id: 'easyclaw', displayName: 'EasyClaw', category: 'lobster', skillsPath: '.easyclaw/skills' },
   { id: 'autoclaw', displayName: 'AutoClaw', category: 'lobster', skillsPath: '.openclaw-autoclaw/skills' },
   { id: 'workbuddy', displayName: 'WorkBuddy', category: 'lobster', skillsPath: '.workbuddy/skills' },
+
+  // DeepSeek Harness (dsh) — plugin-based agent harness. Its skill-filesystem
+  // provider scans user skill roots: ~/.dsh/skills (rank 400) and ~/.agents/skills
+  // (rank 500). We sync to ~/.dsh/skills so dsh keeps its own copy; the central
+  // `.agents` entry below covers the shared root as well.
+  { id: 'dsh', displayName: 'DeepSeek Harness', category: 'coding', skillsPath: '.dsh/skills' },
 
   // Central agent skills directory (codex / generic)
   { id: 'agents', displayName: 'Central (Agent Skills)', category: 'central', skillsPath: '.agents/skills' },
@@ -181,31 +202,43 @@ export async function seedSelfModeToolDirs(
 export async function detectHomeInstalledAgents(
   candidateIds: readonly string[] = SELF_MODE_AGENT_CHOICES,
 ): Promise<string[]> {
-  const home = homeDir();
+  const home = getUserHome();
 
   const found: string[] = [];
   for (const id of candidateIds) {
+    if (id === COPILOT_TOOL_ID) {
+      if (await pathExists(getCopilotHome())) found.push(id);
+      continue;
+    }
     const known = KNOWN_AGENTS.find((a) => a.id === id);
     const skillsPath = known?.probePath ?? known?.skillsPath;
     if (!skillsPath) continue;
     const specialRoot = resolveHostRoot(id, 'user');
     const rootSegment = skillsPath.split('/')[0]; // e.g. ".claude"
     if (!rootSegment) continue;
-    if (await pathExists(specialRoot ?? path.join(home, rootSegment))) {
+    // A Claude Code relocated with CLAUDE_CONFIG_DIR may have no ~/.claude at
+    // all; the developer still uses it. This runs before any config exists, so
+    // the variable is the only signal.
+    const relocated = id === CLAUDE_TOOL_ID ? detectClaudeConfigRoot() : null;
+    if (await pathExists(specialRoot ?? path.join(home, rootSegment)) || (relocated !== null && await pathExists(relocated))) {
       found.push(id);
     }
   }
   return found;
 }
 
-export function getEffectiveAgents(teamConfig: TeamaiConfig): KnownAgent[] {
+export function getEffectiveAgents(
+  teamConfig: TeamaiConfig,
+  localConfig?: { scope?: Scope },
+): KnownAgent[] {
   const byId = new Map<string, KnownAgent & { fromTeamConfig?: boolean }>();
 
   for (const agent of KNOWN_AGENTS) {
     byId.set(agent.id, { ...agent });
   }
 
-  for (const [id, paths] of Object.entries(teamConfig.toolPaths)) {
+  const toolPaths = scopedToolPaths(teamConfig, localConfig ?? {});
+  for (const [id, paths] of Object.entries(toolPaths)) {
     if (!paths.skills) continue;
     const existing = byId.get(id);
     if (existing) {
@@ -233,23 +266,21 @@ export function getEffectiveAgents(teamConfig: TeamaiConfig): KnownAgent[] {
  * detection lines up with what `teamai pull` actually writes to.
  */
 export async function detectInstalledAgents(localConfig: LocalConfig, teamConfig: TeamaiConfig): Promise<ResolvedAgent[]> {
-  const baseDir = resolveBaseDir(localConfig);
-  const agents = getEffectiveAgents(teamConfig);
+  const agents = getEffectiveAgents(teamConfig, localConfig);
+  const scoped = scopedToolPaths(teamConfig, localConfig);
   const fromTeamConfig = new Set(
-    Object.entries(teamConfig.toolPaths)
+    Object.entries(scoped)
       .filter(([, paths]) => paths.skills)
       .map(([id]) => id),
   );
 
   const results: ResolvedAgent[] = [];
   for (const agent of agents) {
-    const segments = (agent.probePath ?? agent.skillsPath).split('/');
-    const rootSegment = segments[0] ?? '';
-    const rootPath = `${baseDir}/${rootSegment}`;
-    const installed = rootSegment ? await pathExists(rootPath) : false;
+    const baseDir = resolveToolBaseDir(agent.id, localConfig);
+    const installed = await isToolInstalledForConfig(agent.id, agent.skillsPath, localConfig);
     results.push({
       ...agent,
-      absoluteSkillsPath: `${baseDir}/${agent.skillsPath}`,
+      absoluteSkillsPath: path.join(baseDir, agent.skillsPath),
       installed,
       fromTeamConfig: fromTeamConfig.has(agent.id),
     });

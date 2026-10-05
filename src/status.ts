@@ -5,21 +5,27 @@ import { getRepoStatus } from './utils/git.js';
 import { assertSafeResourceName } from './utils/path-safety.js';
 import { log } from './utils/logger.js';
 import { getAllHandlers } from './resources/index.js';
-import { listDirs, listFiles, pathExists, readFileSafe } from './utils/fs.js';
+import { listDirs, listFilesRecursive, pathExists, readFileSafe } from './utils/fs.js';
 import { SkillsHandler } from './resources/skills.js';
+import { DocsHandler } from './resources/docs.js';
 import { detectInstalledAgents, type ResolvedAgent } from './known-agents.js';
 import {
   buildClassifyContext,
-  classifySkill,
   formatSkillSource,
   scanAgentSkills,
   truncate,
   type AgentSkillsView,
 } from './agent-skills.js';
-import { RESOURCE_TYPES, type GlobalOptions, type ResourceType } from './types.js';
+import { RESOURCE_TYPES, LocalConfigSchema, getDataHome, type GlobalOptions, type ResourceType } from './types.js';
+import { projectsRootDir, readAnchorFile, projectSlug, legacyProjectSlug } from './utils/partition.js';
 import { maskEnvValue } from './resources/env.js';
-import { parseTeamMcpServers } from './resources/mcp.js';
-import { parseHooksYaml } from './resources/hooks.js';
+import { mcpEntryReader } from './resources/mcp.js';
+import { resolveTeamHookEntries } from './resources/hooks.js';
+import { envEntryReader } from './resources/env.js';
+import {
+  describeEntryFailure, describeOrigin, describeOrigins, resolveEntriesFor,
+  type EntryResolution, type EntryType,
+} from './namespaced-entries.js';
 
 export interface ListOptions extends GlobalOptions {
   /** Where to look for resources: 'repo' (default for backwards compat),
@@ -32,13 +38,26 @@ export interface ListOptions extends GlobalOptions {
 }
 
 export async function status(options: GlobalOptions): Promise<void> {
-  // Auto-detect scope
-  const { localConfig, teamConfig } = await autoDetectInit();
+  if (options.all) {
+    await statusAll();
+    return;
+  }
+  // Auto-detect scope.
+  // This is a read-only command, so `dryRun` is passed unconditionally rather
+  // than forwarded from `options.dryRun`: the load must never migrate a legacy
+  // role config, adopt a pre-#546 partition, or run the self-heal bootstrap
+  // (#850). The preview path returns what a write would have produced, so the
+  // report below still tells the truth, and the migration then persists on the
+  // next command that writes.
+  const { localConfig, teamConfig } = await autoDetectInit(undefined, { dryRun: true });
   const scopeLabel = localConfig.scope;
 
   // Scope info
   console.log('');
   log.info(`Scope: ${scopeLabel}${scopeLabel === 'project' && localConfig.projectRoot ? ` (${localConfig.projectRoot})` : ''}`);
+  // Machine-data partition: where this project's teamai data actually lives
+  // (~/.teamai/projects/<slug>/ for a partitioned install, else legacy .teamai).
+  log.info(`  data: ${getDataHome(localConfig)}`);
 
   // Git status
   console.log('');
@@ -60,7 +79,7 @@ export async function status(options: GlobalOptions): Promise<void> {
   }
 
   // State
-  const state = await loadStateForScope(localConfig.scope, localConfig.projectRoot);
+  const state = await loadStateForScope(localConfig);
   console.log('');
   log.info('Sync state:');
   console.log(`  last push: ${state.lastPush ?? 'never'}`);
@@ -73,53 +92,54 @@ export async function status(options: GlobalOptions): Promise<void> {
   const repoPath = localConfig.repo.localPath;
   const counts: Record<string, number> = {};
 
-  const skillsDirs = await listDirs(path.join(repoPath, 'skills'));
-  counts.skills = skillsDirs.length;
+  // Match `list skills --source repo`: count skills, not namespace directories.
+  counts.skills = (await new SkillsHandler().scanTeamForPull(teamConfig, localConfig)).length;
 
-  const rulesFiles = (await listFiles(path.join(repoPath, 'rules'))).filter(f => f.endsWith('.md'));
+  const rulesFiles = (await listFilesRecursive(path.join(repoPath, 'rules'))).filter(f => f.endsWith('.md'));
   counts.rules = rulesFiles.length;
 
-  const docsExists = await pathExists(path.join(repoPath, 'docs'));
-  const docFiles = docsExists ? (await listFiles(path.join(repoPath, 'docs'))).filter(f => !f.startsWith('.')) : [];
-  counts.docs = docFiles.length;
+  counts.docs = await new DocsHandler().countDocFiles(path.join(repoPath, 'docs'));
 
-  const envYamlPath = path.join(repoPath, 'env', 'env.yaml');
-  let envCount = 0;
-  if (await pathExists(envYamlPath)) {
-    const envContent = await readFileSafe(envYamlPath);
-    if (envContent) {
-      try {
-        const envData = YAML.parse(envContent) as { variables?: unknown[] };
-        envCount = Array.isArray(envData?.variables) ? envData.variables.length : 0;
-      } catch {
-        // invalid yaml
-      }
-    }
-  }
-  counts.env = envCount;
+  // Env, hooks and MCP count what reaches this directory: root plus the active
+  // namespace files. A set that cannot be resolved counts as 0; `teamai doctor`
+  // and the list commands say why.
+  // A type with namespace entries says where they come from: `env: 3 (2 root, 1 checkout)`.
+  const origins: Partial<Record<ResourceType, string>> = {};
+  const count = (type: EntryType & ResourceType, resolution: EntryResolution<unknown>): void => {
+    counts[type] = resolution.kind === 'resolved' ? resolution.entries.length : 0;
+    if (resolution.kind === 'failed') origins[type] = ' (cannot be resolved; run `teamai doctor`)';
+    else if (resolution.entries.some((entry) => entry.namespace !== null)) origins[type] = ` (${describeOrigins(resolution.entries)})`;
+  };
+  count('env', await resolveEntriesFor(envEntryReader, localConfig));
 
   const agentsHandler = getAllHandlers().find((h) => h.type === 'agents');
   counts.agents = agentsHandler
     ? (await agentsHandler.scanTeamForPull(teamConfig, localConfig)).length
     : 0;
 
-  const hooksHandler = getAllHandlers().find((h) => h.type === 'hooks') as
-    | { countHooks: (repoPath: string) => Promise<number> }
-    | undefined;
-  counts.hooks = hooksHandler ? await hooksHandler.countHooks(repoPath) : 0;
-
-  counts.mcp = (await parseTeamMcpServers(repoPath)).length;
+  count('hooks', (await resolveTeamHookEntries(localConfig)).resolution);
+  count('mcp', await resolveEntriesFor(mcpEntryReader, localConfig));
 
   for (const type of RESOURCE_TYPES) {
-    console.log(`  ${type}: ${counts[type] ?? 0}`);
+    console.log(`  ${type}: ${counts[type] ?? 0}${origins[type] ?? ''}`);
   }
 
   // Local pushable items
   console.log('');
   log.info('Local resources not yet pushed:');
   let anyNew = false;
+  let anyUnscanned = false;
   for (const handler of getAllHandlers()) {
-    const items = await handler.scanLocalForPush(teamConfig, localConfig);
+    let items;
+    try {
+      items = await handler.scanLocalForPush(teamConfig, localConfig);
+    } catch (e) {
+      // A manifest that does not parse fails the pull and the push; status is
+      // where the member looks to find out why, so it reports and goes on.
+      log.warn(`  [${handler.type}] could not scan: ${(e as Error).message}`);
+      anyUnscanned = true;
+      continue;
+    }
     if (items.length > 0) {
       anyNew = true;
       console.log(`  [${handler.type}] ${items.length} new`);
@@ -131,15 +151,112 @@ export async function status(options: GlobalOptions): Promise<void> {
     }
   }
   if (!anyNew) {
-    console.log('  (none)');
+    // A bare "(none)" would read as a clean result for the types it never saw.
+    console.log(anyUnscanned ? '  (none in the types that could be scanned)' : '  (none)');
   }
 
   console.log('');
 }
 
+/**
+ * `teamai status --all` — enumerate every project data partition under
+ * ~/.teamai/projects and flag the stale/orphan ones (issue #374 P3). teamai never
+ * auto-collects orphans (a renamed/moved/deleted project leaves its partition
+ * behind), so this is how a user finds partitions safe to delete by hand.
+ *
+ * The verdict rests on the `anchor` reverse-lookup file — the shared project
+ * anchor this partition is keyed by. The persisted repo.businessRepoRoot /
+ * projectRoot in config.yaml is read only as a DISPLAY fallback (an older
+ * partition may predate anchor files); it is a workspace path that can point at a
+ * linked worktree, so it must never drive the orphan verdict. We mark it:
+ *   - active  : anchor exists on disk
+ *   - orphan  : anchor is gone (project deleted/moved) → safe to delete
+ *   - unknown : no anchor → cannot confirm orphan (partition may still be active,
+ *               e.g. a pre-P3 partition still loaded by its main checkout)
+ *   - active (legacy name) : dir named in the pre-#546 `<basename>-<hash>`
+ *               format — data is fine, the name just predates the widening;
+ *               the next command that resolves the project adopts it
+ *   - corrupt : the dir name matches neither slug(anchor) nor
+ *               legacyProjectSlug(anchor) → tampered/half-written
+ */
+async function statusAll(): Promise<void> {
+  const root = projectsRootDir();
+  const slugs = await listDirs(root);
+
+  console.log('');
+  log.info(`Project data partitions (${root}):`);
+  if (slugs.length === 0) {
+    log.info('  (none — no project has been initialized or migrated on this machine)');
+    console.log('');
+    return;
+  }
+
+  let orphanCount = 0;
+  for (const slug of slugs.sort()) {
+    const partitionDir = path.join(root, slug);
+    const anchor = await readAnchorFile(partitionDir);
+
+    // Recover the project path + read a bit of config for DISPLAY context. The
+    // anchor is the trustworthy source; the config's businessRepoRoot/projectRoot
+    // is only a display fallback (see the orphan-verdict note below).
+    let projectPath = anchor;
+    let scope: string | undefined;
+    let kind: string | undefined;
+    const cfgRaw = await readFileSafe(path.join(partitionDir, 'config.yaml'));
+    if (cfgRaw) {
+      try {
+        const parsed = LocalConfigSchema.parse(YAML.parse(cfgRaw));
+        scope = parsed.scope;
+        kind = parsed.repo.kind;
+        if (!projectPath) projectPath = parsed.repo.businessRepoRoot ?? parsed.projectRoot ?? null;
+      } catch { /* unreadable config — leave fields undefined */ }
+    }
+
+    // The orphan verdict must rest ONLY on the anchor — it is the shared project
+    // anchor this partition is keyed by (projectSlug(anchor)). The config's
+    // businessRepoRoot/projectRoot is a persisted *workspace* path that may point
+    // at a linked worktree; its disappearance does NOT prove the shared partition
+    // (still used by the main checkout) is orphaned. So without a trustworthy
+    // anchor we never recommend deletion — classify as unknown.
+    let state: string;
+    if (!anchor) {
+      state = projectPath
+        ? 'unknown — no anchor; cannot confirm orphan (partition may still be active)'
+        : 'unknown (no anchor / project path)';
+    } else if (!(await pathExists(anchor))) {
+      state = 'ORPHAN — project path is gone, safe to delete';
+      orphanCount++;
+    } else if (projectSlug(anchor) === slug) {
+      state = 'active';
+    } else if (legacyProjectSlug(anchor) === slug) {
+      // Pre-#546 naming (`<basename>-<hash>`): the data is fine, the name is
+      // just the older format. status --all never renames anything, so report
+      // it as active with a hint — the next command that resolves this
+      // project's partition adopts it under the current name automatically.
+      state = 'active (legacy name; renamed automatically on next command)';
+    } else {
+      state = 'corrupt — dir name does not match anchor';
+    }
+
+    const kindLabel = kind ? ` ${kind}` : '';
+    log.info(`  ${slug}  [${state}]`);
+    log.info(`    project: ${projectPath ?? '(unresolved)'}${scope ? `  (${scope}${kindLabel})` : ''}`);
+  }
+
+  console.log('');
+  if (orphanCount > 0) {
+    log.warn(
+      `${orphanCount} orphan partition(s) found. teamai never deletes them automatically; ` +
+        `remove one with:  rm -rf "${root}/<slug>"`,
+    );
+    console.log('');
+  }
+}
+
 export async function list(type: string | undefined, options: ListOptions): Promise<void> {
-  // Auto-detect scope
-  const { localConfig, teamConfig } = await autoDetectInit();
+  // Auto-detect scope — read-only, so `dryRun: true` unconditionally, as in
+  // `status` above (#850).
+  const { localConfig, teamConfig } = await autoDetectInit(undefined, { dryRun: true });
   const repoPath = localConfig.repo.localPath;
 
   const source = options.source ?? 'all';
@@ -201,54 +318,49 @@ async function printRepoSection(
   options: ListOptions,
   ctx: { repoPath: string; teamConfig: Awaited<ReturnType<typeof autoDetectInit>>['teamConfig']; localConfig: Awaited<ReturnType<typeof autoDetectInit>>['localConfig'] },
 ): Promise<void> {
-  const { repoPath, teamConfig, localConfig } = ctx;
+  const { teamConfig, localConfig } = ctx;
   console.log('');
   console.log(`=== REPO ${t.toUpperCase()} ===`);
 
+  // Env, hooks and MCP list what reaches this directory, each with its
+  // namespace: root plus the active namespace files.
   if (t === 'env') {
-    const envYamlPath = path.join(repoPath, 'env', 'env.yaml');
-    if (await pathExists(envYamlPath)) {
-      const envContent = await readFileSafe(envYamlPath);
-      if (envContent) {
-        try {
-          const envData = YAML.parse(envContent) as { variables?: Array<{ key: string; value: string; description?: string }> };
-          if (envData?.variables && envData.variables.length > 0) {
-            if (options.reveal) {
-              process.stderr.write('[warn] Env values will be shown in plaintext\n');
-            }
-            for (const v of envData.variables) {
-              const display = options.reveal ? v.value : maskEnvValue(v.value);
-              console.log(`  ${v.key}=${display}`);
-              if (options.verbose && v.description) {
-                console.log(`    ${v.description}`);
-              }
-            }
-          } else {
-            console.log('  (none)');
-          }
-        } catch {
-          console.log('  (invalid env.yaml)');
-        }
-      } else {
-        console.log('  (none)');
-      }
-    } else {
+    const env = await resolveEntriesFor(envEntryReader, localConfig);
+    if (env.kind === 'failed') {
+      console.log(`  ${describeEntryFailure(env.failure)}`);
+    } else if (env.entries.length === 0) {
       console.log('  (none)');
+    } else {
+      if (options.reveal) {
+        process.stderr.write('[warn] Env values will be shown in plaintext\n');
+      }
+      for (const v of env.entries) {
+        const display = options.reveal ? v.entry.value : maskEnvValue(v.entry.value);
+        console.log(`  ${v.name}=${display}  (${describeOrigin(v)})`);
+        if (options.verbose && v.entry.description) {
+          console.log(`    ${v.entry.description}`);
+        }
+      }
     }
     return;
   }
 
   if (t === 'mcp') {
-    const servers = await parseTeamMcpServers(repoPath);
-    if (servers.length === 0) {
+    const mcp = await resolveEntriesFor(mcpEntryReader, localConfig);
+    if (mcp.kind === 'failed') {
+      console.log(`  ${describeEntryFailure(mcp.failure)}`);
+      return;
+    }
+    if (mcp.entries.length === 0) {
       console.log('  (none)');
       return;
     }
-    for (const s of servers) {
+    for (const resolved of mcp.entries) {
+      const s = resolved.entry;
       const endpoint = s.transport === 'stdio'
         ? `${s.command ?? ''} ${(s.args ?? []).join(' ')}`.trim()
         : (s.url ?? '');
-      console.log(`  ${s.name}  [${s.transport}]  ${endpoint}`);
+      console.log(`  ${s.name}  [${s.transport}]  ${endpoint}  (${describeOrigin(resolved)})`);
       if (options.verbose && s.description) {
         console.log(`    ${s.description}`);
       }
@@ -257,14 +369,18 @@ async function printRepoSection(
   }
 
   if (t === 'hooks') {
-    const parsed = await parseHooksYaml(repoPath);
-    const hooks = parsed?.hooks ?? [];
-    if (hooks.length === 0) {
+    const { resolution: hooks } = await resolveTeamHookEntries(localConfig);
+    if (hooks.kind === 'failed') {
+      console.log(`  ${describeEntryFailure(hooks.failure)}`);
+      return;
+    }
+    if (hooks.entries.length === 0) {
       console.log('  (none)');
       return;
     }
-    for (const h of hooks) {
-      console.log(`  ${h.id}  [${h.event}]`);
+    for (const resolved of hooks.entries) {
+      const h = resolved.entry;
+      console.log(`  ${h.id}  [${h.event}]  (${describeOrigin(resolved)})`);
       if (options.verbose && h.description) {
         console.log(`    ${h.description}`);
       }

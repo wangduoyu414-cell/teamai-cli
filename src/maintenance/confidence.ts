@@ -3,7 +3,8 @@ import path from 'node:path';
 
 import matter from 'gray-matter';
 
-import { readFileSafe, writeFile, listFiles } from '../utils/fs.js';
+import { ensureDir, readFileSafe, writeFile, listFiles } from '../utils/fs.js';
+import { isInWriteRoot, listLearningFiles } from '../utils/learnings-roots.js';
 import { log } from '../utils/logger.js';
 
 export interface ConfidenceFactors {
@@ -87,22 +88,21 @@ export async function computeAllConfidence(votesDir: string): Promise<Map<string
 /**
  * Write confidence scores back into learning document frontmatter.
  * Only updates docs whose confidence changed by > 0.05.
- * Returns count of files updated.
+ * Returns the files it wrote, which are what a publish may stage (#823).
  */
 export async function writeBackConfidence(
-  learningsDir: string,
+  learningsDirs: readonly string[],
   confidenceMap: Map<string, number>,
-): Promise<number> {
-  let updated = 0;
-  const files = await listFiles(learningsDir);
+  writeRoot?: string,
+): Promise<string[]> {
+  const written: string[] = [];
+  const files = await listLearningFiles(learningsDirs);
 
-  for (const file of files) {
-    if (!file.endsWith('.md')) continue;
+  for (const { file, absPath } of files) {
     const docId = file.replace(/\.md$/i, '');
     const newConf = confidenceMap.get(docId);
     if (newConf === undefined) continue;
 
-    const absPath = path.join(learningsDir, file);
     const content = await readFileSafe(absPath);
     if (!content) continue;
 
@@ -114,15 +114,23 @@ export async function writeBackConfidence(
 
       data.confidence = newConf;
       const newContent = matter.stringify(body, data);
-      await writeFile(absPath, newContent);
-      updated++;
+      // An inherited learning lives in a root nothing pushes, so rewriting it
+      // there would be discarded by the next realign and never reach the team.
+      // The new version goes to the write root instead, where it takes
+      // precedence over the copy it supersedes.
+      const target = writeRoot && !isInWriteRoot(absPath, writeRoot)
+        ? path.join(writeRoot, file)
+        : absPath;
+      await ensureDir(path.dirname(target));
+      await writeFile(target, newContent);
+      written.push(target);
     } catch {
       log.debug(`confidence: failed to update frontmatter for: ${file}`);
     }
   }
 
-  if (updated > 0) {
-    log.info(`Updated confidence scores for ${updated} learning(s)`);
+  if (written.length > 0) {
+    log.info(`Updated confidence scores for ${written.length} learning(s)`);
   }
-  return updated;
+  return written;
 }

@@ -1,20 +1,159 @@
-import path from 'node:path';
-import { ResourceHandler } from './base.js';
-import type { ResourceItem, ResourceItemStatus, TeamaiConfig, LocalConfig } from '../types.js';
-import { resolveBaseDir, getPushignorePath } from '../types.js';
-import { listDirs, pathExists, copyDir, remove, dirTeamSubsetEqual, getDirLatestMtime, readFileSafe, writeFile } from '../utils/fs.js';
-import { log } from '../utils/logger.js';
-import { BUILTIN_SKILL_NAMES } from '../builtin-skills.js';
-import { resolveOpenclawWorkspaceDir } from '../openclaw-hooks.js';
-import { loadRolesManifest, resolveRoleResourceNamespaces } from '../roles.js';
-import { loadManagedResourceManifest, reconcileManagedResources, type DesiredManagedResource } from '../managed-resources.js';
+import { getCopilotHome } from '../types.js';
+import { usesManagedPolicy } from '../host-adapters.js';
 import { getTeamaiHome } from '../types.js';
-import { assertHostRootsStable, isHostSelected, resolveHostResourcePath, resolveHostRoot, supportsStaticResource } from '../host-adapters.js';
+import { loadManagedResourceManifest, reconcileManagedResources, type DesiredManagedResource } from '../managed-resources.js';
+import { isHostSelected, supportsStaticResource, resolveHostResourcePath, resolveHostRoot, assertHostRootsStable } from '../host-adapters.js';
+import path from 'node:path';
+import YAML from 'yaml';
+import { isToolInstalledForConfig, ResourceHandler } from './base.js';
+import type { ResourceItem, ResourceItemStatus, DeliveryTarget, TeamaiConfig, LocalConfig } from '../types.js';
+import { getPushignorePath, isAgentExcluded, resolveToolBaseDir, scopedToolPaths, SELF_KNOWLEDGE_SCAN_KEY } from '../types.js';
+import { listDirs, listFilesRecursive, pathExists, copyDir, remove, pruneEmptyDirs, dirContentEqual, dirTeamSubsetEqual, fileContentEqual, getDirLatestMtime, readFileSafe, writeFile } from '../utils/fs.js';
+import { log } from '../utils/logger.js';
+import { getFileContentWhenAdded, isPastVersionOf } from '../utils/git.js';
+import { isCliOwnedSkillName } from '../builtin-skills.js';
+import { resolveOpenclawWorkspaceDir } from '../openclaw-hooks.js';
+import { getHermesHome } from '../hermes-home.js';
+import {
+  loadRolesManifest, resolveRoleResourceNamespaces, RolesManifestNotFoundError, type RolesManifest,
+} from '../roles.js';
+import { loadProjectsManifest, resolveProjectResourceNamespaces } from '../projects.js';
+import { assertSafeFallbackNamespaces } from '../manifest-schema.js';
+import { assertWithinRoot } from '../utils/path-safety.js';
+import { splitFrontmatter, stringifyFrontmatter } from '../utils/frontmatter.js';
 
 /** File name used to track who has contributed (pushed) a skill. */
 const CONTRIBUTORS_FILE = 'CONTRIBUTORS';
 const SKILL_MD = 'SKILL.md';
-const FRONTMATTER_REGEX = /^---\n[\s\S]*?\n---/;
+export const CODEX_TOOL = 'codex';
+export const SHARED_AGENT_SKILLS_PATH = '.agents/skills';
+
+/** Prefer Codex's shared skill when that skill already lives there. */
+export async function resolveSkillDestination(
+  tool: string,
+  configuredSkillsPath: string,
+  baseDir: string,
+  skillName: string,
+  sourcePath?: string,
+): Promise<string> {
+  const configuredDestination = path.join(baseDir, configuredSkillsPath, skillName);
+  if (tool === CODEX_TOOL) {
+    const sharedDestination = path.join(baseDir, SHARED_AGENT_SKILLS_PATH, skillName);
+    if (await pathExists(sharedDestination)) {
+      // No source to compare against: the caller only wants to know where the
+      // skill lives. Reconciling needs the team copy to prove the two are the
+      // same, so without it there is nothing to decide and nothing to report —
+      // `doctor` and the post-pull pass would otherwise warn about a conflict
+      // on every skill, for copies the write path treats as identical.
+      if (!sourcePath) return sharedDestination;
+      if (await pathExists(configuredDestination)) {
+        if (await dirContentEqual(sharedDestination, configuredDestination) && await dirContentEqual(configuredDestination, sourcePath)) {
+          await remove(configuredDestination);
+          log.debug(`Removed identical TeamAI skill ${skillName} from ${configuredSkillsPath}`);
+        } else {
+          log.warn(`Codex skill conflict for ${skillName}: keeping different copies in ${SHARED_AGENT_SKILLS_PATH} and ${configuredSkillsPath}`);
+        }
+      }
+      return sharedDestination;
+    }
+  }
+
+  return configuredDestination;
+}
+
+/**
+ * The directory `tool` receives skills into on this machine, or null when it
+ * cannot receive them: no skills path configured, or the tool is not installed.
+ *
+ * This is the gate on its own, asked without inventing a skill name. OpenClaw
+ * resolves through its workspace directory, Hermes through its home, Copilot
+ * counts itself installed once `enabledAgents` names it, and everything else
+ * falls back to the tool root. A second spelling of these gates is exactly how
+ * "Synced N skills" ends up true while a tool receives nothing (#598).
+ */
+export async function skillsDirForTool(
+  tool: string,
+  configuredSkillsPath: string | undefined,
+  localConfig: LocalConfig,
+  probePath?: string,
+): Promise<string | null> {
+  if (!configuredSkillsPath || (usesManagedPolicy(undefined, localConfig) && (!isHostSelected(localConfig, tool) || !supportsStaticResource(tool, 'skills', localConfig.scope)))) return null;
+  if (localConfig.hostRoots) assertHostRootsStable(localConfig);
+  const special = localConfig.hostRoots ? resolveHostResourcePath(tool, 'skills', localConfig) : undefined;
+  if (special) return await pathExists(resolveHostRoot(tool, localConfig.scope, localConfig.projectRoot)!) ? special : null;
+
+  if (tool === 'openclaw') {
+    if (localConfig.scope === 'project') return null;
+    const wsDir = await resolveOpenclawWorkspaceDir();
+    if (!wsDir) {
+      log.debug('Skipping skill sync for openclaw: workspace dir not found');
+      return null;
+    }
+    return path.join(wsDir, 'skills');
+  }
+
+  if (tool === 'hermes') {
+    // Like every other tool, skip when not installed: getHermesHome() always
+    // resolves (HERMES_HOME or ~/.hermes), so without this check every pull
+    // creates a hermes home the user never asked for.
+    if (!await pathExists(getHermesHome())) {
+      log.debug(`Skipping skill sync for ${tool}: tool not installed`);
+      return null;
+    }
+    return path.join(getHermesHome(), 'skills');
+  }
+
+  if (!await isToolInstalledForConfig(tool, configuredSkillsPath, localConfig, undefined, probePath)) {
+    log.debug(`Skipping skill sync for ${tool}: tool not installed`);
+    return null;
+  }
+
+  return path.join(resolveToolBaseDir(tool, localConfig), configuredSkillsPath);
+}
+
+/**
+ * Where `skillName` lands for `tool` on this machine, or null when the tool
+ * cannot receive it.
+ *
+ * One place answers that question, so `pull` writes and `doctor` checks the very
+ * same paths (#598). A second copy of these gates is how "Synced 12 skills"
+ * ends up true for one tool and silently false for another.
+ *
+ * `sourcePath` belongs to the write path: it lets the Codex shared-directory
+ * reconciliation delete a duplicate it can prove is identical. Omit it to
+ * resolve a destination without that side effect.
+ */
+export async function skillTargetForTool(
+  tool: string,
+  configuredSkillsPath: string | undefined,
+  localConfig: LocalConfig,
+  skillName: string,
+  sourcePath?: string,
+  probePath?: string,
+): Promise<string | null> {
+  const skillsDir = await skillsDirForTool(tool, configuredSkillsPath, localConfig, probePath);
+  if (skillsDir === null || configuredSkillsPath === undefined) return null;
+
+  // Codex alone can redirect a skill to the shared `.agents/skills` directory,
+  // and only for a skill that already lives there — so the destination is
+  // per-skill and the gate above cannot answer it.
+  if (tool === CODEX_TOOL) {
+    const baseDir = resolveToolBaseDir(tool, localConfig);
+    return resolveSkillDestination(tool, configuredSkillsPath, baseDir, skillName, sourcePath);
+  }
+
+  return path.join(skillsDir, skillName);
+}
+
+/** Add fields immediately before the closing delimiter without reformatting existing YAML. */
+function appendFrontmatterFields(raw: string, fields: Record<string, string>): string {
+  const eol = raw.includes('\r\n') ? '\r\n' : '\n';
+  const yaml = YAML.stringify(fields).trimEnd().replace(/\n/g, eol);
+  return raw.replace(
+    /(\r?\n---[ \t]*)(\r?\n|$)$/,
+    (_match, closing: string, trailing: string) => `${eol}${yaml}${closing}${trailing}`,
+  );
+}
 
 /**
  * Ensure a SKILL.md file has valid YAML frontmatter with `name` and `description`.
@@ -30,38 +169,35 @@ export async function ensureSkillFrontmatter(skillDir: string, skillName: string
   const content = await readFileSafe(skillMdPath);
   if (!content) return false;
 
-  const fmMatch = content.match(FRONTMATTER_REGEX);
+  const { data, body, raw, valid } = splitFrontmatter(content);
 
-  if (!fmMatch) {
+  if (!raw) {
     // No frontmatter at all — derive description from first heading or first non-empty line
-    const description = extractDescriptionFromContent(content, skillName);
-    const frontmatter = `---\nname: ${skillName}\ndescription: ${description}\n---\n`;
-    const newContent = frontmatter + (content.startsWith('\n') ? content : '\n' + content);
+    const description = extractDescriptionFromContent(body, skillName);
+    const newContent = stringifyFrontmatter({ name: skillName, description }, body);
     await writeFile(skillMdPath, newContent);
     log.debug(`Injected YAML frontmatter into ${skillName}/SKILL.md`);
     return true;
   }
 
+  if (!valid) {
+    log.warn(`Could not repair malformed frontmatter in ${skillName}/SKILL.md; leaving it unchanged`);
+    return false;
+  }
+
   // Frontmatter exists — check for missing fields
-  const fmBlock = fmMatch[0];
-  const fmBody = fmBlock.slice(4, fmBlock.length - 4); // strip leading/trailing ---\n
-  const hasName = /^name:\s*.+/m.test(fmBody);
-  const hasDescription = /^description:\s*.+/m.test(fmBody);
+  const hasName = typeof data['name'] === 'string' && String(data['name']).trim() !== '';
+  const hasDescription = typeof data['description'] === 'string' && String(data['description']).trim() !== '';
 
   if (hasName && hasDescription) return false; // Already complete
 
-  const lines = fmBody.split('\n');
-  if (!hasName) {
-    lines.push(`name: ${skillName}`);
-  }
-  if (!hasDescription) {
-    const restContent = content.slice(fmMatch[0].length);
-    const description = extractDescriptionFromContent(restContent, skillName);
-    lines.push(`description: ${description}`);
-  }
+  const missingFields: Record<string, string> = {};
+  if (!hasName) missingFields.name = skillName;
+  if (!hasDescription) missingFields.description = extractDescriptionFromContent(body, skillName);
 
-  const newFrontmatter = `---\n${lines.join('\n')}\n---`;
-  const newContent = content.replace(FRONTMATTER_REGEX, newFrontmatter);
+  // Preserve existing comments, quoting, key order, and line endings. Re-serializing
+  // the whole block would make an unrelated metadata repair unnecessarily lossy.
+  const newContent = appendFrontmatterFields(raw, missingFields) + body;
   await writeFile(skillMdPath, newContent);
   log.debug(`Added missing frontmatter fields to ${skillName}/SKILL.md`);
   return true;
@@ -93,7 +229,12 @@ function extractDescriptionFromContent(content: string, skillName: string): stri
 /**
  * Scan the team repo skills/ directory to discover namespace subdirectories.
  * A directory is a namespace if it does NOT contain SKILL.md (i.e. it contains
- * skill subdirectories rather than being a skill itself).
+ * skill subdirectories rather than being a skill itself) AND it actually holds
+ * at least one skill. The second condition matters: git tracks files, not
+ * directories, so a pushed skill whose source had an empty subdirectory (e.g.
+ * an unused `assets/`) leaves an untracked, SKILL.md-less shell behind in the
+ * working tree. Treating that shell as a namespace nested every later push
+ * inside a skill's own name.
  * Returns the list of namespace names found, or [] if layout is purely flat.
  */
 export async function scanTeamRepoNamespaces(repoPath: string): Promise<string[]> {
@@ -106,9 +247,16 @@ export async function scanTeamRepoNamespaces(repoPath: string): Promise<string[]
   for (const dir of topDirs) {
     const dirPath = path.join(teamSkillsDir, dir);
     const hasSkillMd = await pathExists(path.join(dirPath, 'SKILL.md'));
-    if (!hasSkillMd) {
-      namespaces.push(dir);
+    if (hasSkillMd) continue;
+    const subDirs = await listDirs(dirPath);
+    let holdsSkill = false;
+    for (const subDir of subDirs) {
+      if (await pathExists(path.join(dirPath, subDir, 'SKILL.md'))) {
+        holdsSkill = true;
+        break;
+      }
     }
+    if (holdsSkill) namespaces.push(dir);
   }
 
   return namespaces;
@@ -125,33 +273,60 @@ async function readPushIgnoredSkills(): Promise<Set<string>> {
 
 /**
  * Resolve skill namespaces from the manifest using the user's configured roles.
- * Falls back to [primaryRole, ...additionalRoles] if manifest is unavailable,
- * and returns [] if no roles are configured.
+ * Falls back to [primaryRole, ...additionalRoles] when the manifest is absent or
+ * does not list the role, returns [] if no roles are configured, and throws when
+ * the manifest exists but cannot be read or parsed.
  */
 async function resolveSkillNamespaces(localConfig: LocalConfig): Promise<string[]> {
   if (!localConfig.primaryRole) return [];
+  const roleIds = [localConfig.primaryRole, ...(localConfig.additionalRoles ?? [])];
+
+  let manifest: RolesManifest;
+  try {
+    manifest = await loadRolesManifest(localConfig.repo.localPath);
+  } catch (error) {
+    // Fallback: use role ids as namespace names (legacy behavior). Reserved for a
+    // manifest that is not there — one that exists and does not parse must not be
+    // silently replaced by a guess at its contents.
+    if (!(error instanceof RolesManifestNotFoundError)) throw error;
+    return assertSafeFallbackNamespaces(roleIds, 'role id used as a skills namespace');
+  }
 
   try {
-    const manifest = await loadRolesManifest(localConfig.repo.localPath);
-    const namespaces = resolveRoleResourceNamespaces({
+    return resolveRoleResourceNamespaces({
       manifest,
       primaryRole: localConfig.primaryRole,
       additionalRoles: localConfig.additionalRoles ?? [],
-    });
-    return namespaces.skills;
+    }).skills;
   } catch {
-    // Fallback: use role ids as namespace names (legacy behavior)
-    return [localConfig.primaryRole, ...(localConfig.additionalRoles ?? [])];
+    // A valid manifest that no longer lists the role (renamed or removed) keeps
+    // the legacy guess it always had; push placement still refuses to guess.
+    return assertSafeFallbackNamespaces(roleIds, 'role id used as a skills namespace');
   }
 }
 
-function getSkillDestination(localConfig: LocalConfig, skillName: string, namespace?: string): string {
-  if (namespace) {
-    return path.join(localConfig.repo.localPath, 'skills', namespace, skillName);
+/**
+ * The skills namespaces push treats as this member's: the role ones
+ * (`resolveSkillNamespaces`, legacy fallbacks included), then those of the
+ * active projects, the same union pull delivers from. Without the project
+ * half, a project skill was pushable only through legacy mode's first-match
+ * scan, which can pick another project's skill of the same name.
+ */
+async function resolvePushSkillNamespaces(localConfig: LocalConfig): Promise<string[]> {
+  const roleNamespaces = await resolveSkillNamespaces(localConfig);
+  const activeProjects = localConfig.projects ?? [];
+  if (activeProjects.length === 0) return roleNamespaces;
+  const manifest = await loadProjectsManifest(localConfig.repo.localPath);
+  if (!manifest) return roleNamespaces;
+  let projectNamespaces: string[];
+  try {
+    projectNamespaces = resolveProjectResourceNamespaces({ manifest, activeProjects }).skills;
+  } catch {
+    // An unknown project id: pull falls back to role-only filtering and warns.
+    return roleNamespaces;
   }
-  return path.join(localConfig.repo.localPath, 'skills', skillName);
+  return [...new Set([...roleNamespaces, ...projectNamespaces])];
 }
-
 
 /**
  * Recursively scan a directory tree to find all subdirectories containing SKILL.md.
@@ -208,6 +383,86 @@ async function scanSkillsRecursively(dirPath: string): Promise<Map<string, strin
   return results;
 }
 
+/**
+ * Every file another team copy of `item`'s skill name tracks: the root skill,
+ * or the skill of that name in any namespace, other than `item` itself. Each
+ * relative path maps to that file in every copy that has it.
+ */
+async function otherVersionFiles(repoPath: string, item: ResourceItem): Promise<Map<string, string[]>> {
+  const skillsDir = path.join(repoPath, 'skills');
+  const copies: string[] = [];
+  for (const dir of await listDirs(skillsDir)) {
+    const dirPath = path.join(skillsDir, dir);
+    if (await pathExists(path.join(dirPath, SKILL_MD))) {
+      if (dir === item.name) copies.push(dirPath);
+    } else if (await pathExists(path.join(dirPath, item.name))) {
+      copies.push(path.join(dirPath, item.name));
+    }
+  }
+  const files = new Map<string, string[]>();
+  for (const copy of copies) {
+    if (path.resolve(copy) === path.resolve(item.sourcePath)) continue;
+    for (const file of await listFilesRecursive(copy)) files.set(file, [...(files.get(file) ?? []), path.join(copy, file)]);
+  }
+  return files;
+}
+
+/**
+ * Install replaces the whole skill (#707): after `source` is copied over
+ * `dest`, a file `source` does not have is removed when it is byte for byte
+ * that file of another team version of the skill, so switching between the
+ * root skill and a namespace skill of that name leaves nothing of the previous
+ * one behind. Any other file is the member's own, and stays: push does not
+ * count such an extra as a change, so it may never have been pushed. One at a
+ * path another version has is named, since it may be an edited leftover.
+ */
+async function removeLeftoverVersionFiles(source: string, dest: string, otherVersions: Map<string, string[]>): Promise<void> {
+  if (otherVersions.size === 0) return;
+  const sourceFiles = new Set(await listFilesRecursive(source));
+  let removed = false;
+  for (const file of await listFilesRecursive(dest)) {
+    const versions = otherVersions.get(file);
+    if (sourceFiles.has(file) || !versions) continue;
+    const installed = path.join(dest, file);
+    const leftover = (await Promise.all(versions.map((version) => fileContentEqual(installed, version)))).some(Boolean);
+    if (!leftover) {
+      log.warn(
+        `Kept ${installed}: another team version of this skill has a file at that path with different content, `
+        + 'so it may be yours or an edited copy. Delete it if you do not need it.',
+      );
+      continue;
+    }
+    await remove(installed);
+    removed = true;
+  }
+  if (removed) await pruneEmptyDirs(dest);
+}
+
+/**
+ * Whether every team file of the skill at `teamDir` (`teamRelDir` in the team
+ * repo at `repoPath`) whose copy under `localDir` differs is an older version
+ * of that team file. A team file missing locally is one a teammate added since
+ * when the active branch at `activeRoot` never added it, and the member's
+ * deletion otherwise. Files only the member has are ignored, as
+ * dirTeamSubsetEqual ignores them.
+ */
+async function isPastSkillVersion(
+  repoPath: string, activeRoot: string, localDir: string, teamDir: string, teamRelDir: string,
+): Promise<boolean> {
+  for (const rel of await listFilesRecursive(teamDir)) {
+    if (rel.split('/').includes(CONTRIBUTORS_FILE)) continue;
+    const localFile = path.join(localDir, rel);
+    if (await fileContentEqual(localFile, path.join(teamDir, rel))) continue;
+    if (!await pathExists(localFile)) {
+      const activeRel = path.relative(activeRoot, localFile).split(path.sep).join('/');
+      if (await getFileContentWhenAdded(activeRoot, activeRel) === null) continue;
+      return false;
+    }
+    if (!await isPastVersionOf(repoPath, localFile, `${teamRelDir}/${rel}`)) return false;
+  }
+  return true;
+}
+
 export class SkillsHandler extends ResourceHandler {
   readonly type = 'skills' as const;
 
@@ -220,7 +475,7 @@ export class SkillsHandler extends ResourceHandler {
    * to enforce role-based access control.
    */
   async scanLocalForPush(teamConfig: TeamaiConfig, localConfig: LocalConfig): Promise<ResourceItem[]> {
-    const scopedNamespaces = await resolveSkillNamespaces(localConfig);
+    const scopedNamespaces = await resolvePushSkillNamespaces(localConfig);
     const teamSkills = new Map<string, { dir: string; namespace?: string }>();
     const blockedSkills = new Set<string>(); // Skills in non-allowed namespaces (role-based)
 
@@ -240,13 +495,17 @@ export class SkillsHandler extends ResourceHandler {
         }
       }
 
-      // Second pass: load skills from allowed namespaces
+      // Second pass: load skills from allowed namespaces. A namespace skill
+      // replaces the root skill of its name, as pull delivers it (#707), so an
+      // edit goes back to the namespace; the first namespace keeps a name. A
+      // directory without SKILL.md is not a skill and replaces nothing, as in pull.
       for (const namespace of scopedNamespaces) {
         const teamSkillsNsDir = path.join(allSkillsDir, namespace);
         const names = await listDirs(teamSkillsNsDir);
         for (const name of names) {
-          if (!teamSkills.has(name)) {
-            teamSkills.set(name, { dir: path.join(teamSkillsNsDir, name), namespace });
+          const dir = path.join(teamSkillsNsDir, name);
+          if (!teamSkills.get(name)?.namespace && await pathExists(path.join(dir, SKILL_MD))) {
+            teamSkills.set(name, { dir, namespace });
           }
         }
       }
@@ -304,10 +563,9 @@ export class SkillsHandler extends ResourceHandler {
     const candidates = new Map<string, { sourcePath: string; mtime: number; status: ResourceItemStatus; namespace?: string }>();
 
     // Scan each tool's skills directory
-    for (const [tool, toolPath] of Object.entries(teamConfig.toolPaths)) {
-      if (!toolPath.skills || !isHostSelected(localConfig, tool) || !supportsStaticResource(tool, 'skills', localConfig.scope)) continue;
-      const skillsDir = resolveHostResourcePath(tool, 'skills', localConfig)
-        ?? path.join(resolveBaseDir(localConfig), toolPath.skills);
+    for (const [tool, toolPath] of Object.entries(scopedToolPaths(teamConfig, localConfig))) {
+      if (!toolPath.skills || (usesManagedPolicy(teamConfig, localConfig) && (!isHostSelected(localConfig, tool) || !supportsStaticResource(tool, 'skills', localConfig.scope)))) continue;
+      const skillsDir = resolveHostResourcePath(tool, 'skills', localConfig) ?? path.join(resolveToolBaseDir(tool, localConfig), toolPath.skills);
       if (!await pathExists(skillsDir)) continue;
 
       // Use recursive scanning to find all skills at any depth
@@ -317,7 +575,7 @@ export class SkillsHandler extends ResourceHandler {
         if (tombstones.has(dir)) continue;
         if (pushIgnoredSkills.has(dir)) continue;
         if (blockedSkills.has(dir)) continue; // Skip skills in non-allowed namespaces
-        if (BUILTIN_SKILL_NAMES.has(dir)) continue; // Skip CLI built-in skills
+        if (isCliOwnedSkillName(dir)) continue; // Skip CLI built-in skills, current and legacy
         if (sourceSkillNames.has(dir)) continue; // Skip cross-team source skills
 
         if (teamSkills.has(dir)) {
@@ -325,6 +583,19 @@ export class SkillsHandler extends ResourceHandler {
           const teamDirPath = teamSkills.get(dir)!.dir;
           const equal = await dirTeamSubsetEqual(localDirPath, teamDirPath, [CONTRIBUTORS_FILE]);
           if (equal) continue; // This tool dir's copy is identical, skip
+          // Single-repo mode: like `.teamai/rules` (see the rules scan), the
+          // active tree's `.teamai/skills` is never refreshed, and a branch
+          // behind the default branch holds older copies nobody edited (#823).
+          const teamRelDir = path.relative(localConfig.repo.localPath, teamDirPath).split(path.sep).join('/');
+          if (tool === SELF_KNOWLEDGE_SCAN_KEY && localConfig.projectRoot
+            && await isPastSkillVersion(localConfig.repo.localPath, localConfig.projectRoot, localDirPath, teamDirPath, teamRelDir)) {
+            log.warn(
+              `[skills] Skipped ${dir}: ${path.relative(resolveToolBaseDir(tool, localConfig), localDirPath)} is an older `
+              + `version of ${teamRelDir}, which has changed on the team since. `
+              + 'Copy the current files over it (or delete it) before editing.',
+            );
+            continue;
+          }
 
           // Content differs — candidate for "modified"
           const mtime = await getDirLatestMtime(localDirPath);
@@ -409,8 +680,21 @@ export class SkillsHandler extends ResourceHandler {
    * Copy a local skill to the team repo.
    */
   async pushItem(item: ResourceItem, _teamConfig: TeamaiConfig, localConfig: LocalConfig): Promise<void> {
-    const dest = getSkillDestination(localConfig, item.name, item.namespace ?? localConfig.primaryRole);
+    const skillsRoot = path.join(localConfig.repo.localPath, 'skills');
+    const dest = path.resolve(localConfig.repo.localPath, item.relativePath);
+    assertWithinRoot(
+      skillsRoot,
+      dest,
+      `Invalid skill destination outside team repo skills directory: ${item.relativePath}`,
+    );
     await copyDir(item.sourcePath, dest);
+    const sourceFiles = new Set(await listFilesRecursive(item.sourcePath));
+    const teamFiles = await listFilesRecursive(dest);
+    for (const relativePath of teamFiles) {
+      if (sourceFiles.has(relativePath) || relativePath === CONTRIBUTORS_FILE) continue;
+      await remove(path.join(dest, relativePath));
+    }
+    await pruneEmptyDirs(dest);
     log.debug(`Copied skill ${item.name} → team repo`);
 
     // Ensure SKILL.md has proper YAML frontmatter (name + description)
@@ -430,71 +714,77 @@ export class SkillsHandler extends ResourceHandler {
   }
 
   /**
+   * Every tool that receives `item`, and where it lands.
+   *
+   * `sourcePath` opts into the write path's Codex shared-directory
+   * reconciliation, which can delete a duplicate it proves identical. A reader
+   * omits it and gets the same destinations without the side effect.
+   */
+  private async resolveTargets(
+    teamConfig: TeamaiConfig,
+    localConfig: LocalConfig,
+    item: ResourceItem,
+    sourcePath?: string,
+  ): Promise<DeliveryTarget[]> {
+    const targets: DeliveryTarget[] = [];
+    for (const [tool, toolPath] of Object.entries(scopedToolPaths(teamConfig, localConfig))) {
+      if (isAgentExcluded(localConfig, tool)) continue;
+      if (usesManagedPolicy(teamConfig, localConfig)
+        && (!isHostSelected(localConfig, tool) || !supportsStaticResource(tool, 'skills', localConfig.scope))) continue;
+
+      const dest = await skillTargetForTool(tool, toolPath.skills, localConfig, item.name, sourcePath, toolPath.probe);
+      if (dest) targets.push({ tool, dest });
+    }
+    return targets;
+  }
+
+  async deliveryTargets(
+    teamConfig: TeamaiConfig,
+    localConfig: LocalConfig,
+    item: ResourceItem,
+  ): Promise<DeliveryTarget[]> {
+    return this.resolveTargets(teamConfig, localConfig, item);
+  }
+
+  /**
    * Pull a skill from team repo to all configured AI tool directories.
    */
   async pullItem(item: ResourceItem, teamConfig: TeamaiConfig, localConfig: LocalConfig): Promise<void> {
-    const resource = await this.buildManagedResource(item, teamConfig, localConfig);
-    const home = getTeamaiHome(localConfig.scope, localConfig.projectRoot);
-    const result = await reconcileManagedResources(home, [resource]);
-    for (const conflict of result.conflicts) log.warn(`Skipped skill sync: ${conflict}`);
-  }
-
-  /** Build every installed destination before the lifecycle engine stages them. */
-  async buildManagedResource(
-    item: ResourceItem,
-    teamConfig: TeamaiConfig,
-    localConfig: LocalConfig,
-  ): Promise<DesiredManagedResource> {
-    assertHostRootsStable(localConfig);
-    const baseDir = resolveBaseDir(localConfig);
-    const targets: DesiredManagedResource['targets'] = [];
-    for (const [tool, toolPath] of Object.entries(teamConfig.toolPaths)) {
-      if (!isHostSelected(localConfig, tool) || !supportsStaticResource(tool, 'skills', localConfig.scope) || !toolPath.skills) continue;
-      let dest: string | null = null;
-      const specialSkillsDir = resolveHostResourcePath(tool, 'skills', localConfig);
-      if (tool === 'openclaw') {
-        const wsDir = await resolveOpenclawWorkspaceDir();
-        if (!wsDir) {
-          log.debug(`Skipping skill sync for openclaw: workspace dir not found`);
-          continue;
-        }
-        dest = path.join(wsDir, 'skills', item.name);
-      } else {
-        const specialRoot = resolveHostRoot(tool, localConfig.scope, localConfig.projectRoot);
-        if (!await ResourceHandler.isToolInstalled(toolPath.skills, baseDir, toolPath.probe, specialRoot)) {
-          log.debug(`Skipping skill sync for ${tool}: tool not installed`);
-          continue;
-        }
-        dest = path.join(specialSkillsDir ?? path.join(baseDir, toolPath.skills), item.name);
-      }
-      if (dest) {
-        targets.push({
-          path: dest,
-          kind: 'directory',
-          tool,
-          ...(specialSkillsDir ? { hostRoot: path.dirname(specialSkillsDir) } : {}),
-          sourcePath: item.sourcePath,
-          preservePaths: [".runtime", "assets/douyin-cookie-bridge/bridge-secret.local.json"],
-          // Preserve pull's historic destination-only frontmatter repair without
-          // mutating the team checkout that supplied the resource.
-          prepareStaged: async (payload) => { await ensureSkillFrontmatter(payload, item.name); },
-        });
+    if (!usesManagedPolicy(teamConfig, localConfig)) {
+    const otherVersions = await otherVersionFiles(localConfig.repo.localPath, item);
+    for (const { tool, dest } of await this.resolveTargets(teamConfig, localConfig, item, item.sourcePath)) {
+      try {
+        await copyDir(item.sourcePath, dest);
+        await removeLeftoverVersionFiles(item.sourcePath, dest, otherVersions);
+        await ensureSkillFrontmatter(dest, item.name);
+        log.debug(`Synced skill ${item.name} → ${tool}`);
+      } catch (e) {
+        log.warn(`Failed to sync skill ${item.name} to ${tool}: ${(e as Error).message}`);
       }
     }
-    const home = getTeamaiHome(localConfig.scope, localConfig.projectRoot);
-    const manifest = await loadManagedResourceManifest(home);
-    const priorTargets = manifest.resources[`skills:${item.name}`]?.targets ?? [];
-    // An allowlist controls new materialization; it must never silently discard
-    // ownership/backups for an unselected host. Explicit uninstall is the removal path.
-    const retainTargetPaths = priorTargets
+      return;
+    }
+    const resource = await this.buildManagedResource(item, teamConfig, localConfig);
+    const result = await reconcileManagedResources(getTeamaiHome(localConfig.scope, localConfig.projectRoot), [resource]);
+    for (const conflict of result.conflicts) log.warn(`Preserved local skill: ${conflict}`);
+  }
+
+  async buildManagedResource(item: ResourceItem, teamConfig: TeamaiConfig, localConfig: LocalConfig): Promise<DesiredManagedResource> {
+    const targets: DesiredManagedResource['targets'] = [];
+    for (const { tool, dest } of await this.resolveTargets(teamConfig, localConfig, item)) {
+      const hostRoot = localConfig.hostRoots?.[tool] ?? (tool === 'copilot' ? getCopilotHome() : tool === 'hermes' ? getHermesHome() : resolveHostRoot(tool, localConfig.scope, localConfig.projectRoot));
+      targets.push({ path: dest, kind: 'directory', tool, sourcePath: item.sourcePath,
+        ...(hostRoot ? { hostRoot } : {}),
+        preservePaths: ['.runtime', 'assets/douyin-cookie-bridge/bridge-secret.local.json'],
+        prepareStaged: async (staged) => { await ensureSkillFrontmatter(staged, item.name); },
+      });
+    }
+    const id = `skills:${item.name}`;
+    const manifest = await loadManagedResourceManifest(getTeamaiHome(localConfig.scope, localConfig.projectRoot));
+    const retainTargetPaths = (manifest.resources[id]?.targets ?? [])
       .filter((target) => !target.tool || !isHostSelected(localConfig, target.tool))
       .map((target) => target.path);
-    return {
-      id: `skills:${item.name}`,
-      type: 'skills',
-      targets,
-      ...(retainTargetPaths.length > 0 ? { retainTargetPaths } : {}),
-    };
+    return { id, type: 'skills', targets, retainTargetPaths };
   }
 
   /**
@@ -502,7 +792,6 @@ export class SkillsHandler extends ResourceHandler {
    */
   async removeItem(name: string, teamConfig: TeamaiConfig, localConfig: LocalConfig): Promise<string[]> {
     const removed: string[] = [];
-    const baseDir = resolveBaseDir(localConfig);
 
     // Remove from team repo
     const scopedNamespaces = await resolveSkillNamespaces(localConfig);
@@ -526,15 +815,24 @@ export class SkillsHandler extends ResourceHandler {
     await this.addTombstone(name, localConfig);
 
     // Remove from each tool's skills directory
-    for (const [tool, toolPath] of Object.entries(teamConfig.toolPaths)) {
-      if (!toolPath.skills || !isHostSelected(localConfig, tool) || !supportsStaticResource(tool, 'skills', localConfig.scope)) continue;
+    for (const [tool, toolPath] of Object.entries(scopedToolPaths(teamConfig, localConfig))) {
+      if (!toolPath.skills || (usesManagedPolicy(teamConfig, localConfig) && (!isHostSelected(localConfig, tool) || !supportsStaticResource(tool, 'skills', localConfig.scope)))) continue;
+      // Not ours to write to, so not ours to delete from. Above the OpenClaw
+      // branch, so the workspace copy is covered by the same gate.
+      if (isAgentExcluded(localConfig, tool)) continue;
       let skillDir: string;
       if (tool === 'openclaw') {
         const wsDir = await resolveOpenclawWorkspaceDir();
         if (!wsDir) continue;
         skillDir = path.join(wsDir, 'skills', name);
       } else {
-        skillDir = path.join(resolveHostResourcePath(tool, 'skills', localConfig) ?? path.join(baseDir, toolPath.skills), name);
+        const baseDir = resolveToolBaseDir(tool, localConfig);
+        const configuredDir = path.join(baseDir, toolPath.skills, name);
+        skillDir = await resolveSkillDestination(tool, toolPath.skills, baseDir, name);
+        if (skillDir !== configuredDir && await pathExists(configuredDir) && await dirContentEqual(skillDir, configuredDir)) {
+          await remove(configuredDir);
+          removed.push(configuredDir);
+        }
       }
       if (await pathExists(skillDir)) {
         await remove(skillDir);

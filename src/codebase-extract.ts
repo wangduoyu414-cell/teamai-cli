@@ -6,7 +6,8 @@
  * evidence pages, router/hot/index navigation, and gaps detection.
  */
 
-import { mkdir, writeFile, readFile } from 'node:fs/promises';
+import { statSync } from 'node:fs';
+import { mkdir, writeFile, readFile, realpath } from 'node:fs/promises';
 import path from 'node:path';
 
 import chalk from 'chalk';
@@ -21,6 +22,10 @@ import {
   buildIndexHubOverlay,
   mergeGraphs,
   saveGraphIndex,
+  extractStructuralGraphAsFacts,
+  astAvailable,
+  mergeCodeFacts,
+  formatAstStatsSummary,
 } from './wiki-engine/adapters/index.js';
 import type { CodeFact, InterfaceInventory, CallChain } from './wiki-engine/adapters/index.js';
 import {
@@ -32,6 +37,8 @@ import {
   mergeInterfaceInventories,
 } from './wiki-engine/code-knowledge/code-incremental.js';
 import { writeIfChanged } from './utils/fs.js';
+import { resolveAnchors } from './utils/git.js';
+import { repoName } from './utils/repo-attribution.js';
 import type { GraphIndex } from './wiki-engine/core/graph-index.schema.js';
 import { routerTemplate, indexTemplate, HOT_TEMPLATE } from './wiki-engine/adapters/templates.js';
 import type { DomainGroup, IndexStats } from './wiki-engine/adapters/templates.js';
@@ -60,6 +67,12 @@ interface ExtractResult {
   graph: { nodes: number; edges: number };
   incremental: boolean;
   outputDir: string;
+  manifest: {
+    written: boolean;
+    source: 'ai' | 'fallback' | 'none';
+    components: number;
+    note?: string;
+  };
 }
 
 interface KnowledgeGap {
@@ -76,7 +89,6 @@ function detectKnowledgeGaps(
 ): KnowledgeGap[] {
   const gaps: KnowledgeGap[] = [];
   const scannedFiles = new Set(files.map((f) => f.relativePath));
-  const nodeSlugs = new Set(graph.nodes.map((n) => n.slug));
   const connectedNodes = new Set<string>();
   for (const edge of graph.edges) {
     connectedNodes.add(edge.from);
@@ -523,9 +535,25 @@ function buildOverview(
   return lines.join('\n');
 }
 
+/**
+ * The wiki slug of `dir` when no `--project` is given (#809): a checkout's
+ * root, the main one or a linked worktree, takes its repo's name (repoName:
+ * the main checkout's real name, or a bare repo's), so every checkout of a repo
+ * writes the repo's evidence, whatever path it was opened by (#823); any other
+ * directory keeps its own name.
+ */
+export async function defaultProjectSlug(dir: string): Promise<string> {
+  if (!statSync(dir, { throwIfNoEntry: false })?.isDirectory()) return path.basename(dir);
+  const anchors = await resolveAnchors(dir);
+  if (anchors && await realpath(dir) === anchors.workspaceRoot) {
+    return repoName(anchors.projectAnchor);
+  }
+  return path.basename(dir);
+}
+
 export async function extractCodebase(opts: ExtractCodebaseOptions): Promise<void> {
   const root = path.resolve(opts.path || '.');
-  const project = opts.project || path.basename(root);
+  const project = opts.project || await defaultProjectSlug(root);
   const maxFiles = opts.maxFiles || 200;
   const outputBase = opts.outputRoot ? path.resolve(opts.outputRoot) : root;
 
@@ -612,6 +640,49 @@ export async function extractCodebase(opts: ExtractCodebaseOptions): Promise<voi
     interfaceInventory = await scanInterfaces(files);
   }
 
+
+  // AST track (web-tree-sitter WASM): resolve precise import/call edges for
+  // TS/JS/Python/Go/Swift. Runs alongside the regex heuristic track; AST facts win
+  // on merge. Falls back to heuristic-only when the WASM runtime is unavailable
+  // (e.g. TEAMAI_SKIP_AST=1) or throws, recording an AST_UNAVAILABLE gap.
+  const astGaps: KnowledgeGap[] = [];
+  if (files.length > 0 && astAvailable()) {
+    try {
+      const { facts: astFacts, result: astResult } = await extractStructuralGraphAsFacts({
+        repoRoot: root,
+        files,
+      });
+      facts = mergeCodeFacts(astFacts, facts);
+      let gapSeq = 0;
+      for (const gap of astResult.gaps) {
+        astGaps.push({
+          id: `AST-${gap.kind}-${gapSeq++}`,
+          kind: gap.kind,
+          description: gap.message,
+          source: gap.sources.join(', '),
+        });
+      }
+      if (!opts.json) {
+        console.log(chalk.dim(`  [AST: ${formatAstStatsSummary(astResult.stats)}]`));
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      astGaps.push({
+        id: 'AST-UNAVAILABLE-0',
+        kind: 'AST_UNAVAILABLE',
+        description: `code-ast failed: ${message}; used code-heuristic only.`,
+        source: 'code-ast',
+      });
+    }
+  } else if (files.length > 0) {
+    astGaps.push({
+      id: 'AST-UNAVAILABLE-0',
+      kind: 'AST_UNAVAILABLE',
+      description: 'web-tree-sitter WASM runtime unavailable or TEAMAI_SKIP_AST=1; used code-heuristic only.',
+      source: 'code-ast',
+    });
+  }
+
   const graph: GraphIndex = buildCodeGraph(facts);
 
   // Call chain tracing (entry → orchestration → service → data)
@@ -663,43 +734,61 @@ export async function extractCodebase(opts: ExtractCodebaseOptions): Promise<voi
   // in import-repo.ts after all per-repo graphs are in place (avoids write races).
   await saveGraphIndex(wikiRoot, repoGraph);
 
-  // AI enrichment (optional, non-blocking; skipped with --skip-enrich)
+  // AI enrichment (optional, non-blocking; skipped with --skip-enrich).
+  // When enrich yields nothing, still write a deterministic _manifest.json so
+  // deep-enrich has components to work with (#508).
   let aiDomains: DomainGroup[] = [];
+  let manifestSource: 'ai' | 'fallback' | 'none' = 'none';
+  let manifestComponentCount = 0;
+  const {
+    enrichWithAI,
+    writeManifest,
+    buildFallbackManifest,
+    groupFactsByModule,
+    describeEvidenceManifest,
+  } = await import('./enrich-with-ai.js');
+  const modules = groupFactsByModule(facts);
+
   if (opts.skipEnrich) {
     if (!opts.json) console.log(chalk.dim('  [AI enrich: skipped (--skip-enrich)]'));
-  } else try {
-    const { enrichWithAI, writeManifest } = await import('./enrich-with-ai.js');
-    const modules = new Map<string, CodeFact[]>();
-    for (const fact of facts) {
-      if (fact.kind === 'relation') continue;
-      const mod = fact.file.split('/')[0] || '_root';
-      const existing = modules.get(mod) ?? [];
-      existing.push(fact);
-      modules.set(mod, existing);
-    }
-
-    const enrichResult = await enrichWithAI({ project, facts, interfaceInventory, modules });
-    if (enrichResult) {
-      await writeManifest(enrichResult.manifest, evidenceDir);
-      aiDomains = enrichResult.domains;
-      // Persist AI-inferred domain classification for rebuildWikiIndex
-      const domainMeta = {
-        domain: enrichResult.repoDomain || (enrichResult.domains[0]?.name ?? ''),
-        description: enrichResult.repoDescription || '',
-        keywords: enrichResult.repoKeywords || [],
-        components: enrichResult.domains[0]?.components ?? [],
-      };
-      await writeFile(path.join(evidenceDir, '_domains.json'), JSON.stringify(domainMeta, null, 2), 'utf-8');
+  } else {
+    try {
+      const enrichResult = await enrichWithAI({ project, facts, interfaceInventory, modules });
+      if (enrichResult) {
+        await writeManifest(enrichResult.manifest, evidenceDir);
+        manifestSource = 'ai';
+        manifestComponentCount = enrichResult.manifest.components.length;
+        aiDomains = enrichResult.domains;
+        // Persist AI-inferred domain classification for rebuildWikiIndex
+        const domainMeta = {
+          domain: enrichResult.repoDomain || (enrichResult.domains[0]?.name ?? ''),
+          description: enrichResult.repoDescription || '',
+          keywords: enrichResult.repoKeywords || [],
+          components: enrichResult.domains[0]?.components ?? [],
+        };
+        await writeFile(path.join(evidenceDir, '_domains.json'), JSON.stringify(domainMeta, null, 2), 'utf-8');
+        if (!opts.json) {
+          const domainLabel = domainMeta.domain || 'uncategorized';
+          console.log(`  AI enrich: ${enrichResult.manifest.components.length} modules, domain=${domainLabel}`);
+        }
+      }
+    } catch (e) {
       if (!opts.json) {
-        const domainLabel = domainMeta.domain || 'uncategorized';
-        console.log(`  AI enrich: ${enrichResult.manifest.components.length} modules, domain=${domainLabel}`);
+        console.log(chalk.dim(`  [AI enrich skipped: ${(e as Error).message}]`));
       }
     }
-  } catch (e) {
-    if (!opts.json) {
-      console.log(chalk.dim(`  [AI enrich skipped: ${(e as Error).message}]`));
+  }
+
+  if (manifestSource === 'none') {
+    const fallback = buildFallbackManifest({ project, facts, modules });
+    if (fallback && fallback.components.length > 0) {
+      await writeManifest(fallback, evidenceDir);
+      manifestSource = 'fallback';
+      manifestComponentCount = fallback.components.length;
     }
   }
+
+  const manifestNote = describeEvidenceManifest(manifestSource, manifestComponentCount);
 
   // 生成模块级摘要页（按顶层目录聚合）
   const moduleSummaries = buildModuleSummaries(facts, graph, project);
@@ -733,7 +822,7 @@ export async function extractCodebase(opts: ExtractCodebaseOptions): Promise<voi
   await writeIfChanged(path.join(wikiRoot, 'index.md'), indexTemplate(proj, indexStats));
 
   // 生成 gaps/ — 知识缺口追踪
-  const gaps = detectKnowledgeGaps(facts, graph, files);
+  const gaps = [...detectKnowledgeGaps(facts, graph, files), ...astGaps];
   const gapsDir = path.join(wikiRoot, 'gaps');
   await mkdir(gapsDir, { recursive: true });
   const gapLines = [
@@ -839,6 +928,12 @@ export async function extractCodebase(opts: ExtractCodebaseOptions): Promise<voi
     graph: { nodes: repoGraph.nodes.length, edges: repoGraph.edges.length },
     incremental: !!opts.incremental && !!changedFiles,
     outputDir: wikiRoot,
+    manifest: {
+      written: manifestSource !== 'none',
+      source: manifestSource,
+      components: manifestComponentCount,
+      ...(manifestNote ? { note: manifestNote } : {}),
+    },
   };
 
   if (opts.json) {
@@ -857,5 +952,8 @@ export async function extractCodebase(opts: ExtractCodebaseOptions): Promise<voi
       console.log(`  Call chains: ${callChains.length} chains (max depth ${Math.max(...callChains.map(c => c.depth))})`);
     }
     console.log(`  Output: ${wikiRoot}`);
+    if (manifestNote) {
+      console.log(`  ${manifestNote}`);
+    }
   }
 }

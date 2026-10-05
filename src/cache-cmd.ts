@@ -1,7 +1,7 @@
 import chalk from 'chalk';
 
 import type { GlobalOptions } from './types.js';
-import { getCacheStatus, gcCache } from './utils/cache-index.js';
+import { getCacheStatus, gcCache, parsePositiveInteger } from './utils/cache-index.js';
 import { log } from './utils/logger.js';
 
 // ─── Types ───────────────────────────────────────────────
@@ -45,6 +45,15 @@ function shortSha(sha?: string): string {
     return sha.slice(0, 8);
 }
 
+function parseGcOption(value: string, option: string): number | undefined {
+    const parsed = parsePositiveInteger(value);
+    if (parsed !== undefined) return parsed;
+
+    log.error(`${option} must be a positive integer; received "${value}"`);
+    process.exitCode = 2;
+    return undefined;
+}
+
 // ─── Command ──────────────────────────────────────────────
 
 /**
@@ -77,7 +86,7 @@ async function runStatus(opts: CacheCmdOptions): Promise<void> {
     console.log('');
 
     if (result.entryCount === 0) {
-        console.log(chalk.gray('（无缓存条目）'));
+        console.log(chalk.gray('(no cache entries)'));
         return;
     }
 
@@ -85,7 +94,6 @@ async function runStatus(opts: CacheCmdOptions): Promise<void> {
     const colKey = 50;
     const colSize = 12;
     const colUsed = 26;
-    const colSha = 10;
 
     const header = [
         'KEY'.padEnd(colKey),
@@ -109,7 +117,7 @@ async function runStatus(opts: CacheCmdOptions): Promise<void> {
 
     console.log('');
     console.log(
-        chalk.bold(`总计: ${result.entryCount} 个仓库，占用 ${formatBytes(result.totalBytes)}`),
+        chalk.bold(`Total: ${result.entryCount} repo(s), ${formatBytes(result.totalBytes)}`),
     );
     console.log('');
 }
@@ -117,22 +125,14 @@ async function runStatus(opts: CacheCmdOptions): Promise<void> {
 async function runGc(opts: CacheCmdOptions): Promise<void> {
     let maxBytes: number | undefined;
     if (opts.maxBytes !== undefined) {
-        const parsed = parseInt(opts.maxBytes, 10);
-        if (!isNaN(parsed) && parsed > 0) {
-            maxBytes = parsed;
-        } else {
-            log.warn(`--max-bytes 值无效: ${opts.maxBytes}，将使用默认值`);
-        }
+        maxBytes = parseGcOption(opts.maxBytes, '--max-bytes');
+        if (maxBytes === undefined) return;
     }
 
     let staleDays: number | undefined;
     if (opts.staleDays !== undefined) {
-        const parsed = parseInt(opts.staleDays, 10);
-        if (!isNaN(parsed) && parsed > 0) {
-            staleDays = parsed;
-        } else {
-            log.warn(`--stale-days 值无效: ${opts.staleDays}，将使用默认值`);
-        }
+        staleDays = parseGcOption(opts.staleDays, '--stale-days');
+        if (staleDays === undefined) return;
     }
 
     const gcOpts = {
@@ -154,20 +154,21 @@ async function runGc(opts: CacheCmdOptions): Promise<void> {
     const dryRunTag = opts.dryRun ? chalk.yellow('[dry-run] ') : '';
 
     console.log('');
-    console.log(chalk.bold(`${dryRunTag}GC 执行结果`));
+    console.log(chalk.bold(`${dryRunTag}GC result`));
     console.log('');
     console.log(
-        `前: ${result.before.entryCount} 个仓库，${formatBytes(result.before.totalBytes)}`,
+        `Before: ${result.before.entryCount} repo(s), ${formatBytes(result.before.totalBytes)}`,
     );
     console.log(
-        `后: ${result.after.entryCount} 个仓库，${formatBytes(result.after.totalBytes)}`,
+        `After: ${result.after.entryCount} repo(s), ${formatBytes(result.after.totalBytes)}`,
     );
     console.log('');
 
     if (result.removed.length === 0) {
-        console.log(chalk.green('无需清理'));
+        console.log(chalk.green('Nothing to clean up'));
     } else {
-        console.log(chalk.bold(`清理列表（${result.removed.length} 项）:`));
+        const removedLabel = opts.dryRun ? 'Would remove' : 'Removed';
+        console.log(chalk.bold(`${removedLabel} (${result.removed.length}):`));
         for (const item of result.removed) {
             const tag = item.reason === 'stale' ? chalk.yellow('[stale]') : chalk.red('[over-cap]');
             console.log(`  ${tag} ${item.key}  (${formatBytes(item.size_bytes)})`);
@@ -176,7 +177,7 @@ async function runGc(opts: CacheCmdOptions): Promise<void> {
 
     if (result.skipped.length > 0) {
         console.log('');
-        console.log(chalk.bold(chalk.red(`跳过列表（${result.skipped.length} 项，需人工排查）:`)));
+        console.log(chalk.bold(chalk.red(`Skipped (${result.skipped.length}, needs manual review):`)));
         for (const item of result.skipped) {
             console.log(`  ${chalk.red('[skip]')} ${item.key}: ${item.reason}`);
         }

@@ -1,14 +1,27 @@
 import { execSync, spawnSync } from 'node:child_process';
+import crossSpawn from 'cross-spawn';
 import { log, spinner } from '../../utils/logger.js';
+import { resolveCliPath } from '../../utils/cli-path.js';
+import { isInteractive } from '../../utils/prompt.js';
 import type { RepoInfo } from '../types.js';
+import { OrganizationNotFoundError, RepoCreatePermissionError } from '../types.js';
 
 /**
  * Thin wrapper around the CNB (cnb.cool) OpenAPI CLI — `@cnbcool/cnb-cli`.
  *
  * Mirrors the shape of tgit/gf-cli.ts: delegate auth + repo + PR operations to
- * the platform's own CLI. CNB's CLI is a plain binary (not a bash launcher), so
- * we invoke it via spawnSync with an args array — no shell, so repo paths /
- * branch names / titles cannot inject shell metacharacters.
+ * the platform's own CLI. Arguments are passed as an array and never through a
+ * shell string, so repo paths / branch names / titles cannot inject shell
+ * metacharacters. Two Windows details decide how we launch it:
+ *
+ *   - the package is `bin: { cnb: 'bin/cnb.js' }`, so npm only writes
+ *     `cnb.cmd` / `cnb.ps1` shims on Windows — there is no `cnb.exe`;
+ *   - a bare `cnb` therefore fails with ENOENT, and handing the resolved
+ *     `cnb.cmd` to `child_process.spawnSync` fails with EINVAL.
+ *
+ * `cross-spawn` handles both cases (same reason `utils/ai-client.ts` uses it),
+ * while `resolveCliPath` keeps "is it installed?" and "can we run it?" based on
+ * the same answer.
  *
  * Auth has two paths, matching how the GitHub provider treats GITHUB_TOKEN:
  *   - Interactive (dev laptop): `cnb login` (OAuth2 device flow) stores a token;
@@ -32,12 +45,23 @@ export function cnbExec(
   args: string[],
   options?: { inheritStdio?: boolean; cwd?: string },
 ): { stdout: string; stderr: string; status: number } {
-  log.debug(`cnb exec: cnb ${args.join(' ')}`);
+  // Resolve the executable first, then launch it through cross-spawn: on
+  // Windows the npm-installed CLI is only a `.cmd` shim, which neither a bare
+  // name (ENOENT) nor a direct child_process.spawnSync (EINVAL) can start. That
+  // used to come back as status 1 with an empty stderr, so cnbIsAuthenticated()
+  // reported "not logged in" for a perfectly installed CLI.
+  const cnbPath = resolveCliPath('cnb');
+  if (!cnbPath) {
+    log.debug('cnb CLI not found on PATH');
+    return { stdout: '', stderr: 'cnb CLI not found on PATH', status: 127 };
+  }
+
+  log.debug(`cnb exec: ${cnbPath} ${args.join(' ')}`);
   if (options?.inheritStdio) {
-    const r = spawnSync('cnb', args, { stdio: 'inherit', env: { ...process.env }, cwd: options.cwd });
+    const r = crossSpawn.sync(cnbPath, args, { stdio: 'inherit', env: { ...process.env }, cwd: options.cwd });
     return { stdout: '', stderr: '', status: r.status ?? 1 };
   }
-  const r = spawnSync('cnb', args, {
+  const r = crossSpawn.sync(cnbPath, args, {
     env: { ...process.env },
     encoding: 'utf-8',
     maxBuffer: 10 * 1024 * 1024,
@@ -69,12 +93,7 @@ export function assertCnbApiOk(out: string, action: string): void {
 // ─── Installation ────────────────────────────────────────
 
 export function isCnbInstalled(): boolean {
-  try {
-    execSync('which cnb', { stdio: ['pipe', 'pipe', 'pipe'] });
-    return true;
-  } catch {
-    return false;
-  }
+  return resolveCliPath('cnb') !== null;
 }
 
 /** Ensure the CNB CLI is available; install globally via npm if missing. */
@@ -135,10 +154,19 @@ export function cnbWhoami(): string | null {
   return process.env.CNB_USERNAME?.trim() || null;
 }
 
-/** Trigger the interactive OAuth2 device-flow login. */
+/**
+ * Trigger the interactive OAuth2 device-flow login.
+ *
+ * Pass `--host ${CNB_HOST}` explicitly: left to its own devices the `cnb` CLI
+ * infers the platform URL from the first `git remote` of the current directory,
+ * so running this inside a repo whose remote points at a non-CNB host (e.g. an
+ * internal git server) sends the device-auth request there and fails with 401.
+ * CNB_HOST is already the single source of truth for every other CNB operation
+ * (clone / create-repo / PR), so anchoring login to it keeps auth consistent.
+ */
 export function cnbLogin(): void {
   log.info('Starting cnb authentication (OAuth2 device flow)...');
-  const r = cnbExec(['login'], { inheritStdio: true });
+  const r = cnbExec(['login', '--host', CNB_HOST], { inheritStdio: true });
   if (r.status !== 0) throw new Error('cnb login failed. Please try again.');
 }
 
@@ -147,6 +175,15 @@ export function ensureCnbAuthenticated(): string {
   if (cnbIsAuthenticated()) {
     const u = cnbWhoami();
     if (u) return u;
+  }
+  // `cnb login` inherits stdio and waits for an OAuth2 device flow. Without a
+  // person at a terminal that never completes (issue #711).
+  if (!isInteractive()) {
+    throw new Error(
+      'CNB authentication unavailable without a terminal. ' +
+        'Export CNB_TOKEN (or CNB_ACCESS_TOKEN), ' +
+        'or run `cnb login` in an interactive shell first.',
+    );
   }
   cnbLogin();
   const u = cnbWhoami();
@@ -189,6 +226,15 @@ export function cnbParseRepoInput(input: string): RepoInfo {
 /**
  * Clone via git. With a CNB_TOKEN we embed Basic creds in the URL (CI path);
  * otherwise we let git call `cnb git-credential` (interactive-login path).
+ *
+ * In the interactive path the credential helper must persist beyond the clone
+ * itself: `git -c credential.helper=... clone` only applies for that one
+ * invocation, so the cloned repo's `remote.origin.url` carries no credentials
+ * and the next push/pull falls back to an interactive Username/Password prompt.
+ * GitHub/TGit solve this by embedding the token in the clone URL; CNB has no
+ * user-readable token in the interactive path, so we persist the helper into
+ * the repo's local config instead, making every later git operation on it auth
+ * transparently.
  */
 export function cnbRepoClone(repo: string, localPath: string): void {
   const token = getCnbToken();
@@ -199,7 +245,7 @@ export function cnbRepoClone(repo: string, localPath: string): void {
   } else {
     args = ['-c', 'credential.helper=!cnb git-credential', 'clone', `https://${CNB_HOST}/${repo}.git`, localPath];
   }
-  const r = spawnSync('git', args, { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 120_000 });
+  const r = spawnSync('git', args, { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 120_000, windowsHide: true });
   const out = `${r.stderr ?? ''} ${r.stdout ?? ''}`;
   if (/not found|does not exist|Repository not found|404/i.test(out)) {
     throw new CnbRepoNotFoundError(repo);
@@ -208,15 +254,78 @@ export function cnbRepoClone(repo: string, localPath: string): void {
     const sanitized = out.replace(/cnb:[^@]+@/g, 'cnb:***@').trim();
     throw new Error(`git clone failed: ${sanitized}`);
   }
+
+  // Persist the credential helper into the cloned repo so push/pull (which init
+  // runs after cloning) authenticate without prompting. Token-path clones bake
+  // creds into remote.origin.url, so only the interactive path needs this.
+  if (!token) {
+    const cfg = spawnSync('git', ['config', '--local', 'credential.helper', '!cnb git-credential'], {
+      encoding: 'utf-8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+      cwd: localPath,
+      windowsHide: true,
+    });
+    if (cfg.status !== 0) {
+      log.warn(`Could not persist CNB credential helper: ${(cfg.stderr ?? '').trim()}. Push/pull may prompt for credentials.`);
+    }
+  }
 }
 
-/** Create a repo: `cnb repositories create-repo --slug <owner> --name <repo>`. */
+/** Web page for creating a CNB organization (group). */
+export function cnbOrganizationCreateUrl(): string {
+  return `https://${CNB_HOST}/new/groups`;
+}
+
+/** Web page for creating a CNB repository. */
+export function cnbRepoCreateUrl(): string {
+  return `https://${CNB_HOST}/new/repos`;
+}
+
+/**
+ * Check whether an organization/group exists: `cnb organizations get-group
+ * --group <path>`. This is a read-only lookup (`group-resource:r`) available to
+ * the ordinary login token, unlike creating an org. Returns true on HTTP 200,
+ * false on 404; throws on any other outcome so a transient/auth error is not
+ * mistaken for "missing".
+ */
+export function cnbOrganizationExists(org: string): boolean {
+  const r = cnbExec(['organizations', 'get-group', '--group', org]);
+  const out = r.stdout || r.stderr;
+  if (/(?:^|["\s])status["\s:]+\s*200\b/.test(out)) return true;
+  if (/(?:^|["\s])status["\s:]+\s*404\b/.test(out) || /not found|不存在/i.test(out)) return false;
+  throw new Error(`cnb get-group failed for "${org}": ${out || `exit ${r.status}`}`);
+}
+
+/**
+ * Create a repo: `cnb repositories create-repo --slug <owner> --name <repo>`.
+ *
+ * When the owning organization/group does not exist, the CNB API rejects the
+ * call with a 404 ("Resource not found"); we surface that as
+ * {@link OrganizationNotFoundError} so `init` can point the user at the CNB web
+ * UI to create the organization (the `cnb` CLI's OAuth token cannot create one —
+ * that needs the `group-manage:rw` scope, which the device-flow login never
+ * grants).
+ */
 export async function cnbCreateRepo(owner: string, repo: string): Promise<void> {
-  const r = cnbExec(['repositories', 'create-repo', '--slug', owner, '--name', repo]);
-  if (r.status !== 0) {
-    throw new Error(`cnb create-repo failed: ${r.stderr || r.stdout}`);
+  try {
+    const r = cnbExec(['repositories', 'create-repo', '--slug', owner, '--name', repo]);
+    if (r.status !== 0) {
+      throw new Error(`cnb create-repo failed: ${r.stderr || r.stdout}`);
+    }
+    assertCnbApiOk(r.stdout, 'create-repo');
+  } catch (e) {
+    const msg = (e as Error).message;
+    if (/HTTP 404|not found|不存在/i.test(msg)) {
+      throw new OrganizationNotFoundError(owner, cnbOrganizationCreateUrl());
+    }
+    // The login token lacks the group-resource:rw scope needed to create a repo
+    // (403). It cannot be granted via `cnb login`, so guide the user to the web
+    // UI instead of surfacing a raw scope error.
+    if (/HTTP 403|scope|permission|forbidden|权限/i.test(msg)) {
+      throw new RepoCreatePermissionError(`${owner}/${repo}`, cnbRepoCreateUrl());
+    }
+    throw e;
   }
-  assertCnbApiOk(r.stdout, 'create-repo');
 }
 
 // ─── Pull requests ───────────────────────────────────────

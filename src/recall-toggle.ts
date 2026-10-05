@@ -2,56 +2,73 @@ import path from 'node:path';
 import { autoDetectInit, saveLocalConfigForScope } from './config.js';
 import { log } from './utils/logger.js';
 import { readFileSafe, writeFile, remove, pathExists } from './utils/fs.js';
-import { ResourceHandler } from './resources/base.js';
-import { RECALL_DEPENDENT_SKILLS } from './builtin-skills.js';
+import { isToolInstalledForConfig } from './resources/base.js';
 import {
-  resolveBaseDir,
+  ALL_SUPPORTED_TOOLS,
+  agentFileExtensionForTool,
+  type ToolName,
+} from './resources/agent-format.js';
+import { ruleFileExtensionForTool } from './resources/rule-format.js';
+import { LEGACY_RECALL_SKILL_NAMES, builtinSkillsTarget, pruneLegacyBuiltinSkills } from './builtin-skills.js';
+import {
+  resolveToolBaseDir,
   isRecallEnabled,
+  isAgentExcluded,
+  scopedToolPaths,
   TEAMAI_RECALL_RULES_START,
   TEAMAI_RECALL_RULES_END,
   type GlobalOptions,
   type TeamaiConfig,
   type LocalConfig,
 } from './types.js';
-import { assertHostRootsStable, isHostSelected, resolveHostResourcePath, supportsStaticResource } from './host-adapters.js';
+import { usesManagedPolicy, assertHostRootsStable, isHostSelected, supportsStaticResource } from './host-adapters.js';
 
 async function removeRecallArtifacts(teamConfig: TeamaiConfig, localConfig: LocalConfig): Promise<void> {
-  const baseDir = resolveBaseDir(localConfig);
-
-  for (const [tool, toolPath] of Object.entries(teamConfig.toolPaths)) {
-    if (!isHostSelected(localConfig, tool)) continue;
+  for (const [tool, toolPath] of Object.entries(scopedToolPaths(teamConfig, localConfig))) {
+    if (usesManagedPolicy(teamConfig, localConfig) && !isHostSelected(localConfig, tool)) continue;
+    const baseDir = resolveToolBaseDir(tool, localConfig);
     // Remove recall rule file
-    if (toolPath.rules && supportsStaticResource(tool, 'rules', localConfig.scope)) {
-      const ruleFile = path.join(baseDir, toolPath.rules, 'teamai-recall.md');
-      if (await pathExists(ruleFile)) {
-        await remove(ruleFile);
-        log.debug(`Removed recall rule from ${tool}`);
+    if (toolPath.rules) {
+      // Cursor-compatible copies are `.mdc`; older layouts also left `.md` files.
+      const extensions = new Set<string>([ruleFileExtensionForTool(tool), '.md']);
+      for (const extension of extensions) {
+        const ruleFile = path.join(baseDir, toolPath.rules, `teamai-recall${extension}`);
+        if (await pathExists(ruleFile)) {
+          await remove(ruleFile);
+          log.debug(`Removed recall rule from ${tool}`);
+        }
       }
+    }
+
+    // Remove the legacy recall skill an earlier release deployed. The served
+    // `share` workflow is gated at run time, but a member who upgrades and
+    // disables recall before pulling still has the old directory.
+    // Same resolver and gates as deployment: an uninstalled Codex must not have
+    // the shared .agents/skills root pruned on its behalf, and OpenClaw and
+    // Hermes are pruned where their skills actually live.
+    if (toolPath.skills && !isAgentExcluded(localConfig, tool)) {
+      const target = await builtinSkillsTarget(tool, toolPath.skills, localConfig);
+      if (target) await pruneLegacyBuiltinSkills(tool, target, LEGACY_RECALL_SKILL_NAMES);
     }
 
     // Remove recall agent file
-    if (toolPath.agents && supportsStaticResource(tool, 'agents', localConfig.scope)) {
-      const agentFile = path.join(baseDir, toolPath.agents, 'teamai-recall.md');
-      if (await pathExists(agentFile)) {
-        await remove(agentFile);
-        log.debug(`Removed recall agent from ${tool}`);
+    if (toolPath.agents) {
+      const agentsDir = path.join(baseDir, toolPath.agents);
+      const extensions = new Set<string>(['.md']);
+      if ((ALL_SUPPORTED_TOOLS as string[]).includes(tool)) {
+        extensions.add(agentFileExtensionForTool(tool as ToolName));
       }
-    }
-
-    // Remove recall-dependent built-in skills
-    if (toolPath.skills && supportsStaticResource(tool, 'skills', localConfig.scope)) {
-      const skillsDir = resolveHostResourcePath(tool, 'skills', localConfig) ?? path.join(baseDir, toolPath.skills);
-      for (const skillName of RECALL_DEPENDENT_SKILLS) {
-        const skillDir = path.join(skillsDir, skillName);
-        if (await pathExists(skillDir)) {
-          await remove(skillDir);
-          log.debug(`Removed recall skill ${skillName} from ${tool}`);
+      for (const extension of extensions) {
+        const agentFile = path.join(agentsDir, `teamai-recall${extension}`);
+        if (await pathExists(agentFile)) {
+          await remove(agentFile);
+          log.debug(`Removed recall agent from ${tool}`);
         }
       }
     }
 
     // Remove recall block from CLAUDE.md
-    if (toolPath.claudemd && supportsStaticResource(tool, 'instructions', localConfig.scope)) {
+    if (toolPath.claudemd && (!usesManagedPolicy(teamConfig, localConfig) || supportsStaticResource(tool, 'instructions', localConfig.scope))) {
       const claudeMdPath = path.join(baseDir, toolPath.claudemd);
       const content = await readFileSafe(claudeMdPath);
       if (content && content.includes(TEAMAI_RECALL_RULES_START)) {
@@ -80,19 +97,20 @@ async function deployRecallArtifacts(teamConfig: TeamaiConfig, localConfig: Loca
 
   await deployBuiltinRules(teamConfig, localConfig, { skipRecall: false });
   await deployBuiltinAgents(teamConfig, localConfig, { skipRecall: false });
-  await deployBuiltinSkills(teamConfig, localConfig, { skipRecall: false });
+  await deployBuiltinSkills(teamConfig, localConfig);
 
   // Inject recall rules block into CLAUDE.md for Tier-1 tools
   const { injectClaudeMdSection } = await import('./utils/claudemd.js');
   const { compileRecallRulesBlock } = await import('./pull.js');
-  const baseDir = resolveBaseDir(localConfig);
   const recallBlock = compileRecallRulesBlock();
 
-  for (const [tool, toolPath] of Object.entries(teamConfig.toolPaths)) {
-    if (!isHostSelected(localConfig, tool) || !supportsStaticResource(tool, 'agents', localConfig.scope)) continue;
+  for (const [tool, toolPath] of Object.entries(scopedToolPaths(teamConfig, localConfig))) {
+    if (usesManagedPolicy(teamConfig, localConfig) && !isHostSelected(localConfig, tool)) continue;
+    if (isAgentExcluded(localConfig, tool)) continue;
     if (!toolPath.claudemd || !toolPath.agents) continue;
-    if (!await ResourceHandler.isToolInstalled(toolPath.agents, baseDir, toolPath.probe)) continue;
+    if (!await isToolInstalledForConfig(tool, toolPath.agents, localConfig)) continue;
 
+    const baseDir = resolveToolBaseDir(tool, localConfig);
     const claudeMdPath = path.join(baseDir, toolPath.claudemd);
     try {
       await injectClaudeMdSection(
@@ -109,7 +127,7 @@ async function deployRecallArtifacts(teamConfig: TeamaiConfig, localConfig: Loca
 
 export async function recallDisable(_opts: GlobalOptions): Promise<void> {
   const { localConfig, teamConfig } = await autoDetectInit();
-  assertHostRootsStable(localConfig);
+  if (usesManagedPolicy(teamConfig, localConfig)) assertHostRootsStable(localConfig);
 
   const updated = { ...localConfig, recallEnabled: false };
   await saveLocalConfigForScope(updated, localConfig.scope, localConfig.projectRoot);
@@ -120,7 +138,7 @@ export async function recallDisable(_opts: GlobalOptions): Promise<void> {
 
 export async function recallEnable(_opts: GlobalOptions): Promise<void> {
   const { localConfig, teamConfig } = await autoDetectInit();
-  assertHostRootsStable(localConfig);
+  if (usesManagedPolicy(teamConfig, localConfig)) assertHostRootsStable(localConfig);
 
   const updated = { ...localConfig, recallEnabled: true };
   await saveLocalConfigForScope(updated, localConfig.scope, localConfig.projectRoot);

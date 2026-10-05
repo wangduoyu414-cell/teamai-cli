@@ -2,9 +2,16 @@ import { describe, it, expect, vi, beforeEach, afterEach, type Mock } from 'vite
 
 // ─── Mocks ──────────────────────────────────────────────
 
+vi.mock('cross-spawn', () => ({ default: { sync: vi.fn() } }));
 vi.mock('node:child_process', () => ({
-  execSync: vi.fn(),
   spawnSync: vi.fn(),
+}));
+
+// gh-cli resolves the CLI through utils/cli-path.js. Tests used to fake "gh not
+// installed" by making execSync('which gh') throw; the seam is now the resolver,
+// so drive that instead (default: not installed, see beforeEach blocks).
+vi.mock('../utils/cli-path.js', () => ({
+  resolveCliPath: vi.fn(),
 }));
 
 vi.mock('../utils/logger.js', () => ({
@@ -27,7 +34,8 @@ vi.mock('../utils/logger.js', () => ({
 
 // ─── Imports after mocks ────────────────────────────────
 
-import { execSync, spawnSync } from 'node:child_process';
+import crossSpawn from 'cross-spawn';
+import { spawnSync } from 'node:child_process';
 import { parseGitHubRepoInput } from '../providers/github/repo-url.js';
 import {
   ghPrCreate,
@@ -35,13 +43,15 @@ import {
   ghRepoClone,
   ghIsAuthenticated,
   getGitHubToken,
+  ensureGhAuthenticated,
   RepoNotFoundError,
 } from '../providers/github/gh-cli.js';
+import { resolveCliPath } from '../utils/cli-path.js';
 import { detectProvider, getProvider } from '../providers/registry.js';
 import { GitHubProvider } from '../providers/github/index.js';
 
-const mockedExecSync = execSync as Mock;
 const mockedSpawnSync = spawnSync as Mock;
+const mockedResolveCliPath = resolveCliPath as Mock;
 
 // ─── repo-url parsing ───────────────────────────────────
 
@@ -105,8 +115,8 @@ describe('detectProvider', () => {
     expect(detectProvider('org/repo')).toBe('github');
   });
 
-  it('defaults unknown hosts to github', () => {
-    expect(detectProvider('https://gitlab.com/org/repo')).toBe('github');
+  it('uses generic git for unknown hosts', () => {
+    expect(detectProvider('https://gitea.example.com/org/repo')).toBe('git');
   });
 });
 
@@ -145,7 +155,7 @@ describe('ghIsAuthenticated', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    mockedExecSync.mockReset();
+    mockedResolveCliPath.mockReturnValue(null);
   });
 
   afterEach(() => {
@@ -160,9 +170,6 @@ describe('ghIsAuthenticated', () => {
   it('returns false when no gh, no token', () => {
     delete process.env.GITHUB_TOKEN;
     delete process.env.GH_TOKEN;
-    mockedExecSync.mockImplementation(() => {
-      throw new Error('command not found: gh');
-    });
     expect(ghIsAuthenticated()).toBe(false);
   });
 });
@@ -174,12 +181,10 @@ describe('ghRepoClone', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    mockedSpawnSync.mockReset();
-    mockedExecSync.mockReset();
-    // CLI detection is the first spawn; tests provide its result separately.
-    mockedExecSync.mockImplementation(() => {
-      throw new Error('not found');
-    });
+    vi.mocked(crossSpawn.sync).mockReset();
+    mockedSpawnSync.mockReturnValue({ status: 0, stdout: '', stderr: '' });
+    mockedResolveCliPath.mockReturnValue('/native/gh');
+    // Clone uses the authenticated CLI; no token in Git URLs.
     delete process.env.GITHUB_TOKEN;
     delete process.env.GH_TOKEN;
   });
@@ -189,8 +194,7 @@ describe('ghRepoClone', () => {
   });
 
   it('throws RepoNotFoundError when remote does not exist', () => {
-    mockedSpawnSync.mockReturnValueOnce({status:0, stdout:"gh version", stderr:""});
-    mockedSpawnSync.mockReturnValue({
+    (crossSpawn.sync as Mock).mockReturnValue({
       status: 128,
       stdout: '',
       stderr: 'remote: Repository not found.',
@@ -199,7 +203,7 @@ describe('ghRepoClone', () => {
   });
 
   it('succeeds when gh clone and local helper configuration exit 0', () => {
-    mockedSpawnSync.mockReturnValue({
+    (crossSpawn.sync as Mock).mockReturnValue({
       status: 0,
       stdout: "Cloning into '/tmp/clone'...",
       stderr: '',
@@ -209,8 +213,7 @@ describe('ghRepoClone', () => {
 
   it('sanitizes token from error output', () => {
     process.env.GITHUB_TOKEN = 'ghp_secret';
-    mockedSpawnSync.mockReturnValueOnce({status:0, stdout:"gh version", stderr:""});
-    mockedSpawnSync.mockReturnValue({
+    (crossSpawn.sync as Mock).mockReturnValue({
       status: 128,
       stdout: '',
       stderr: 'fatal: unable to connect to x-access-token:ghp_secret@github.com',
@@ -227,7 +230,7 @@ describe('ghCreateRepo', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    mockedExecSync.mockReset();
+    mockedResolveCliPath.mockReturnValue(null);
     process.env.GITHUB_TOKEN = 'ghp_test';
   });
 
@@ -284,9 +287,6 @@ describe('ghCreateRepo', () => {
   it('throws when no token is available', async () => {
     delete process.env.GITHUB_TOKEN;
     delete process.env.GH_TOKEN;
-    mockedExecSync.mockImplementation(() => {
-      throw new Error('not found');
-    });
 
     await expect(ghCreateRepo('teamai', 'cli')).rejects.toThrow(/Cannot retrieve GitHub token/);
   });
@@ -300,11 +300,8 @@ describe('ghPrCreate via REST API', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    mockedExecSync.mockReset();
-    // no gh CLI → should use API
-    mockedExecSync.mockImplementation(() => {
-      throw new Error('not found');
-    });
+    mockedResolveCliPath.mockReturnValue(null);
+    // no gh CLI (resolver -> null) → should use API
     process.env.GITHUB_TOKEN = 'ghp_test';
   });
 
@@ -377,6 +374,39 @@ describe('ghPrCreate via REST API', () => {
 });
 
 // ─── GitHubProvider surface ─────────────────────────────
+
+// ─── ensureGhAuthenticated without a terminal (issue #711) ──
+
+describe('ensureGhAuthenticated without a terminal', () => {
+  const originalIsTTY = process.stdin.isTTY;
+  const savedToken = { GITHUB_TOKEN: process.env.GITHUB_TOKEN, GH_TOKEN: process.env.GH_TOKEN };
+
+  beforeEach(() => {
+    mockedSpawnSync.mockReset();
+    mockedResolveCliPath.mockReturnValue('/usr/bin/gh');
+    delete process.env.GITHUB_TOKEN;
+    delete process.env.GH_TOKEN;
+    Object.defineProperty(process.stdin, 'isTTY', { value: false, configurable: true });
+    // `gh api user` fails: no session.
+    mockedSpawnSync.mockReturnValue({ status: 1, stdout: '', stderr: '' });
+  });
+
+  afterEach(() => {
+    Object.defineProperty(process.stdin, 'isTTY', { value: originalIsTTY, configurable: true });
+    for (const [k, v] of Object.entries(savedToken)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  });
+
+  it('refuses instead of spawning the browser device flow, and names GITHUB_TOKEN', async () => {
+    await expect(ensureGhAuthenticated()).rejects.toThrow(/GITHUB_TOKEN/);
+    const loginCalls = mockedSpawnSync.mock.calls.filter(
+      ([, args]) => Array.isArray(args) && args[0] === 'auth' && args[1] === 'login',
+    );
+    expect(loginCalls).toHaveLength(0);
+  });
+});
 
 describe('GitHubProvider', () => {
   it('is the default provider returned when name omitted', () => {

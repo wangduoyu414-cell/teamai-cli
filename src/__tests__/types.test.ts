@@ -1,11 +1,16 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
+import path from 'node:path';
+import os from 'node:os';
 import {
   MemberConfigSchema,
   TeamaiConfigSchema,
   SharingConfigSchema,
+  getInterventionSharing,
   StateSchema,
   LocalConfigSchema,
+  resolveLegacyProjectHookScope,
 } from '../types.js';
+import type { LocalConfig } from '../types.js';
 
 describe('MemberConfigSchema', () => {
   it('should parse a complete member config', () => {
@@ -51,7 +56,43 @@ describe('MemberConfigSchema', () => {
   });
 });
 
+describe('LocalConfigSchema', () => {
+  it("expands a home-relative repo.localPath so git and the manifest readers see an absolute path", () => {
+    const previousHome = process.env.HOME;
+    process.env.HOME = '/home/e2e';
+    try {
+      const parsed = LocalConfigSchema.parse({
+        repo: { localPath: '~/.teamai/team-repo', remote: 'https://github.com/acme/team.git' },
+        username: 'e2e',
+      });
+      expect(parsed.repo.localPath).toBe('/home/e2e/.teamai/team-repo');
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME; else process.env.HOME = previousHome;
+    }
+  });
+
+  it('leaves an absolute repo.localPath untouched', () => {
+    const parsed = LocalConfigSchema.parse({
+      repo: { localPath: '/srv/team-repo', remote: 'https://github.com/acme/team.git' },
+      username: 'e2e',
+    });
+    expect(parsed.repo.localPath).toBe('/srv/team-repo');
+  });
+});
+
 describe('TeamaiConfigSchema', () => {
+  it.each(['github', 'tgit', 'cnb', 'git'] as const)(
+    'accepts the %s provider',
+    (provider) => {
+      const result = TeamaiConfigSchema.parse({
+        team: 'test-team',
+        repo: 'https://example.com/test/repo.git',
+        provider,
+      });
+      expect(result.provider).toBe(provider);
+    },
+  );
+
   it('should include codebuddy in default toolPaths', () => {
     const result = TeamaiConfigSchema.parse({
       team: 'test-team',
@@ -65,7 +106,7 @@ describe('TeamaiConfigSchema', () => {
       settings: '.codebuddy/settings.json',
       claudemd: '.codebuddy/CODEBUDDY.md',
       mcp: '.codebuddy/mcp.json',
-      mcpProject: '.codebuddy/mcp.json',
+      mcpProject: '.mcp.json',
     });
   });
 
@@ -162,6 +203,24 @@ describe('SharingConfigSchema env', () => {
     });
     expect(result.sharing.env).toBeDefined();
     expect(result.sharing.env.injectShellProfile).toBe(true);
+  });
+});
+
+describe('SharingConfigSchema intervention', () => {
+  it('leaves intervention undefined when absent and defaults keywords to []', () => {
+    const result = SharingConfigSchema.parse({});
+    expect(result.intervention).toBeUndefined();
+    expect(getInterventionSharing({ sharing: result })).toEqual({ correctionKeywords: [] });
+    expect(getInterventionSharing({})).toEqual({ correctionKeywords: [] });
+  });
+
+  it('accepts team correctionKeywords', () => {
+    const result = SharingConfigSchema.parse({ intervention: { correctionKeywords: ['rehazlo', 'no era eso'] } });
+    expect(getInterventionSharing({ sharing: result }).correctionKeywords).toEqual(['rehazlo', 'no era eso']);
+  });
+
+  it('rejects non-string keywords', () => {
+    expect(() => SharingConfigSchema.parse({ intervention: { correctionKeywords: [1] } })).toThrow();
   });
 });
 
@@ -268,5 +327,46 @@ describe('LocalConfigSchema inheritUserScope', () => {
 
   it('rejects non-boolean values', () => {
     expect(() => LocalConfigSchema.parse({ ...baseConfig, inheritUserScope: 'yes' })).toThrow();
+  });
+});
+
+describe('resolveLegacyProjectHookScope', () => {
+  afterEach(() => vi.unstubAllEnvs());
+
+  const base = {
+    repo: { localPath: '/tmp/repo', remote: 'x' },
+    username: 'u',
+    additionalRoles: [],
+  };
+  const project = (extra: Record<string, unknown> = {}) =>
+    ({ ...base, scope: 'project', projectRoot: '/path/to/project', ...extra }) as unknown as LocalConfig;
+
+  it('returns the <projectRoot> pair for a non-self project scope', () => {
+    const legacy = resolveLegacyProjectHookScope(project());
+    expect(legacy?.baseDir).toBe('/path/to/project');
+    expect(legacy?.manifestPath).toContain('/path/to/project');
+  });
+
+  it('returns null for user scope (hooks only ever lived in HOME)', () => {
+    expect(resolveLegacyProjectHookScope({ ...base, scope: 'user' } as unknown as LocalConfig)).toBeNull();
+  });
+
+  it('returns null without a projectRoot', () => {
+    expect(resolveLegacyProjectHookScope({ ...base, scope: 'project' } as unknown as LocalConfig)).toBeNull();
+  });
+
+  it('returns null in self mode (its alternate location is HOME, shared with user scope)', () => {
+    expect(resolveLegacyProjectHookScope(project({ repo: { ...base.repo, kind: 'self' } }))).toBeNull();
+  });
+
+  it('returns null when projectRoot IS the home dir — never sweeps the live target', () => {
+    // `teamai init .` run in ~ (dotfiles repo): the "legacy" copy and the live
+    // HOME copy are the same file, so sweeping it would delete the hooks the
+    // primary pass just wrote.
+    const home = path.join(os.tmpdir(), 'teamai-legacy-home');
+    vi.stubEnv('HOME', home);
+    expect(resolveLegacyProjectHookScope(project({ projectRoot: home }))).toBeNull();
+    // Also when the two differ only by a trailing separator / relative segment.
+    expect(resolveLegacyProjectHookScope(project({ projectRoot: path.join(home, '.') }))).toBeNull();
   });
 });

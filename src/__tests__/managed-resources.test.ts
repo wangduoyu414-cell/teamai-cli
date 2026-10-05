@@ -502,7 +502,7 @@ describe('managed resource lifecycle', () => {
   });
 
   it('recovers a legacy external OpenClaw journal by proving the target is inside its skills root', async () => {
-    const { root, home } = await fixture();
+    const { home } = await fixture();
     const externalRoot = await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-openclaw-legacy-'));
     tempDirs.push(externalRoot);
     const stateDir = path.join(externalRoot, 'state');

@@ -14,8 +14,12 @@ const mockGit = {
   addConfig: vi.fn(),
   revparse: vi.fn().mockResolvedValue('main'),
   reset: vi.fn(),
+  clean: vi.fn(),
   merge: vi.fn(),
   diff: vi.fn().mockResolvedValue('+some real content change\n'),
+  pull: vi.fn(),
+  fetch: vi.fn(),
+  raw: vi.fn(),
 };
 
 vi.mock('simple-git', () => ({
@@ -36,6 +40,8 @@ vi.mock('node:fs', () => ({
   },
 }));
 
+vi.mock('node:fs/promises', () => ({ realpath: vi.fn(async (p: string) => p) }));
+
 vi.mock('../utils/logger.js', () => ({
   log: {
     info: vi.fn(),
@@ -44,10 +50,11 @@ vi.mock('../utils/logger.js', () => ({
     error: vi.fn(),
     debug: vi.fn(),
     dim: vi.fn(),
+    persist: vi.fn(),
   },
 }));
 
-import { generateBranchName, pushRepoBranch, checkoutMaster, pushRepoDirectly, initRepo, configureGitUser, getHeadRev, resetToCleanMaster, isMetadataOnlyDiff, isGitRepo } from '../utils/git.js';
+import { generateBranchName, pushRepoBranch, checkoutMaster, pushRepoDirectly, initRepo, configureGitUser, getHeadRev, resetToCleanMaster, isMetadataOnlyDiff, isGitRepo, normalizeRepoUrlForCompare, remotesMatch, redactGitCredentials, pullRepo, pullRepoFastForward, pushLearningToOrigin } from '../utils/git.js';
 import fse from 'fs-extra';
 
 describe('generateBranchName', () => {
@@ -59,7 +66,6 @@ describe('generateBranchName', () => {
   it('should use the correct current date components', () => {
     const before = new Date();
     const name = generateBranchName('bob');
-    const after = new Date();
 
     // Extract the date part
     const match = name.match(/^teamai\/push\/bob\/(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})$/);
@@ -117,10 +123,25 @@ describe('pushRepoBranch', () => {
     expect(result).toBe(true);
     expect(mockGit.checkoutLocalBranch).toHaveBeenCalledWith('teamai/push/test/123');
     expect(mockGit.add).toHaveBeenCalledWith(['file.txt']);
-    expect(mockGit.commit).toHaveBeenCalledWith('commit msg');
+    expect(mockGit.commit).toHaveBeenCalledWith('commit msg', { '--no-verify': null });
     expect(mockGit.push).toHaveBeenCalledWith(['-u', 'origin', 'teamai/push/test/123']);
     // Should NOT switch back to master — caller does that after gfMrCreate
     expect(mockGit.checkout).not.toHaveBeenCalled();
+  });
+
+  it('should push a newly added empty file', async () => {
+    mockGit.status.mockResolvedValue({ staged: ['empty.md'] });
+    mockGit.diff.mockResolvedValue([
+      'diff --git a/empty.md b/empty.md',
+      'new file mode 100644',
+      'index 0000000..e69de29',
+    ].join('\n'));
+
+    const result = await pushRepoBranch('/repo', 'commit msg', ['empty.md'], 'teamai/push/test/empty');
+
+    expect(result).toBe(true);
+    expect(mockGit.commit).toHaveBeenCalledWith('commit msg', { '--no-verify': null });
+    expect(mockGit.push).toHaveBeenCalledWith(['-u', 'origin', 'teamai/push/test/empty']);
   });
 
   it('should return false and clean up branch when no changes to commit', async () => {
@@ -137,6 +158,8 @@ describe('pushRepoBranch', () => {
     expect(result).toBe(false);
     expect(mockGit.checkout).toHaveBeenCalledWith('master');
     expect(mockGit.deleteLocalBranch).toHaveBeenCalledWith('teamai/push/test/456', true);
+    expect(mockGit.reset).toHaveBeenCalledWith(['--hard', 'HEAD']);
+    expect(mockGit.clean).toHaveBeenCalledWith('f', ['-d']);
     expect(mockGit.commit).not.toHaveBeenCalled();
     expect(mockGit.push).not.toHaveBeenCalled();
   });
@@ -158,7 +181,32 @@ describe('pushRepoBranch', () => {
     expect(mockGit.diff).toHaveBeenCalledWith(['--cached', '--unified=0']);
     expect(mockGit.checkout).toHaveBeenCalledWith('master');
     expect(mockGit.deleteLocalBranch).toHaveBeenCalledWith('teamai/push/test/789', true);
+    expect(mockGit.reset).toHaveBeenCalledWith(['--hard', 'HEAD']);
+    expect(mockGit.clean).toHaveBeenCalledWith('f', ['-d']);
     expect(mockGit.commit).not.toHaveBeenCalled();
+  });
+
+  it('skips the branch delete (no throw) when the default branch is busy in another worktree', async () => {
+    // Multi-worktree: `checkout master` fails because another worktree holds it,
+    // so HEAD stays on the push branch. Deleting the checked-out branch would
+    // throw; the delete must be skipped and pushRepoBranch must return false
+    // rather than propagating a cryptic git error.
+    mockGit.status.mockResolvedValue({ staged: [] });
+    mockGit.revparse.mockImplementation(async (args: any) => {
+      const a = Array.isArray(args) ? args : [args];
+      if (a[0] === '--abbrev-ref' && a[1] === 'origin/HEAD') return 'origin/master';
+      return '';
+    });
+    mockGit.checkout.mockRejectedValueOnce(
+      new Error("fatal: 'master' is already used by worktree at '/repo/primary'"),
+    );
+
+    const result = await pushRepoBranch('/repo', 'msg', ['file.txt'], 'teamai/push/test/wt');
+
+    expect(result).toBe(false);
+    expect(mockGit.checkout).toHaveBeenCalledWith('master');
+    // The delete is skipped because the switch did not actually happen.
+    expect(mockGit.deleteLocalBranch).not.toHaveBeenCalled();
   });
 });
 
@@ -217,7 +265,9 @@ describe('pushRepoDirectly', () => {
     await pushRepoDirectly('/repo', 'direct commit', ['file.txt']);
 
     expect(mockGit.add).toHaveBeenCalledWith(['file.txt']);
+    // Ordinary path: do not skip hooks (unlike isolated worktree commits).
     expect(mockGit.commit).toHaveBeenCalledWith('direct commit');
+    expect(mockGit.commit.mock.calls[0]).toHaveLength(1);
     expect(mockGit.revparse).toHaveBeenCalledWith(['--abbrev-ref', 'HEAD']);
     expect(mockGit.push).toHaveBeenCalledWith(['-u', 'origin', 'main']);
   });
@@ -403,6 +453,22 @@ describe('isMetadataOnlyDiff', () => {
     expect(isMetadataOnlyDiff('  \n  ')).toBe(true);
   });
 
+  it('should return false for file additions and deletions without content lines', () => {
+    const added = [
+      'diff --git a/empty.md b/empty.md',
+      'new file mode 100644',
+      'index 0000000..e69de29',
+    ].join('\n');
+    const deleted = [
+      'diff --git a/empty.md b/empty.md',
+      'deleted file mode 100644',
+      'index e69de29..0000000',
+    ].join('\n');
+
+    expect(isMetadataOnlyDiff(added)).toBe(false);
+    expect(isMetadataOnlyDiff(deleted)).toBe(false);
+  });
+
   it('should return true for timestamp-only changes', () => {
     const diff = [
       '--- a/teamwiki/source-manifest.json',
@@ -448,5 +514,261 @@ describe('isMetadataOnlyDiff', () => {
       '+lastUpdated: new',
     ].join('\n');
     expect(isMetadataOnlyDiff(diff)).toBe(true);
+  });
+});
+
+describe('normalizeRepoUrlForCompare', () => {
+  it('strips embedded credentials from https URLs', () => {
+    expect(normalizeRepoUrlForCompare('https://oauth2:TOKEN@git.woa.com/HyperAI/teamai.git'))
+      .toBe('git.woa.com/hyperai/teamai');
+  });
+
+  it('treats http and https as equal', () => {
+    expect(normalizeRepoUrlForCompare('http://github.com/org/repo'))
+      .toBe(normalizeRepoUrlForCompare('https://github.com/org/repo'));
+  });
+
+  it('normalizes scp-form ssh to host/owner/repo', () => {
+    expect(normalizeRepoUrlForCompare('git@github.com:org/repo.git'))
+      .toBe('github.com/org/repo');
+  });
+
+  it('ignores a trailing .git and trailing slash', () => {
+    expect(normalizeRepoUrlForCompare('https://github.com/org/repo.git/'))
+      .toBe('github.com/org/repo');
+  });
+
+  it('is case-insensitive', () => {
+    expect(normalizeRepoUrlForCompare('https://GitHub.com/Org/Repo'))
+      .toBe('github.com/org/repo');
+  });
+
+  it('handles ssh:// URLs with credentials', () => {
+    expect(normalizeRepoUrlForCompare('ssh://git@git.woa.com/HyperAI/teamai.git'))
+      .toBe('git.woa.com/hyperai/teamai');
+  });
+});
+
+describe('remotesMatch', () => {
+  it('matches the same repo across credential/protocol/.git differences', () => {
+    expect(remotesMatch(
+      'https://oauth2:TOKEN@git.woa.com/HyperAI/teamai.git',
+      'https://git.woa.com/HyperAI/teamai',
+    )).toBe(true);
+    expect(remotesMatch(
+      'git@github.com:org/repo.git',
+      'https://github.com/org/repo',
+    )).toBe(true);
+  });
+
+  it('does not match different repos', () => {
+    // The exact bug: cached clone of HyperAI/teamai vs requested teamai/teamai-dev-repo
+    expect(remotesMatch(
+      'https://oauth2:TOKEN@git.woa.com/HyperAI/teamai.git',
+      'https://git.woa.com/teamai/teamai-dev-repo.git',
+    )).toBe(false);
+  });
+
+  it('does not match different hosts for the same owner/repo', () => {
+    expect(remotesMatch(
+      'https://github.com/org/repo.git',
+      'https://gitlab.com/org/repo.git',
+    )).toBe(false);
+  });
+});
+
+describe('redactGitCredentials', () => {
+  it('removes user:token userinfo from https URLs', () => {
+    expect(redactGitCredentials('https://oauth2:TOKEN@git.woa.com/HyperAI/teamai.git'))
+      .toBe('https://git.woa.com/HyperAI/teamai.git');
+  });
+
+  it('leaves credential-free URLs untouched', () => {
+    expect(redactGitCredentials('https://github.com/org/repo.git'))
+      .toBe('https://github.com/org/repo.git');
+  });
+
+  it('leaves scp-form ssh URLs untouched', () => {
+    expect(redactGitCredentials('git@github.com:org/repo.git'))
+      .toBe('git@github.com:org/repo.git');
+  });
+});
+
+describe('pullRepo', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    // resetToCleanMaster needs status + revparse (default branch detection)
+    mockGit.status.mockResolvedValue({
+      conflicted: [],
+      modified: [],
+      not_added: [],
+      created: [],
+      staged: [],
+      files: [],
+    });
+    mockGit.revparse.mockImplementation(async (args: any) => {
+      const a = Array.isArray(args) ? args : [args];
+      if (a[0] === '--abbrev-ref' && a[1] === 'HEAD') return 'main';
+      if (a[0] === '--show-toplevel') return '/tmp/x';
+      return '';
+    });
+    mockGit.raw.mockResolvedValue('0\n');
+    mockGit.fetch.mockResolvedValue(undefined);
+    mockGit.reset.mockResolvedValue(undefined);
+  });
+
+  it('returns "already up to date" when pull reports no changes', async () => {
+    mockGit.pull.mockResolvedValue({ summary: { changes: 0, insertions: 0, deletions: 0 } });
+    const result = await pullRepo('/tmp/x');
+    expect(result).toBe('already up to date');
+    expect(mockGit.pull).toHaveBeenCalledWith(['--ff-only']);
+    expect(mockGit.reset).not.toHaveBeenCalledWith(expect.arrayContaining(['--hard']));
+  });
+
+  it('returns changed file count on fast-forward success', async () => {
+    mockGit.pull.mockResolvedValue({ summary: { changes: 2, insertions: 5, deletions: 1 } });
+    const result = await pullRepo('/tmp/x');
+    expect(result).toBe('2 file(s) changed');
+  });
+
+  it('falls back to hard reset when pull rejects (diverged)', async () => {
+    mockGit.pull.mockRejectedValue(new Error('Not possible to fast-forward, aborting.'));
+    const result = await pullRepo('/tmp/x');
+    expect(result).toBe('reset to origin (diverged)');
+    expect(mockGit.fetch).toHaveBeenCalledWith(['origin', 'main']);
+    expect(mockGit.reset).toHaveBeenCalledWith(['--hard', 'origin/main']);
+  });
+
+  it('re-throws when fetch fails after diverged pull', async () => {
+    mockGit.pull.mockRejectedValue(new Error('Not possible to fast-forward, aborting.'));
+    mockGit.fetch.mockRejectedValue(new Error('could not read from remote'));
+    await expect(pullRepo('/tmp/x')).rejects.toThrow('could not read from remote');
+    expect(mockGit.reset).not.toHaveBeenCalledWith(expect.arrayContaining(['--hard']));
+  });
+
+  it('surfaces the real auth/network error when fetch also fails', async () => {
+    vi.clearAllMocks();
+    mockGit.status.mockResolvedValue({
+      conflicted: [],
+      modified: [],
+      not_added: [],
+      created: [],
+      staged: [],
+      files: [],
+    });
+    mockGit.revparse.mockImplementation(async (args: any) => {
+      const a = Array.isArray(args) ? args : [args];
+      if (a[0] === '--abbrev-ref' && a[1] === 'HEAD') return 'main';
+      if (a[0] === '--show-toplevel') return '/tmp/x';
+      return '';
+    });
+    mockGit.raw.mockResolvedValue('0\n');
+    mockGit.pull.mockRejectedValue(new Error('Authentication failed for origin'));
+    mockGit.fetch.mockRejectedValue(new Error('Authentication failed for origin'));
+    await expect(pullRepo('/tmp/x')).rejects.toThrow('Authentication failed');
+    expect(mockGit.reset).not.toHaveBeenCalled();
+  });
+
+  it('re-throws without hard reset when repo is not a dedicated clone', async () => {
+    mockGit.revparse.mockImplementation(async (args: any) => {
+      const a = Array.isArray(args) ? args : [args];
+      if (a[0] === '--abbrev-ref' && a[1] === 'HEAD') return 'main';
+      if (a[0] === '--show-toplevel') return '/tmp';
+      return '';
+    });
+    mockGit.pull.mockRejectedValue(new Error('Not possible to fast-forward, aborting.'));
+    await expect(pullRepo('/tmp/x')).rejects.toThrow('fast-forward');
+    expect(mockGit.fetch).not.toHaveBeenCalled();
+    expect(mockGit.reset).not.toHaveBeenCalledWith(expect.arrayContaining(['--hard']));
+  });
+
+  it('warns when the realign discards local commits', async () => {
+    mockGit.pull.mockRejectedValue(new Error('Not possible to fast-forward, aborting.'));
+    mockGit.raw.mockResolvedValue('2\n');
+    const result = await pullRepo('/tmp/x');
+    expect(result).toBe('reset to origin (diverged)');
+    const { log: testLog } = await import('../utils/logger.js');
+    expect(testLog.warn).toHaveBeenCalled();
+  });
+});
+
+describe('pullRepoFastForward', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('returns already up to date on empty ff-only pull', async () => {
+    mockGit.pull.mockResolvedValue({ summary: { changes: 0, insertions: 0, deletions: 0 } });
+    await expect(pullRepoFastForward('/tmp/x')).resolves.toBe('already up to date');
+    expect(mockGit.pull).toHaveBeenCalledWith(['--ff-only']);
+    expect(mockGit.reset).not.toHaveBeenCalled();
+    expect(mockGit.fetch).not.toHaveBeenCalled();
+  });
+
+  it('never hard-resets when ff-only fails', async () => {
+    mockGit.pull.mockRejectedValue(new Error('Not possible to fast-forward, aborting.'));
+    await expect(pullRepoFastForward('/tmp/x')).rejects.toThrow('fast-forward');
+    expect(mockGit.fetch).not.toHaveBeenCalled();
+    expect(mockGit.reset).not.toHaveBeenCalled();
+  });
+});
+
+describe('pushLearningToOrigin', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockGit.add.mockResolvedValue(undefined);
+    mockGit.commit.mockResolvedValue(undefined);
+    mockGit.push.mockResolvedValue(undefined);
+    mockGit.fetch.mockResolvedValue(undefined);
+  });
+
+  it('pushes even when nothing is newly staged (core P1 regression: file already committed)', async () => {
+    // Simulates: prior failed contribute committed the file but never pushed.
+    // git.add produces no new staged entry, so staged === [].
+    // pushLearningToOrigin must still call git.push to send that ahead commit.
+    mockGit.status.mockResolvedValue({ staged: [] });
+    mockGit.revparse.mockImplementation(async (args: any) => {
+      const a = Array.isArray(args) ? args : [args];
+      if (a[0] === '--abbrev-ref' && a[1] === 'HEAD') return 'main';
+      return '';
+    });
+    mockGit.raw.mockResolvedValue('0\n');
+
+    const result = await pushLearningToOrigin('/repo', 'foo.md', 'commit msg');
+
+    expect(mockGit.commit).not.toHaveBeenCalled();
+    expect(mockGit.push).toHaveBeenCalledWith(['origin', 'main']);
+    expect(result).toBe(true);
+  });
+
+  it('returns false when branch is still ahead of origin after push', async () => {
+    mockGit.status.mockResolvedValue({ staged: [] });
+    mockGit.revparse.mockImplementation(async (args: any) => {
+      const a = Array.isArray(args) ? args : [args];
+      if (a[0] === '--abbrev-ref' && a[1] === 'HEAD') return 'main';
+      return '';
+    });
+    mockGit.raw.mockResolvedValue('1\n');
+
+    const result = await pushLearningToOrigin('/repo', 'foo.md', 'commit msg');
+
+    expect(mockGit.push).toHaveBeenCalledWith(['origin', 'main']);
+    expect(result).toBe(false);
+  });
+
+  it('commits then pushes when the file is newly staged', async () => {
+    mockGit.status.mockResolvedValue({ staged: ['learnings/bar.md'] });
+    mockGit.revparse.mockImplementation(async (args: any) => {
+      const a = Array.isArray(args) ? args : [args];
+      if (a[0] === '--abbrev-ref' && a[1] === 'HEAD') return 'main';
+      return '';
+    });
+    mockGit.raw.mockResolvedValue('0\n');
+
+    const result = await pushLearningToOrigin('/repo', 'bar.md', 'commit msg');
+
+    expect(mockGit.commit).toHaveBeenCalledWith('commit msg');
+    expect(mockGit.push).toHaveBeenCalledWith(['origin', 'main']);
+    expect(result).toBe(true);
   });
 });

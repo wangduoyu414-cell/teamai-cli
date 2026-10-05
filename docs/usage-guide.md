@@ -1252,6 +1252,8 @@ teamai recall status     # View the current effective status (team default + use
 
 When disabled, `teamai pull` skips deploying the recall subagent, the recall rules injection block, and the TodoWrite reminder hook. Manually running `teamai recall <query>` to search is not affected by this switch.
 
+For the autocode managed-resource installation, disabling Recall also limits `pull` to static resources: it leaves local learnings and unpublished drafts untouched, does not publish the learning queue or refresh knowledge/report worktrees, and indexes only the selected docs, rules, and skills. The policy is read after the repository refresh, including on unchanged-revision pulls. Native upstream installations retain their existing knowledge synchronization behavior.
+
 ### Knowledge Base Maintenance
 
 Over time, some learnings accumulate low confidence scores (nobody upvoted them) or become stale. `teamai recall maintenance` keeps the knowledge base healthy:

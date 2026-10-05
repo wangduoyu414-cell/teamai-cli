@@ -1153,6 +1153,8 @@ teamai recall status     # 查看当前生效状态（团队默认 + 用户覆�
 
 关闭后，`teamai pull` 将跳过部署 recall subagent、recall rules 注入块和 TodoWrite 提醒 hook。手动执行 `teamai recall <query>` 搜索不受此开关影响。
 
+对于 autocode 受管资源安装，关闭 Recall 还会把 `pull` 限定为静态资源同步：保留本地 learnings 与未发布草稿，不发布知识队列或刷新知识/报告工作树，仅索引已选择的文档、规则和 Skill。以仓库刷新后的策略为准，远端版本未变化时同样生效。原生上游安装保留既有知识同步行为。
+
 ### 知识库维护
 
 随着时间推移，部分 learnings 会积累低置信度（无人 upvote）或变得过时。`teamai recall maintenance` 可保持知识库健康：

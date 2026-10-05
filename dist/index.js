@@ -33043,6 +33043,13 @@ async function pullForScope(localConfig, options, reported, policy = {}, result)
     log.persist(reason);
     return;
   }
+  const freshConfig = await loadTeamConfig(localConfig.repo.localPath);
+  if (!freshConfig) {
+    process.exitCode = 1;
+    log.warn(`[${scopeLabel}] Team config (teamai.yaml) not found. Skipping.`);
+    return;
+  }
+  const syncKnowledge = !usesManagedPolicy(freshConfig, localConfig) || isRecallEnabled(localConfig, freshConfig);
   if (!options.dryRun) {
     try {
       const tip = localConfig.repo.kind === "self" ? `origin/${await getDefaultBranch(localConfig.repo.localPath)}` : void 0;
@@ -33055,7 +33062,7 @@ async function pullForScope(localConfig, options, reported, policy = {}, result)
     }
   }
   try {
-    const queue = options.dryRun ? { remaining: 0, published: [], lastError: void 0 } : await publishQueuedLearnings(localConfig, localConfig.username, { holdsSyncLock: true });
+    const queue = options.dryRun || !syncKnowledge ? { remaining: 0, published: [], lastError: void 0 } : await publishQueuedLearnings(localConfig, localConfig.username, { holdsSyncLock: true });
     if (options.dryRun) {
       if (queue.remaining > 0) log.info(`[${scopeLabel}] [dry-run] Would publish ${queue.remaining} queued learning(s)`);
     } else if (queue.published.length > 0) {
@@ -33070,12 +33077,6 @@ async function pullForScope(localConfig, options, reported, policy = {}, result)
   } catch (e) {
     log.debug(`publishing queued learnings skipped: ${e.message}`);
   }
-  const freshConfig = await loadTeamConfig(localConfig.repo.localPath);
-  if (!freshConfig) {
-    process.exitCode = 1;
-    log.warn(`[${scopeLabel}] Team config (teamai.yaml) not found. Skipping.`);
-    return;
-  }
   let roleContext = null;
   try {
     roleContext = await buildRolePullContext(localConfig);
@@ -33087,6 +33088,7 @@ async function pullForScope(localConfig, options, reported, policy = {}, result)
   let reportsReadRoot;
   const resolveReportsReadRoot = () => {
     reportsReadRoot ??= (async () => {
+      if (!syncKnowledge) return void 0;
       if (!usesBranchWorktree(localConfig)) return localConfig.repo.localPath;
       try {
         const { readableReportsWorktree: readableReportsWorktree2 } = await Promise.resolve().then(() => (init_reports_branch(), reports_branch_exports));
@@ -33110,14 +33112,16 @@ async function pullForScope(localConfig, options, reported, policy = {}, result)
   const syncLearningsAndRebuildIndex = async () => {
     if (options.dryRun) return;
     try {
-      try {
-        const { learningsBranch: learningsBranch2 } = await Promise.resolve().then(() => (init_learnings_branch(), learnings_branch_exports));
-        const refreshed = await learningsBranch2.refresh(localConfig, { pushIfCreated: false });
-        if (refreshed.status === "failed") log.debug(`learnings worktree unavailable: ${refreshed.reason}`);
-      } catch (e) {
-        log.debug(`learnings worktree unavailable: ${e.message}`);
+      if (syncKnowledge) {
+        try {
+          const { learningsBranch: learningsBranch2 } = await Promise.resolve().then(() => (init_learnings_branch(), learnings_branch_exports));
+          const refreshed = await learningsBranch2.refresh(localConfig, { pushIfCreated: false });
+          if (refreshed.status === "failed") log.debug(`learnings worktree unavailable: ${refreshed.reason}`);
+        } catch (e) {
+          log.debug(`learnings worktree unavailable: ${e.message}`);
+        }
       }
-      const publishedRoots = await indexableLearningsRoots(localConfig);
+      const publishedRoots = syncKnowledge ? await indexableLearningsRoots(localConfig) : [];
       const docsRepoDir = path85.join(localConfig.repo.localPath, "docs");
       const rulesRepoDir = path85.join(localConfig.repo.localPath, "rules");
       const skillsRepoDir = path85.join(localConfig.repo.localPath, "skills");
@@ -33145,7 +33149,7 @@ async function pullForScope(localConfig, options, reported, policy = {}, result)
         for (const name of await countLearnings(dir)) counted.add(name);
       }
       learningsCount = counted.size;
-      if (localConfig.scope === "user") {
+      if (syncKnowledge && localConfig.scope === "user") {
         await mirrorLearnings(
           mirrorSources,
           getUserLearningsDir(),
@@ -33173,11 +33177,11 @@ async function pullForScope(localConfig, options, reported, policy = {}, result)
           // yet stays recallable, and a queued edit wins over the published copy.
           // Then every published root, so nothing is indexed from one directory
           // that happened to be picked.
-          learningsDirs: [
+          learningsDirs: syncKnowledge ? [
             pendingLearningsDir(localConfig),
             ...effectiveLearningsDir ? [effectiveLearningsDir] : [],
             ...publishedRoots
-          ],
+          ] : [],
           learningsNamespaces: activeLearningsNamespaces,
           docsDir: await pathExists(docsRepoDir) ? docsRepoDir : void 0,
           // The docs pull delivers here, not the whole docs/ tree (#707).

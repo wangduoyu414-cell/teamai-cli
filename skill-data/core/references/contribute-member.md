@@ -60,6 +60,11 @@ thing now.
 The doc lands in the team's `learnings/` and appears for teammates on their next
 `teamai pull`. It is also searchable via `teamai recall`.
 
+In an autocode managed-resource installation with Recall disabled, `pull` only
+syncs static resources and their index. It preserves local learning files and
+unpublished drafts without publishing or mirroring knowledge. Native upstream
+installations keep their existing knowledge synchronization behavior.
+
 > Tip: while recall is on, `teamai skill get share` auto-summarizes the current
 > session instead of you writing the doc by hand.
 

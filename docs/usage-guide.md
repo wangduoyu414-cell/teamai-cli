@@ -1254,6 +1254,10 @@ When disabled, `teamai pull` skips deploying the recall subagent, the recall rul
 
 For the autocode managed-resource installation, disabling Recall also limits `pull` to static resources: it leaves local learnings and unpublished drafts untouched, does not publish the learning queue or refresh knowledge/report worktrees, and indexes only the selected docs, rules, and skills. The policy is read after the repository refresh, including on unchanged-revision pulls. Native upstream installations retain their existing knowledge synchronization behavior.
 
+Managed-resource pulls preserve local source edits. If those edits have been published and the installed content already exactly matches the new deployment (including normalized Skill metadata), the next pull accepts it without rewriting the target. Extra personal files still count as edits; `.DS_Store`, `Thumbs.db`, `desktop.ini` and Python bytecode caches do not. `--force` requests a full sync, not permission to overwrite a conflict. The team-repo cache is not an authoring checkout: local changes, unpublished commits or a failed fast-forward stop the managed refresh without a hard reset. Preserve that work in your authoring checkout before resolving the cache state and retrying.
+
+When team policy disables member registration, built-in skills or automatic hooks, init skips the corresponding reviewer prompt and missing-built-in warning, and directs members to run `teamai pull` manually. It does not enable these features as part of joining.
+
 ### Knowledge Base Maintenance
 
 Over time, some learnings accumulate low confidence scores (nobody upvoted them) or become stale. `teamai recall maintenance` keeps the knowledge base healthy:

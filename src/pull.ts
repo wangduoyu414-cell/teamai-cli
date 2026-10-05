@@ -144,7 +144,9 @@ async function refreshTeamRepo(
   // the reconcile/source/report stages — so there is no unlocked window in which
   // another writer could reset/checkout the tree. We must NOT lock here: the lock
   // is non-reentrant, so re-acquiring it in the same process would fail.
-  const result = await pullRepo(localConfig.repo.localPath);
+  const currentPolicy = await loadTeamConfig(localConfig.repo.localPath);
+  const result = await pullRepo(localConfig.repo.localPath,
+    usesManagedPolicy(currentPolicy ?? undefined, localConfig) ? { preserveLocalChanges: true } : undefined);
 
   let version: string | null = null;
   try {
@@ -716,7 +718,7 @@ async function pullForScope(
     revisionField?: 'lastPullRev' | 'lastInheritedPullRev';
   } = {},
   /** Set to `{ completed: true }` on a real (non-dry-run) sync. See pull(). */
-  result?: { completed: boolean; docsSyncFailed: boolean; resourceSyncFailed: boolean },
+  result?: { completed: boolean; docsSyncFailed: boolean; resourceSyncFailed: boolean; blockedScopes: Set<LocalConfig> },
 ): Promise<void> {
   const scopeLabel = localConfig.scope;
   const declaredConfig = await loadTeamConfig(localConfig.repo.localPath);
@@ -755,6 +757,11 @@ async function pullForScope(
   } catch (e) {
     const reason = `[${scopeLabel}] Pull failed: ${(e as Error).message}`;
     process.exitCode = 1;
+    if (result) {
+      result.resourceSyncFailed = true;
+      // A refused managed cache must not feed hooks, MCP or post-pull scripts.
+      if (usesManagedPolicy(declaredConfig ?? undefined, localConfig)) result.blockedScopes.add(localConfig);
+    }
     pullSpin.fail(reason);
     log.persist(reason);
     return;
@@ -2022,7 +2029,7 @@ export async function pull(
   // into another call.
   const reported = new Set<string>();
   // A later successful scope must not hide an earlier docs failure (or vice versa).
-  const syncResult = { completed: false, docsSyncFailed: false, resourceSyncFailed: false };
+  const syncResult = { completed: false, docsSyncFailed: false, resourceSyncFailed: false, blockedScopes: new Set<LocalConfig>() };
 
   // Whether HOME's settings.json still has the pre-dispatch hook format. Read now
   // (HOME-only, no shared clone), but the actual reinject runs later under the
@@ -2164,9 +2171,10 @@ export async function pull(
   // A scope whose shared clone was locked this run is dropped from every stage
   // below: they all loadTeamConfig()/reset the same clone, which may be on a
   // transient branch held by the concurrent writer. Skipping is safe/idempotent
-  // — the next uncontended pull reconciles and reports normally.
-  const reconcileUser = activeUserConfig && !contended.has(activeUserConfig) ? activeUserConfig : null;
-  const reconcileProject = projectConfig && !contended.has(projectConfig) ? projectConfig : null;
+  // — the next uncontended pull reconciles and reports normally. A failed
+  // managed refresh likewise excludes that scope's unverified cache.
+  const reconcileUser = activeUserConfig && !contended.has(activeUserConfig) && !syncResult.blockedScopes.has(activeUserConfig) ? activeUserConfig : null;
+  const reconcileProject = projectConfig && !contended.has(projectConfig) && !syncResult.blockedScopes.has(projectConfig) ? projectConfig : null;
   // The deploy owner for this pull: the project scope's repo when a project
   // is active, else the user scope's — the two are mutually exclusive by
   // derivation above. An inherited user scope (inheritUserScope) is
@@ -2308,7 +2316,7 @@ export async function pull(
   //    clone-consuming stage above for the same reason the checks would need
   //    the clone, and reading it while the other process holds it on a
   //    transient branch is how a diagnostic invents a failure.
-  await reportPostPullChecks(options, reported, contended.size > 0);
+  await reportPostPullChecks(options, reported, contended.size > 0 || syncResult.blockedScopes.size > 0);
   } finally {
     if (result) result.completed = syncResult.completed && !syncResult.docsSyncFailed && !syncResult.resourceSyncFailed;
     const releaseSyncLocks = async () => {

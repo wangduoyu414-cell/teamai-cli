@@ -109,6 +109,14 @@ generated reference below. Read it instead of guessing a flag.
 removing stale and local-only documents; an edited doc of a docs namespace you left
 is kept and named. Use a dedicated directory; preview with `--dry-run`.
 
+For autocode managed resources, local edits stay protected. Already-published edits
+that exactly match the new deployment are accepted without rewriting; extra personal
+files still conflict. OS metadata and Python bytecode caches are not source edits.
+`--force` does not overwrite a conflict. A dirty, locally ahead or diverged team-repo
+cache stops the refresh without a hard reset; preserve the work before resolving it.
+With Recall disabled, this installation leaves learnings, unpublished drafts and
+knowledge/report worktrees untouched and indexes only selected static resources.
+
 ## References
 
 In the files below, `{SKILL_DIR}` is the directory `teamai skill path core` prints; a reference file you open on its own writes that directory as `SKILL_DIR` in braces.

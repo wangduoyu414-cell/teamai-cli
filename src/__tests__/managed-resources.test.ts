@@ -124,6 +124,78 @@ describe('managed resource lifecycle', () => {
     expect((await loadManagedResourceManifest(home)).resources['agents:a']).toBeDefined();
   });
 
+  it('accepts published local edits without rewriting them or losing the original backup', async () => {
+    const { root, home } = await fixture();
+    const target = path.join(root, 'agent.md');
+    await fse.writeFile(target, 'personal original');
+    await reconcileManagedResources(home, [file('agents:a', target, 'v1')]);
+    const prior = (await loadManagedResourceManifest(home)).resources['agents:a'].targets[0];
+    await fse.writeFile(target, 'published v2');
+    const before = await fse.readFile(path.join(home, 'managed-resources.json'));
+    const journalBefore = await fse.readFile(path.join(home, 'managed-resources.journal.json'));
+    const preview = await reconcileManagedResources(home, [file('agents:a', target, 'published v2')], { plan: true });
+    expect(preview.conflicts).toEqual([]);
+    expect(await fse.readFile(path.join(home, 'managed-resources.json'))).toEqual(before);
+    expect(await fse.readFile(path.join(home, 'managed-resources.journal.json'))).toEqual(journalBefore);
+
+    const result = await reconcileManagedResources(home, [file('agents:a', target, 'published v2')]);
+    expect(result.conflicts).toEqual([]);
+    expect(result.applied).toEqual([]);
+    const updated = (await loadManagedResourceManifest(home)).resources['agents:a'].targets[0];
+    expect(updated.ownership).toBe(prior.ownership);
+    expect(updated.backupPath).toBe(prior.backupPath);
+    expect(updated.backupHash).toBe(prior.backupHash);
+    expect(updated.hash).not.toBe(prior.hash);
+    await uninstallManagedResources(home);
+    expect(await fse.readFile(target, 'utf8')).toBe('personal original');
+  });
+
+  it('compares normalized Skill content during read-only plan and pull, retaining extra personal files', async () => {
+    const { root, home } = await fixture();
+    const source = path.join(root, 'source');
+    const target = path.join(root, 'skill');
+    const resource = (version: string): DesiredManagedResource => ({
+      id: 'skills:example', type: 'skills', targets: [{
+        path: target, kind: 'directory', sourcePath: source,
+        preservePaths: ['.runtime'],
+        sourceOverrides: { 'SKILL.md': `---\nname: example\n---\n${version}` },
+      }],
+    });
+    await fse.outputFile(path.join(source, 'SKILL.md'), 'v1');
+    await reconcileManagedResources(home, [resource('v1')]);
+    await fse.writeFile(path.join(source, 'SKILL.md'), 'v2');
+    await fse.writeFile(path.join(target, 'SKILL.md'), '---\nname: example\n---\nv2');
+    await fse.outputFile(path.join(target, '.runtime', 'private.txt'), 'local runtime');
+    const ledger = await fse.readFile(path.join(home, 'managed-resources.json'));
+    expect((await reconcileManagedResources(home, [resource('v2')], { plan: true })).conflicts).toEqual([]);
+    expect(await fse.readFile(path.join(home, 'managed-resources.json'))).toEqual(ledger);
+    expect(await fse.readFile(path.join(source, 'SKILL.md'), 'utf8')).toBe('v2');
+    const result = await reconcileManagedResources(home, [resource('v2')]);
+    expect(result.conflicts).toEqual([]);
+    expect(result.applied).toEqual([]);
+    expect(await fse.readFile(path.join(target, '.runtime', 'private.txt'), 'utf8')).toBe('local runtime');
+    await fse.writeFile(path.join(target, 'personal.md'), 'keep this');
+    expect((await reconcileManagedResources(home, [resource('v2')])).conflicts).toHaveLength(1);
+    expect(await fse.readFile(path.join(target, 'personal.md'), 'utf8')).toBe('keep this');
+  });
+
+  it.each(['.DS_Store', 'Thumbs.db', 'desktop.ini'])('ignores disposable Skill metadata %s while applying real updates', async (metadata) => {
+    const { root, home } = await fixture();
+    const source = path.join(root, 'source');
+    const target = path.join(root, 'skill');
+    const resource: DesiredManagedResource = { id: 'skills:example', type: 'skills', targets: [{
+      path: target, kind: 'directory', sourcePath: source, preservePaths: ['.runtime'],
+    }] };
+    await fse.outputFile(path.join(source, 'SKILL.md'), 'v1');
+    await reconcileManagedResources(home, [resource]);
+    await fse.writeFile(path.join(target, metadata), 'disposable');
+    expect((await reconcileManagedResources(home, [resource], { plan: true })).conflicts).toEqual([]);
+    expect((await reconcileManagedResources(home, [resource])).applied).toEqual([]);
+    await fse.writeFile(path.join(source, 'SKILL.md'), 'v2');
+    expect((await reconcileManagedResources(home, [resource])).conflicts).toEqual([]);
+    expect(await fse.readFile(path.join(target, 'SKILL.md'), 'utf8')).toBe('v2');
+  });
+
   it('removes stale targets when a resource target is renamed', async () => {
     const { root, home } = await fixture();
     const oldTarget = path.join(root, 'old.md');

@@ -80,8 +80,9 @@ teamai init https://<platform>/<org>/<repo> --scope user
 **Set up all their AI tools by default (global rule 9).** Don't add `--agent` to
 restrict the install unless the user said to. Omitting it gives a picker — select
 **every AI tool already installed**. Afterwards, **tell the user (in their
-language) which agents will now auto-sync TeamAI**, and note any detected tool that
-was skipped and why.
+language) which agents have active hooks or need manual pull**, and note any
+detected tool that was skipped and why. Follow the team policy: registration,
+built-in discovery skills and automatic hooks may be intentionally disabled.
 
 **Read-only / restricted environments (no Git access):** some sandboxed hosts
 cannot use Git. If the admin provides an HTTP endpoint + API key instead, use:
@@ -116,17 +117,16 @@ section "Which tools actually get hooks".
 
 ## Step 6 — Confirm the skills actually arrived
 
-Team resources sync on **session start**, so they may be empty right after init.
-To confirm now:
+Team resources may be empty right after init. Confirm delivery now:
 
 ```bash
 teamai pull        # sync immediately
 teamai list        # see the team skills / rules / docs you now have
 ```
 
-Then tell the user: from now on, **opening a new session in this AI tool
-auto-syncs** the latest team resources — no manual step needed. If their tool has
-no session-start hook (e.g. Gemini CLI, JoyCode), they run `teamai pull` by hand.
+Then explain the actual update path: active session-start hooks sync future
+sessions; a tool without that hook or a team with `sharing.hooks.autoApply: false`
+uses manual `teamai pull`. Do not promise auto-sync or inject hooks against policy.
 
 **Reassure them about privacy** (in their language): *"TeamAI does not send any of
 your session data to third parties. The only place anything is reported is the team

@@ -45,14 +45,15 @@ and create-repo URLs, and the per-provider caveats, and points at
    Unless the user names specific tools, do **not** pass `--agent` to restrict the
    install. Let `teamai init` set up every AI tool already installed (omitting
    `--agent` gives an interactive picker; select all detected tools). **After init,
-   report which agents were set up** — in the user's language, which tools now
-   auto-start TeamAI, and which detected tools were skipped and why (e.g. Codex
-   trust-gate, CodeBuddy design). Verify the real per-tool result with
+   report which agents were set up** — in the user's language, which tools have
+   active synchronization hooks or require manual pull, and which detected tools
+   were skipped and why (e.g. Codex trust-gate, CodeBuddy design). Verify the real per-tool result with
    `teamai doctor` and `teamai hooks list`.
-3. **After init, resources appear on the NEXT session.** `teamai init` injects a
-   session-start hook that auto-runs `teamai pull`. Empty skills/rules directories
-   right after init are normal; they fill in when the user opens a fresh session in
-   this tool. To sync immediately, run `teamai pull`.
+3. **Run `teamai pull` to confirm initial resource delivery.** When team policy
+   allows hooks and the selected tool activates them, later sessions auto-run pull.
+   With `sharing.hooks.autoApply: false`, synchronization stays manual; do not inject
+   hooks to override that policy. Disabled member registration skips reviewer setup,
+   and `builtins.skills.mode: disabled` intentionally omits the discovery skill.
 4. **Finish with `teamai doctor`.** Every setup or onboarding flow ends by running
    it and resolving what it reports before you call the job done.
 

@@ -636,7 +636,7 @@ describe('init', () => {
   });
 
   /** Init against a clone whose teamai.yaml loads, so the stub deploy runs. */
-  async function initWithTeamConfig(): Promise<void> {
+  async function initWithTeamConfig(staticOnly = false): Promise<void> {
     let cloneDone = false;
     pathExistsFn = (p: string) => (p === localPath ? cloneDone : false);
     mockGfRepoClone.mockImplementation(() => {
@@ -652,14 +652,26 @@ describe('init', () => {
         rules: { enforced: [] },
         docs: { localDir: '~/.teamai/docs' },
         env: { injectShellProfile: true },
+        ...(staticOnly ? { registration: { autoRegister: false }, hooks: { autoApply: false } } : {}),
       },
+      ...(staticOnly ? { builtins: { skills: { mode: 'disabled' } } } : {}),
       toolPaths: {},
     } as never);
-    questionAnswers = ['n', '1'];
+    questionAnswers = staticOnly ? ['1'] : ['n', '1'];
     await init({ repo: 'https://git.woa.com/HyperAI/teamai-test.git', scope: 'user' });
   }
 
   describe('deploys built-in skills after init', () => {
+    it('gives manual-sync guidance without reviewer setup or false warnings for a static team', async () => {
+      const { log } = await import('../utils/logger.js');
+      mockDeployBuiltinSkills.mockResolvedValueOnce(0);
+      await initWithTeamConfig(true);
+      expect(saveLocalConfig).toHaveBeenCalledWith(expect.objectContaining({ primaryRole: 'hai' }));
+      expect(log.info).toHaveBeenCalledWith(expect.stringContaining('Run `teamai pull` to install or update team resources'));
+      expect(log.info).not.toHaveBeenCalledWith(expect.stringContaining('[dry-run]'));
+      expect(log.info).not.toHaveBeenCalledWith(expect.stringContaining('auto-sync on each session start'));
+      expect(log.warn).not.toHaveBeenCalledWith(expect.stringContaining('not deployed'));
+    });
     it('calls deployBuiltinSkills with teamConfig when loadTeamConfig returns non-null', async () => {
       await initWithTeamConfig();
 

@@ -308,18 +308,29 @@ export async function commitPaths(
  * Before any hard reset we log.warn if it would discard local commits or
  * uncommitted changes, so the loss is never silent. A failed fetch is re-thrown
  * so the caller surfaces the real network/auth cause.
+ * Managed-resource callers use preserveLocalChanges: reject dirty or locally
+ * ahead caches and propagate ff-only failures without the reset fallback.
  */
-export async function pullRepo(localPath: string): Promise<string> {
+export async function pullRepo(localPath: string, options: { preserveLocalChanges?: boolean } = {}): Promise<string> {
   const git = createGit(localPath);
   const branch = (await git.revparse(['--abbrev-ref', 'HEAD'])).trim();
 
+  if (options.preserveLocalChanges && (await git.status()).files.length > 0) {
+    throw new Error(`Team repo cache has local changes at ${localPath}. Nothing was overwritten. `
+      + 'Copy your work to your authoring checkout, then commit or stash the cache changes before retrying.');
+  }
+
   try {
     const result = await git.pull(['--ff-only']);
+    if (options.preserveLocalChanges && (await git.status()).ahead > 0) {
+      throw new Error(`Team repo cache has unpublished commits at ${localPath}; publish or preserve them before retrying.`);
+    }
     if (result.summary.changes === 0 && result.summary.insertions === 0 && result.summary.deletions === 0) {
       return 'already up to date';
     }
     return `${result.summary.changes} file(s) changed`;
   } catch (err) {
+    if (options.preserveLocalChanges) throw err;
     // ff-only failed. A hard reset to origin is the only recovery, but it is
     // destructive — only safe on a dedicated team-repo clone. On a business-repo
     // subdir it would bubble up to the user's repo, so bail and surface the cause.

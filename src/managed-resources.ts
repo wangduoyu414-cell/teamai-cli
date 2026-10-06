@@ -24,8 +24,10 @@ export interface ManagedResourceTarget {
   sourcePath?: string;
   /** Normalized source bytes shared by read-only comparison and staged writes. */
   sourceOverrides?: Record<string, string>;
-  /** A project instruction owns this block only, never the surrounding file. */
+  /** An instruction owns this block only, never the surrounding file. */
   section?: ManagedSection;
+  /** Exact unmarked team bytes eligible for first-time manual adoption. */
+  legacyContent?: string;
   /** Explicit local-only Skill paths: never supplied by the remote source. */
   preservePaths?: string[];
 }
@@ -496,28 +498,35 @@ function token(value: string): string {
   return digest(value).slice(0, 20);
 }
 
-function extractSection(content: string, section: ManagedSection): string | null {
+function sectionRange(content: string, section: ManagedSection): { start: number; end: number } | null {
   const start = content.indexOf(section.start);
   const end = content.indexOf(section.end);
-  if (start === -1 || end === -1 || end < start) return null;
-  return content.slice(start, end + section.end.length);
+  if (start === -1 && end === -1) return null;
+  if (start === -1 || end < start || content.indexOf(section.start, start + section.start.length) !== -1
+    || content.indexOf(section.end, end + section.end.length) !== -1) {
+    throw new Error('Instruction markers are incomplete or duplicated; preserve the file and resolve the markers before syncing');
+  }
+  return { start, end: end + section.end.length };
+}
+
+function extractSection(content: string, section: ManagedSection): string | null {
+  const range = sectionRange(content, section);
+  return range ? content.slice(range.start, range.end) : null;
 }
 
 function mergeSection(content: string, section: ManagedSection, block: string): string {
-  const start = content.indexOf(section.start);
-  const end = content.indexOf(section.end);
-  if (start !== -1 && end !== -1 && end >= start) {
-    return content.slice(0, start) + block + content.slice(end + section.end.length);
+  const range = sectionRange(content, section);
+  if (range) {
+    return content.slice(0, range.start) + block + content.slice(range.end);
   }
   return `${content.trimEnd()}${content.trimEnd() ? '\n\n' : ''}${block}\n`;
 }
 
 function removeSection(content: string, section: ManagedSection): string {
-  const start = content.indexOf(section.start);
-  const end = content.indexOf(section.end);
-  if (start === -1 || end === -1 || end < start) return content;
-  const before = content.slice(0, start).replace(/\n+$/, '\n');
-  const after = content.slice(end + section.end.length).replace(/^\n+/, '\n');
+  const range = sectionRange(content, section);
+  if (!range) return content;
+  const before = content.slice(0, range.start).replace(/\n+$/, '\n');
+  const after = content.slice(range.end).replace(/^\n+/, '\n');
   if (`${before}${after}`.trim() === '') return '';
   return `${before}${after}`.trimEnd() + (before || after ? '\n' : '');
 }
@@ -679,7 +688,7 @@ interface StagedTarget {
   hash: string;
 }
 
-async function stageTarget(target: ManagedResourceTarget, transactionId: string, index: number): Promise<StagedTarget> {
+async function stageTarget(target: ManagedResourceTarget, transactionId: string, index: number, personalBase?: string): Promise<StagedTarget> {
   if ((target.content === undefined) === (target.sourcePath === undefined)) {
     throw new Error(`Managed target ${target.path} needs exactly one of content or sourcePath`);
   }
@@ -691,10 +700,10 @@ async function stageTarget(target: ManagedResourceTarget, transactionId: string,
   const payload = path.join(root, 'payload');
   try {
     if (target.content !== undefined) {
-      const existing = target.section ? await fse.readFile(target.path, 'utf8').catch((error: NodeJS.ErrnoException) => {
+      const existing = personalBase ?? (target.section ? await fse.readFile(target.path, 'utf8').catch((error: NodeJS.ErrnoException) => {
         if (error.code === 'ENOENT') return '';
         throw error;
-      }) : undefined;
+      }) : undefined);
       await fse.writeFile(payload, target.section ? mergeSection(existing!, target.section, target.content) : target.content, 'utf8');
     } else {
       const source = await fse.stat(target.sourcePath!);
@@ -928,6 +937,9 @@ export async function reconcileManagedResources(
       || target.preservePaths.some(p => !['.runtime', 'assets/douyin-cookie-bridge/bridge-secret.local.json'].includes(p)))) {
       throw new Error('Invalid local-only Skill paths');
     }
+    if (target.section && (target.content === undefined || extractSection(target.content, target.section) !== target.content)) {
+      throw new Error('Managed instruction content must contain exactly one complete marker block');
+    }
   }
   if (options.plan) {
     const pending = await readJournal(home);
@@ -969,12 +981,26 @@ export async function reconcileManagedResources(
   const pruneTypes = new Set<DesiredManagedResource['type']>(options.pruneTypes ?? []);
   const pruneIds = options.pruneResourceIds ? new Set(options.pruneResourceIds) : null;
   const conflictIds = new Set<string>();
+  const personalBases = new Map<string, string>();
 
   for (const resource of desiredResources) {
     for (const target of resource.targets) {
       const prior = findRecordByPath(manifest, target.path);
-      if (!prior) continue;
+      if (!prior) {
+        if (resource.type === 'instructions' && target.section && target.legacyContent !== undefined) {
+          const existing = await fse.readFile(target.path, 'utf8').catch((error: NodeJS.ErrnoException) => {
+            if (error.code === 'ENOENT') return null;
+            throw error;
+          });
+          if (existing === target.legacyContent) personalBases.set(target.path, '');
+        }
+        continue;
+      }
+      if (prior.section && !target.section) {
+        throw new Error(`Cannot expand section ownership to the whole file: ${target.path}`);
+      }
       const currentHash = await hashPath(target.path, prior.kind, prior.section, prior.preservePaths);
+      const migrating = resource.type === 'instructions' && target.section && !prior.section;
       if (currentHash !== null && currentHash !== prior.hash) {
         // A member may have already published exactly these edits. Compare the
         // actual deployment bytes, including Skill metadata normalization, so
@@ -982,9 +1008,15 @@ export async function reconcileManagedResources(
         const desiredHash = target.content !== undefined
           ? digest(target.content)
           : target.sourcePath ? await hashPath(target.sourcePath, target.kind, undefined, target.preservePaths, target.sourceOverrides) : null;
-        if (currentHash === desiredHash) continue;
+        if (!migrating && currentHash === desiredHash) continue;
         conflictIds.add(resource.id);
         result.conflicts.push(`${resource.id}: ${target.path} was modified locally`);
+      } else if (migrating) {
+        const personalBase = prior.backupPath ? await fse.readFile(prior.backupPath, 'utf8') : '';
+        if (extractSection(personalBase, target.section!) !== null) {
+          throw new Error(`Legacy instruction backup contains a managed block; resolve it before migrating ${target.path}`);
+        }
+        personalBases.set(target.path, personalBase);
       }
     }
   }
@@ -1015,7 +1047,8 @@ export async function reconcileManagedResources(
     let index = 0;
     for (const resource of activeResources) {
       for (const target of resource.targets) {
-        const entry = await stageTarget(target, transactionId, index++);
+        // A legacy whole-file backup is personal content, not a restoreBlock.
+        const entry = await stageTarget(target, transactionId, index++, personalBases.get(target.path));
         staged.set(`${resource.id}\0${target.path}`, entry);
         addStagedTargetEvidence(journal, entry.root, target, resource.type);
         await writeJournal(home, journal);
@@ -1040,10 +1073,17 @@ export async function reconcileManagedResources(
         let ownership: ManagedOwnership;
         let backupPath: string | undefined;
         let backupHash: string | undefined;
+        const migrating = resource.type === 'instructions' && target.section && prior && !prior.section;
         const sectionFileExisted = target.section
-          ? (prior?.section ? prior.sectionFileExisted : targetExisted)
+          ? (personalBases.has(target.path) ? prior?.ownership === 'replaced-with-backup' : prior?.section ? prior.sectionFileExisted : targetExisted)
           : undefined;
-        if (prior) {
+        if (migrating) {
+          // Personal bytes have been restored into the staged file. From this
+          // commit onward only the new block is owned; the old full-file backup
+          // is retired only by post-commit cleanup, never before rollback ends.
+          ownership = 'created';
+          if (prior.backupPath) journal.backupCleanup.push(prior.backupPath);
+        } else if (prior) {
           ownership = prior.ownership;
           backupPath = prior.backupPath;
           backupHash = prior.backupHash;

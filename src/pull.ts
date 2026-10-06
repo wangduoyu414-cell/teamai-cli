@@ -57,6 +57,7 @@ import { acquireLock, releaseLock } from './update.js';
 import { mirrorLearnings } from './utils/learnings-mirror.js';
 import { withTimeout } from './utils/async.js';
 import { runDeclaredPostPull } from './post-pull.js';
+import { assertCompatibleCore } from './core-compatibility.js';
 
 export async function retainMissingUnselectedTargets(
   home: string,
@@ -764,6 +765,20 @@ async function pullForScope(
     }
     pullSpin.fail(reason);
     log.persist(reason);
+    return;
+  }
+
+  // Check the refreshed lock, before any resource delivery or control-plane
+  // effects. A cached pre-fetch check alone would miss a new Core requirement.
+  try {
+    await assertCompatibleCore(localConfig.repo.localPath);
+  } catch (error) {
+    process.exitCode = 1;
+    if (result) {
+      result.resourceSyncFailed = true;
+      result.blockedScopes.add(localConfig);
+    }
+    log.error(`[${scopeLabel}] Core compatibility check failed: ${(error as Error).message}`);
     return;
   }
 
@@ -1715,8 +1730,9 @@ export async function reconcileManagedInstructions(
             kind: 'file',
             tool,
             ...(specialInstructionPath ? { hostRoot: path.dirname(specialInstructionPath) } : {}),
-            // User scope's host instruction file is a complete TeamAI-managed file.
-            content: `${blocks.join('\n\n').trim()}\n`,
+            section: instructionSection,
+            legacyContent: `${blocks.join('\n\n').trim()}\n`,
+            content: `${instructionSection.start}\n<!-- DO NOT EDIT: This section is auto-managed by teamai -->\n\n${blocks.join('\n\n').trim()}\n${instructionSection.end}`,
           }],
           ...(retainTargetPaths.length > 0 ? { retainTargetPaths } : {}),
         });

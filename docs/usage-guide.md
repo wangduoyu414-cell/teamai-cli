@@ -95,6 +95,10 @@ teamai --version
 
 **Prerequisites:** Node.js ≥ 20, Git (TGit users also need the `gf` CLI, and CNB users the `cnb` CLI — `teamai init` installs either automatically)
 
+Repositories that publish `teamai-core.lock.json` require its exact active CLI package and version. `pull` checks the refreshed lock before delivering resources; a mismatch or invalid lock stops that scope, including hooks, MCP and post-pull scripts. `--plan` checks only the cached lock without fetching. Follow that repository's pinned installation instructions instead of installing `latest`. Older CLIs need a one-time upgrade before this safeguard can apply.
+
+Managed root `AGENTS.md` instructions occupy a marked block in both user and project files. Personal rules outside it survive updates and uninstall. An unchanged legacy whole-file installation migrates transactionally: its verified original backup becomes personal text, and only the new team block remains managed. The old backup is retired after the new file and ownership record commit. Locally edited legacy files, ambiguous backups and broken markers are preserved for resolution. Boundary blank-line formatting follows the existing section formatter; this is not a byte-for-byte archive. Do not downgrade a migrated installation to a CLI that still owns whole files.
+
 ---
 
 ## Admin Initialization

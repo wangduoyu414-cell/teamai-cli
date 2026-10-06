@@ -23,6 +23,8 @@ flow — see `{SKILL_DIR}/references/setup-admin.md` — not this one.)
 
 ## Step 1 — Install and verify
 
+If the team's instructions declare `teamai-core.lock.json`, use that repository's pinned installation path, not the generic command below. A lock mismatch during pull is an upgrade requirement, not permission to force synchronization. Older CLIs require a one-time upgrade to enforce this check. Managed global instructions preserve personal text outside their marked team block; an edited legacy whole-file installation must be resolved before migration.
+
 ```bash
 npm install -g teamai-cli
 teamai --version

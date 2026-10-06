@@ -10656,7 +10656,7 @@ async function reconcileManagedResources(home, desiredResources, options = {}) {
           backupPath = backup.path;
           backupHash = backup.hash;
         }
-        if (currentHash !== entry.hash) {
+        if (migrating || currentHash !== entry.hash) {
           for (const local of target.preservePaths ?? []) {
             const from = path29.join(target.path, local);
             if (await fse3.pathExists(from)) {

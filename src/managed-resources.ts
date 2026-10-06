@@ -1097,7 +1097,9 @@ export async function reconcileManagedResources(
           backupPath = backup.path;
           backupHash = backup.hash;
         }
-        if (currentHash !== entry.hash) {
+        // Migration also restores personal bytes outside the block. Equal block
+        // hashes cannot prove the complete staged file is already installed.
+        if (migrating || currentHash !== entry.hash) {
           // Copy local data only when source changes. Unchanged pulls neither
           // traverse nor copy the virtual environment. The existing transaction
           // captures the complete old directory for rollback.

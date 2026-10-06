@@ -7,13 +7,13 @@ import { loadManagedResourceManifest, reconcileManagedResources, uninstallManage
 const roots: string[] = [];
 const section = { start: '<!-- [teamai:instructions:start] -->', end: '<!-- [teamai:instructions:end] -->' };
 const block = (version: string) => `${section.start}\n# Team ${version}\n${section.end}`;
-async function fixture(personal?: string) {
+async function fixture(personal?: string, legacy = '# Team old\n') {
   const root = await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-instruction-migration-'));
   roots.push(root);
   const home = path.join(root, '.teamai');
   const target = path.join(root, 'AGENTS.md');
   if (personal !== undefined) await fse.writeFile(target, personal);
-  const whole: DesiredManagedResource = { id: 'instructions:codex', type: 'instructions', targets: [{ path: target, kind: 'file', content: '# Team old\n' }] };
+  const whole: DesiredManagedResource = { id: 'instructions:codex', type: 'instructions', targets: [{ path: target, kind: 'file', content: legacy }] };
   const desired = (version = 'new'): DesiredManagedResource => ({ ...whole, targets: [{ path: target, kind: 'file', section, content: block(version) }] });
   await reconcileManagedResources(home, [whole]);
   const prior = (await loadManagedResourceManifest(home)).resources[whole.id].targets[0];
@@ -34,6 +34,15 @@ async function snapshot(root: string): Promise<Record<string, string>> {
 afterEach(async () => { await Promise.all(roots.splice(0).map(root => fse.remove(root))); });
 
 describe('whole-file instruction migration', () => {
+  it('restores personal content even when the old whole file already contains the desired block', async () => {
+    const { home, target, desired, prior } = await fixture('# Original personal rules\n', `${block('new')}\n`);
+    await reconcileManagedResources(home, [desired()]);
+    expect(await fse.readFile(target, 'utf8')).toBe(`# Original personal rules\n\n${block('new')}\n`);
+    expect(await fse.pathExists(prior.backupPath!)).toBe(false);
+    await uninstallManagedResources(home);
+    expect(await fse.readFile(target, 'utf8')).toBe('# Original personal rules\n');
+  });
+
   it('restores the original personal body once and keeps later personal edits through update and uninstall', async () => {
     const { root, home, target, desired, prior } = await fixture('# My personal rules\n');
     const before = await snapshot(root);

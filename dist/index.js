@@ -6319,16 +6319,16 @@ async function reconcilePlacementRecords(repoPath, state, tip, deliversEveryName
     if (!records) continue;
     const kept = {};
     for (const [name, recorded] of Object.entries(records)) {
-      const valid = placedResourcePath(records, root, name);
-      if (valid && !await exists3(valid)) {
+      const valid2 = placedResourcePath(records, root, name);
+      if (valid2 && !await exists3(valid2)) {
         log.debug(`Dropping placement record ${field}.${name} \u2192 ${recorded}: gone from the default branch`);
-        if (field === "placedAgents") state.retiredPlacedAgents = { ...state.retiredPlacedAgents, [name]: valid };
+        if (field === "placedAgents") state.retiredPlacedAgents = { ...state.retiredPlacedAgents, [name]: valid2 };
         changed = true;
         continue;
       }
-      if (valid && checkedAt && !recordedNow.has(`${field}:${name}`) && await pathDeletedSince(repoPath, checkedAt, valid, history) === true) {
+      if (valid2 && checkedAt && !recordedNow.has(`${field}:${name}`) && await pathDeletedSince(repoPath, checkedAt, valid2, history) === true) {
         log.debug(`Dropping placement record ${field}.${name} \u2192 ${recorded}: deleted from the default branch since the last check`);
-        if (field === "placedAgents") state.retiredPlacedAgents = { ...state.retiredPlacedAgents, [name]: valid };
+        if (field === "placedAgents") state.retiredPlacedAgents = { ...state.retiredPlacedAgents, [name]: valid2 };
         changed = true;
         continue;
       }
@@ -6502,18 +6502,18 @@ function splitFrontmatter2(content) {
   const body = content.slice(rawFull.length);
   const raw = stripBom(rawFull);
   let data = {};
-  let valid = false;
+  let valid2 = false;
   try {
     const parsed = matter2(raw, {});
     if (!isPlainRecord(parsed.data)) {
       return { data: {}, valid: false, body, raw };
     }
     data = { ...parsed.data };
-    valid = true;
+    valid2 = true;
   } catch {
     data = {};
   }
-  return { data, valid, body, raw };
+  return { data, valid: valid2, body, raw };
 }
 function parseFrontmatter(content) {
   const { data, body } = splitFrontmatter2(content);
@@ -6984,10 +6984,10 @@ function tgitAuthHeaders(token2, scheme) {
   }
   return { "PRIVATE-TOKEN": token2 };
 }
-async function tgitFetch(path157, init2) {
+async function tgitFetch(path158, init2) {
   const { token: token2, scheme: resolvedScheme } = getTGitToken();
   const scheme = cachedScheme ?? resolvedScheme;
-  const url = `${TGIT_API_BASE}${path157}`;
+  const url = `${TGIT_API_BASE}${path158}`;
   const callerHeaders = { ...init2?.headers };
   const baseHeaders = { "Content-Type": "application/json", ...callerHeaders };
   const doFetch = (activeScheme) => fetch(url, {
@@ -10149,27 +10149,32 @@ async function readJournal(home) {
 function token(value) {
   return digest(value).slice(0, 20);
 }
-function extractSection(content, section) {
+function sectionRange(content, section) {
   const start = content.indexOf(section.start);
   const end = content.indexOf(section.end);
-  if (start === -1 || end === -1 || end < start) return null;
-  return content.slice(start, end + section.end.length);
+  if (start === -1 && end === -1) return null;
+  if (start === -1 || end < start || content.indexOf(section.start, start + section.start.length) !== -1 || content.indexOf(section.end, end + section.end.length) !== -1) {
+    throw new Error("Instruction markers are incomplete or duplicated; preserve the file and resolve the markers before syncing");
+  }
+  return { start, end: end + section.end.length };
+}
+function extractSection(content, section) {
+  const range = sectionRange(content, section);
+  return range ? content.slice(range.start, range.end) : null;
 }
 function mergeSection(content, section, block) {
-  const start = content.indexOf(section.start);
-  const end = content.indexOf(section.end);
-  if (start !== -1 && end !== -1 && end >= start) {
-    return content.slice(0, start) + block + content.slice(end + section.end.length);
+  const range = sectionRange(content, section);
+  if (range) {
+    return content.slice(0, range.start) + block + content.slice(range.end);
   }
   return `${content.trimEnd()}${content.trimEnd() ? "\n\n" : ""}${block}
 `;
 }
 function removeSection(content, section) {
-  const start = content.indexOf(section.start);
-  const end = content.indexOf(section.end);
-  if (start === -1 || end === -1 || end < start) return content;
-  const before = content.slice(0, start).replace(/\n+$/, "\n");
-  const after = content.slice(end + section.end.length).replace(/^\n+/, "\n");
+  const range = sectionRange(content, section);
+  if (!range) return content;
+  const before = content.slice(0, range.start).replace(/\n+$/, "\n");
+  const after = content.slice(range.end).replace(/^\n+/, "\n");
   if (`${before}${after}`.trim() === "") return "";
   return `${before}${after}`.trimEnd() + (before || after ? "\n" : "");
 }
@@ -10303,7 +10308,7 @@ async function validateManagedBackups(manifest) {
     }
   }
 }
-async function stageTarget(target, transactionId, index) {
+async function stageTarget(target, transactionId, index, personalBase) {
   if (target.content === void 0 === (target.sourcePath === void 0)) {
     throw new Error(`Managed target ${target.path} needs exactly one of content or sourcePath`);
   }
@@ -10315,10 +10320,10 @@ async function stageTarget(target, transactionId, index) {
   const payload = path29.join(root, "payload");
   try {
     if (target.content !== void 0) {
-      const existing = target.section ? await fse3.readFile(target.path, "utf8").catch((error) => {
+      const existing = personalBase ?? (target.section ? await fse3.readFile(target.path, "utf8").catch((error) => {
         if (error.code === "ENOENT") return "";
         throw error;
-      }) : void 0;
+      }) : void 0);
       await fse3.writeFile(payload, target.section ? mergeSection(existing, target.section, target.content) : target.content, "utf8");
     } else {
       const source = await fse3.stat(target.sourcePath);
@@ -10503,6 +10508,9 @@ async function reconcileManagedResources(home, desiredResources, options = {}) {
     if (target.preservePaths && (resource.type !== "skills" || target.kind !== "directory" || target.preservePaths.some((p) => ![".runtime", "assets/douyin-cookie-bridge/bridge-secret.local.json"].includes(p)))) {
       throw new Error("Invalid local-only Skill paths");
     }
+    if (target.section && (target.content === void 0 || extractSection(target.content, target.section) !== target.content)) {
+      throw new Error("Managed instruction content must contain exactly one complete marker block");
+    }
   }
   if (options.plan) {
     const pending = await readJournal(home);
@@ -10542,16 +10550,36 @@ async function reconcileManagedResources(home, desiredResources, options = {}) {
   const pruneTypes = new Set(options.pruneTypes ?? []);
   const pruneIds = options.pruneResourceIds ? new Set(options.pruneResourceIds) : null;
   const conflictIds = /* @__PURE__ */ new Set();
+  const personalBases = /* @__PURE__ */ new Map();
   for (const resource of desiredResources) {
     for (const target of resource.targets) {
       const prior = findRecordByPath(manifest, target.path);
-      if (!prior) continue;
+      if (!prior) {
+        if (resource.type === "instructions" && target.section && target.legacyContent !== void 0) {
+          const existing = await fse3.readFile(target.path, "utf8").catch((error) => {
+            if (error.code === "ENOENT") return null;
+            throw error;
+          });
+          if (existing === target.legacyContent) personalBases.set(target.path, "");
+        }
+        continue;
+      }
+      if (prior.section && !target.section) {
+        throw new Error(`Cannot expand section ownership to the whole file: ${target.path}`);
+      }
       const currentHash = await hashPath(target.path, prior.kind, prior.section, prior.preservePaths);
+      const migrating = resource.type === "instructions" && target.section && !prior.section;
       if (currentHash !== null && currentHash !== prior.hash) {
         const desiredHash = target.content !== void 0 ? digest(target.content) : target.sourcePath ? await hashPath(target.sourcePath, target.kind, void 0, target.preservePaths, target.sourceOverrides) : null;
-        if (currentHash === desiredHash) continue;
+        if (!migrating && currentHash === desiredHash) continue;
         conflictIds.add(resource.id);
         result.conflicts.push(`${resource.id}: ${target.path} was modified locally`);
+      } else if (migrating) {
+        const personalBase = prior.backupPath ? await fse3.readFile(prior.backupPath, "utf8") : "";
+        if (extractSection(personalBase, target.section) !== null) {
+          throw new Error(`Legacy instruction backup contains a managed block; resolve it before migrating ${target.path}`);
+        }
+        personalBases.set(target.path, personalBase);
       }
     }
   }
@@ -10587,7 +10615,7 @@ async function reconcileManagedResources(home, desiredResources, options = {}) {
     let index = 0;
     for (const resource of activeResources) {
       for (const target of resource.targets) {
-        const entry = await stageTarget(target, transactionId, index++);
+        const entry = await stageTarget(target, transactionId, index++, personalBases.get(target.path));
         staged.set(`${resource.id}\0${target.path}`, entry);
         addStagedTargetEvidence(journal, entry.root, target, resource.type);
         await writeJournal(home, journal);
@@ -10609,8 +10637,12 @@ async function reconcileManagedResources(home, desiredResources, options = {}) {
         let ownership;
         let backupPath;
         let backupHash;
-        const sectionFileExisted = target.section ? prior?.section ? prior.sectionFileExisted : targetExisted : void 0;
-        if (prior) {
+        const migrating = resource.type === "instructions" && target.section && prior && !prior.section;
+        const sectionFileExisted = target.section ? personalBases.has(target.path) ? prior?.ownership === "replaced-with-backup" : prior?.section ? prior.sectionFileExisted : targetExisted : void 0;
+        if (migrating) {
+          ownership = "created";
+          if (prior.backupPath) journal.backupCleanup.push(prior.backupPath);
+        } else if (prior) {
           ownership = prior.ownership;
           backupPath = prior.backupPath;
           backupHash = prior.backupHash;
@@ -10624,7 +10656,7 @@ async function reconcileManagedResources(home, desiredResources, options = {}) {
           backupPath = backup.path;
           backupHash = backup.hash;
         }
-        if (currentHash !== entry.hash) {
+        if (migrating || currentHash !== entry.hash) {
           for (const local of target.preservePaths ?? []) {
             const from = path29.join(target.path, local);
             if (await fse3.pathExists(from)) {
@@ -20252,12 +20284,12 @@ async function ensureSkillFrontmatter(skillDir, skillName) {
   return true;
 }
 function normalizeSkillFrontmatter(content, skillName) {
-  const { data, body, raw, valid } = splitFrontmatter2(content);
+  const { data, body, raw, valid: valid2 } = splitFrontmatter2(content);
   if (!raw) {
     const description = extractDescriptionFromContent(body, skillName);
     return stringifyFrontmatter({ name: skillName, description }, body);
   }
-  if (!valid) {
+  if (!valid2) {
     log.warn(`Could not repair malformed frontmatter in ${skillName}/SKILL.md; leaving it unchanged`);
     return content;
   }
@@ -23170,13 +23202,13 @@ async function ensureWorktree(spec, localConfig, options = {}) {
     );
   }
   if (await isGitRepo(wt)) {
-    let valid = false;
+    let valid2 = false;
     try {
       await createGit(wt).revparse(["--is-inside-work-tree"]);
-      valid = true;
+      valid2 = true;
     } catch {
     }
-    if (valid) {
+    if (valid2) {
       await refuseForeignCheckout(spec, wt, repoRoot);
       return wt;
     }
@@ -28179,6 +28211,41 @@ var init_post_pull = __esm({
   }
 });
 
+// src/core-compatibility.ts
+import path72 from "path";
+import { readFile as readFile2 } from "fs/promises";
+import { valid } from "semver";
+async function assertCompatibleCore(repoPath) {
+  const filename = path72.join(repoPath, "teamai-core.lock.json");
+  let text;
+  try {
+    text = await readFile2(filename, "utf8");
+  } catch (error) {
+    if (error.code === "ENOENT") return;
+    throw error;
+  }
+  let lock;
+  try {
+    lock = JSON.parse(text);
+    if (!lock || lock.schema_version !== 1 || lock.status !== "active" || typeof lock.fork?.package !== "string" || !/^(@[a-z0-9._-]+\/)?[a-z0-9._-]+$/.test(lock.fork.package) || typeof lock.fork.version !== "string" || !valid(lock.fork.version)) {
+      throw new Error("unsupported lock");
+    }
+  } catch {
+    throw new Error("Invalid teamai-core.lock.json; no resources were installed. Ask the team maintainer to repair the lock.");
+  }
+  const required = lock.fork;
+  const installed2 = { package: getCurrentPackageName(), version: getCurrentVersion() };
+  if (required.package !== installed2.package || required.version !== installed2.version) {
+    throw new Error(`This team requires ${required.package}@${required.version}; running ${installed2.package}@${installed2.version}. No resources were installed. Update the tool checkout to the approved team revision, run npm ci --ignore-scripts there, then retry npm exec -- teamai pull. Global installations must use the same approved Core.`);
+  }
+}
+var init_core_compatibility = __esm({
+  "src/core-compatibility.ts"() {
+    "use strict";
+    init_package_info();
+  }
+});
+
 // src/models-cmd.ts
 var models_cmd_exports = {};
 __export(models_cmd_exports, {
@@ -28190,7 +28257,7 @@ __export(models_cmd_exports, {
   modelsSwitch: () => modelsSwitch,
   syncTeamModelProfiles: () => syncTeamModelProfiles
 });
-import path72 from "path";
+import path73 from "path";
 async function teamContext() {
   let initialized;
   try {
@@ -28468,7 +28535,7 @@ async function syncTeamModelProfiles(localConfig, options = {}) {
     group.agents.push(agent);
     groups.set(groupKey, group);
   }
-  if (groups.size === 0 && !await pathExists(path72.join(localConfig.repo.localPath, "models"))) return void 0;
+  if (groups.size === 0 && !await pathExists(path73.join(localConfig.repo.localPath, "models"))) return void 0;
   const resolution = await resolveEntriesFor(modelsEntryReader, localConfig);
   if (resolution.kind === "failed") {
     reportEntryResolution(resolution);
@@ -28545,15 +28612,15 @@ __export(usage_tracker_exports, {
 });
 import { randomBytes as randomBytes3, randomUUID as randomUUID3 } from "crypto";
 import fs31 from "fs";
-import path73 from "path";
+import path74 from "path";
 function getUsagePath(config) {
   const dataHome = getDataHome(config);
   const sharedDir = getTeamaiHomeDir();
-  if (path73.resolve(dataHome) !== path73.resolve(sharedDir)) return path73.join(dataHome, "usage.jsonl");
-  return path73.join(sharedDir, "user-usage.jsonl");
+  if (path74.resolve(dataHome) !== path74.resolve(sharedDir)) return path74.join(dataHome, "usage.jsonl");
+  return path74.join(sharedDir, "user-usage.jsonl");
 }
 function getKnownSkillsPath() {
-  return path73.join(getUserHome(), ".teamai", "known-skills.json");
+  return path74.join(getUserHome(), ".teamai", "known-skills.json");
 }
 function extractSkillName(toolInput) {
   try {
@@ -28597,18 +28664,18 @@ async function skillExistsOnDisk(skillName, toolRoots) {
   const home = getUserHome();
   const claudeRoot = resolveToolRootDir(CLAUDE_TOOL_ID, DEFAULT_CLAUDE_ROOT, toolRoots);
   const userSkillDirs = [
-    path73.join(claudeRoot, "skills"),
-    ...SKILL_DIRS.map((dir) => path73.join(home, dir)),
-    path73.join(getCopilotHome(), "skills")
+    path74.join(claudeRoot, "skills"),
+    ...SKILL_DIRS.map((dir) => path74.join(home, dir)),
+    path74.join(getCopilotHome(), "skills")
   ];
   for (const dir of userSkillDirs) {
-    const skillMd = path73.join(dir, skillName, "SKILL.md");
+    const skillMd = path74.join(dir, skillName, "SKILL.md");
     if (await pathExists(skillMd)) return true;
   }
   const cwd = process.cwd();
-  if (path73.resolve(cwd) !== path73.resolve(home)) {
+  if (path74.resolve(cwd) !== path74.resolve(home)) {
     for (const dir of PROJECT_SKILL_DIRS) {
-      const skillMd = path73.join(cwd, dir, skillName, "SKILL.md");
+      const skillMd = path74.join(cwd, dir, skillName, "SKILL.md");
       if (await pathExists(skillMd)) return true;
     }
   }
@@ -28617,7 +28684,7 @@ async function skillExistsOnDisk(skillName, toolRoots) {
 async function appendUsageEvent(event, config) {
   try {
     const usagePath = getUsagePath(config);
-    await ensureDir(path73.dirname(usagePath));
+    await ensureDir(path74.dirname(usagePath));
     const line = JSON.stringify(event) + "\n";
     if (await withUsageLock(usagePath, APPEND_LOCK_WAIT, () => fs31.promises.appendFile(usagePath, line, "utf-8"))) {
       log.debug(`Tracked skill: ${event.skill}`);
@@ -28625,7 +28692,7 @@ async function appendUsageEvent(event, config) {
     }
     await ignoreUsageSideFiles(config, usagePath);
     const pendingId = randomUUID3();
-    const pendingPath2 = path73.join(path73.dirname(usagePath), `${pendingPrefix(usagePath)}${pendingId}.jsonl`);
+    const pendingPath2 = path74.join(path74.dirname(usagePath), `${pendingPrefix(usagePath)}${pendingId}.jsonl`);
     const mode = await fs31.promises.stat(usagePath).then((s) => s.mode & 511, () => 384);
     await fs31.promises.writeFile(pendingPath2, JSON.stringify({ ...event, pendingId }) + "\n", { encoding: "utf-8", flag: "wx", mode });
     log.debug(`Tracked skill: ${event.skill} (in ${pendingPath2}; ${usagePath}.lock is held)`);
@@ -28695,16 +28762,16 @@ async function withUsageLock(usagePath, wait, fn) {
   }
 }
 function pendingPrefix(usagePath) {
-  return `${path73.basename(usagePath, ".jsonl")}.pending-`;
+  return `${path74.basename(usagePath, ".jsonl")}.pending-`;
 }
 async function foldPendingEvents2(usagePath) {
-  const dir = path73.dirname(usagePath);
+  const dir = path74.dirname(usagePath);
   const prefix = pendingPrefix(usagePath);
   const names = await fs31.promises.readdir(dir).catch(() => []);
   let folded;
   for (const name of names) {
     if (!name.startsWith(prefix) || !name.endsWith(".jsonl")) continue;
-    const pendingPath2 = path73.join(dir, name);
+    const pendingPath2 = path74.join(dir, name);
     try {
       const content = await fs31.promises.readFile(pendingPath2, "utf-8");
       if (!content.endsWith("\n")) continue;
@@ -28757,7 +28824,7 @@ async function rewriteUsageFile(config, keep) {
 }
 async function ignoreUsageSideFiles(config, usagePath) {
   if (config.scope !== "project" || config.repo.kind === "self") return;
-  const gitignorePath = path73.join(path73.dirname(usagePath), ".gitignore");
+  const gitignorePath = path74.join(path74.dirname(usagePath), ".gitignore");
   try {
     const lines = (await fs31.promises.readFile(gitignorePath, "utf-8")).split("\n");
     const missing = USAGE_SIDE_FILE_PATTERNS.filter((p) => !lines.some((l) => l.trim() === p));
@@ -28772,12 +28839,12 @@ async function ignoreUsageSideFiles(config, usagePath) {
   }
 }
 async function removeOrphanTemps2(target) {
-  const dir = path73.dirname(target);
-  const prefix = `${path73.basename(target)}.`;
+  const dir = path74.dirname(target);
+  const prefix = `${path74.basename(target)}.`;
   const names = await fs31.promises.readdir(dir).catch(() => []);
   for (const name of names) {
     if (!name.startsWith(prefix) || !/^\d+\.[0-9a-f]{12}\.tmp$/.test(name.slice(prefix.length))) continue;
-    await fs31.promises.rm(path73.join(dir, name), { force: true }).catch(() => void 0);
+    await fs31.promises.rm(path74.join(dir, name), { force: true }).catch(() => void 0);
   }
 }
 async function updateKnownSkills(skillName) {
@@ -29044,20 +29111,20 @@ __export(partition_exports, {
   resolvePartitionDir: () => resolvePartitionDir,
   writeAnchorFile: () => writeAnchorFile
 });
-import path74 from "path";
+import path75 from "path";
 import fs32 from "fs";
 import { createHash as createHash8 } from "crypto";
 import YAML15 from "yaml";
 function isCaseInsensitiveFs(probeDir) {
-  const base = probeDir ?? path74.join(getUserHome(), ".teamai");
+  const base = probeDir ?? path75.join(getUserHome(), ".teamai");
   const cached = caseInsensitiveCache.get(base);
   if (cached !== void 0) return cached;
   let insensitive = false;
   try {
     fs32.mkdirSync(base, { recursive: true });
     const token2 = `.teamai-case-probe-${process.pid}-${Date.now()}`;
-    const upper = path74.join(base, token2.toUpperCase());
-    const lower = path74.join(base, token2.toLowerCase());
+    const upper = path75.join(base, token2.toUpperCase());
+    const lower = path75.join(base, token2.toLowerCase());
     fs32.writeFileSync(upper, "");
     insensitive = fs32.existsSync(lower);
     fs32.rmSync(upper, { force: true });
@@ -29071,7 +29138,7 @@ function resetCaseProbeCache() {
   caseInsensitiveCache = /* @__PURE__ */ new Map();
 }
 function normalizeAnchor(anchor) {
-  const probeDir = path74.dirname(anchor) || anchor;
+  const probeDir = path75.dirname(anchor) || anchor;
   return isCaseInsensitiveFs(probeDir) ? anchor.toLowerCase() : anchor;
 }
 function safePathPrefix(anchor) {
@@ -29090,16 +29157,16 @@ function projectSlug(anchor) {
 }
 function legacyProjectSlug(anchor) {
   const norm = normalizeAnchor(anchor);
-  const raw = path74.basename(norm) || "project";
+  const raw = path75.basename(norm) || "project";
   const cleaned = raw.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
   return `${(cleaned || "project").slice(0, 40)}-${anchorHash(norm)}`;
 }
 function projectDataHome(anchor) {
-  return path74.join(getUserHome(), ".teamai", "projects", projectSlug(anchor));
+  return path75.join(getUserHome(), ".teamai", "projects", projectSlug(anchor));
 }
 async function resolvePartitionDir(anchor, options = {}) {
   const canonical = projectDataHome(anchor);
-  const legacyDir = path74.join(projectsRootDir(), legacyProjectSlug(anchor));
+  const legacyDir = path75.join(projectsRootDir(), legacyProjectSlug(anchor));
   if (legacyDir === canonical) return canonical;
   if (options.dryRun) {
     const canonicalEntries = await fs32.promises.readdir(canonical).catch(() => null);
@@ -29135,7 +29202,7 @@ async function adoptLegacyPartition(canonical, legacyDir) {
   }
 }
 async function rebaseLocalPathAfterAdoption(canonical, legacyDir) {
-  const configPath = path74.join(canonical, "config.yaml");
+  const configPath = path75.join(canonical, "config.yaml");
   const content = await readFileSafe(configPath);
   if (!content) return;
   let doc;
@@ -29146,9 +29213,9 @@ async function rebaseLocalPathAfterAdoption(canonical, legacyDir) {
   }
   const repo = doc?.repo;
   if (!repo?.localPath) return;
-  const rel = path74.relative(legacyDir, expandHome(repo.localPath));
-  if (rel === "" ? false : rel.startsWith("..") || path74.isAbsolute(rel)) return;
-  const rebased = rel === "" ? canonical : path74.join(canonical, rel);
+  const rel = path75.relative(legacyDir, expandHome(repo.localPath));
+  if (rel === "" ? false : rel.startsWith("..") || path75.isAbsolute(rel)) return;
+  const rebased = rel === "" ? canonical : path75.join(canonical, rel);
   if (rebased === repo.localPath) return;
   repo.localPath = rebased;
   await writeFileAtomic(configPath, YAML15.stringify(doc));
@@ -29162,16 +29229,16 @@ async function dirExists(p) {
   }
 }
 function projectsRootDir() {
-  return path74.join(getUserHome(), ".teamai", "projects");
+  return path75.join(getUserHome(), ".teamai", "projects");
 }
 async function writeAnchorFile(partitionDir, anchor) {
   await fs32.promises.mkdir(partitionDir, { recursive: true });
-  await fs32.promises.writeFile(path74.join(partitionDir, "anchor"), `${anchor}
+  await fs32.promises.writeFile(path75.join(partitionDir, "anchor"), `${anchor}
 `, "utf-8");
 }
 async function readAnchorFile(partitionDir) {
   try {
-    const raw = await fs32.promises.readFile(path74.join(partitionDir, "anchor"), "utf-8");
+    const raw = await fs32.promises.readFile(path75.join(partitionDir, "anchor"), "utf-8");
     const trimmed = raw.trim();
     return trimmed || null;
   } catch {
@@ -29181,14 +29248,14 @@ async function readAnchorFile(partitionDir) {
 async function pruneWorkspaceDirs(dataHome, worktrees) {
   if (worktrees.length === 0) return [];
   const live = new Set(worktrees.map(managedMcpWorkspaceId));
-  const workspaces = path74.join(dataHome, "workspaces");
+  const workspaces = path75.join(dataHome, "workspaces");
   let entries;
   try {
     entries = await fs32.promises.readdir(workspaces, { withFileTypes: true });
   } catch {
     return [];
   }
-  const stale = entries.filter((entry) => entry.isDirectory() && /^[0-9a-f]{12}$/.test(entry.name) && !live.has(entry.name)).map((entry) => path74.join(workspaces, entry.name));
+  const stale = entries.filter((entry) => entry.isDirectory() && /^[0-9a-f]{12}$/.test(entry.name) && !live.has(entry.name)).map((entry) => path75.join(workspaces, entry.name));
   await Promise.all(stale.map((dir) => fs32.promises.rm(dir, { recursive: true, force: true })));
   return stale;
 }
@@ -29673,16 +29740,16 @@ __export(digest_exports, {
   summarizeTeamTrends: () => summarizeTeamTrends
 });
 import YAML16 from "yaml";
-import path75 from "path";
+import path76 from "path";
 import fs33 from "fs";
 async function loadTeamStats(repoPath) {
-  const statsDir = path75.join(repoPath, "stats");
+  const statsDir = path76.join(repoPath, "stats");
   const stats = [];
   try {
     const files = await listFiles(statsDir);
     for (const file of files) {
       if (!file.endsWith(".yaml") && !file.endsWith(".yml")) continue;
-      const content = await readFileSafe(path75.join(statsDir, file));
+      const content = await readFileSafe(path76.join(statsDir, file));
       if (!content) continue;
       try {
         const parsed = YAML16.parse(content);
@@ -29787,17 +29854,17 @@ async function getRecentSkillChanges(repoPath, subdir = "") {
   return changes;
 }
 async function getRecentSessions(repoPath) {
-  const sessionsDir = path75.join(repoPath, "sessions");
+  const sessionsDir = path76.join(repoPath, "sessions");
   const summaries = [];
   try {
     const userDirs = await fs33.promises.readdir(sessionsDir, { withFileTypes: true });
     for (const userDir of userDirs) {
       if (!userDir.isDirectory()) continue;
-      const userSessionsDir = path75.join(sessionsDir, userDir.name);
+      const userSessionsDir = path76.join(sessionsDir, userDir.name);
       const files = await listFiles(userSessionsDir);
       for (const file of files) {
         if (!file.endsWith(".md")) continue;
-        const content = await readFileSafe(path75.join(userSessionsDir, file));
+        const content = await readFileSafe(path76.join(userSessionsDir, file));
         if (content) {
           summaries.push(`[${userDir.name}] ${file}:
 ${content.slice(0, 500)}`);
@@ -29991,7 +30058,7 @@ async function generateDigest() {
       console.log("");
     }
     const skillChanges = localConfig.repo.kind === "self" ? await getRecentSkillChanges(
-      localConfig.repo.businessRepoRoot ?? path75.dirname(repoPath),
+      localConfig.repo.businessRepoRoot ?? path76.dirname(repoPath),
       ".teamai"
     ) : await getRecentSkillChanges(repoPath);
     const newSkills = skillChanges.filter((c) => c.type === "new");
@@ -30053,28 +30120,28 @@ var init_digest = __esm({
 
 // src/session-owners.ts
 import fs34 from "fs";
-import path76 from "path";
+import path77 from "path";
 function sharedSnapshotPath(name) {
-  return path76.join(getTeamaiHomeDir(), "dashboard", `reported-${name}.json`);
+  return path77.join(getTeamaiHomeDir(), "dashboard", `reported-${name}.json`);
 }
 function snapshotPathIn(dataHome, name) {
   const file = `reported-${name}.json`;
-  if (path76.resolve(dataHome) !== path76.resolve(getTeamaiHomeDir())) return path76.join(dataHome, "dashboard", file);
-  return path76.join(dataHome, "dashboard", `user-${file}`);
+  if (path77.resolve(dataHome) !== path77.resolve(getTeamaiHomeDir())) return path77.join(dataHome, "dashboard", file);
+  return path77.join(dataHome, "dashboard", `user-${file}`);
 }
 function sessionOwnersPath() {
-  return path76.join(getTeamaiHomeDir(), "dashboard", "session-owners.jsonl");
+  return path77.join(getTeamaiHomeDir(), "dashboard", "session-owners.jsonl");
 }
 async function knownDataHomes() {
   const slugs = await fs34.promises.readdir(projectsRootDir()).catch(() => []);
-  const homes = [getTeamaiHomeDir(), ...[...slugs].sort().map((slug) => path76.join(projectsRootDir(), slug))];
+  const homes = [getTeamaiHomeDir(), ...[...slugs].sort().map((slug) => path77.join(projectsRootDir(), slug))];
   const { resolveConfigForDir: resolveConfigForDir2 } = await Promise.resolve().then(() => (init_config(), config_exports));
   const cwds = new Set((await readEvents()).flatMap((e) => typeof e.cwd === "string" ? [e.cwd] : []));
   for (const cwd of cwds) {
     const config = await pathExists(cwd) ? await resolveConfigForDir2(cwd) : null;
     if (config) homes.push(getDataHome(config));
   }
-  return [...new Set(homes.map((home) => path76.resolve(home)))];
+  return [...new Set(homes.map((home) => path77.resolve(home)))];
 }
 function reportedSize(entry) {
   if (!entry || typeof entry !== "object") return { prompts: 0, tokens: 0 };
@@ -30214,7 +30281,7 @@ async function readSessionOwners() {
   const owners = /* @__PURE__ */ new Map();
   if (!await pathExists(sessionOwnersPath())) {
     try {
-      await ensureDir(path76.dirname(sessionOwnersPath()));
+      await ensureDir(path77.dirname(sessionOwnersPath()));
       await fs34.promises.writeFile(sessionOwnersPath(), await ownersFromSnapshots(), { flag: "wx" });
     } catch (e) {
       if (e.code !== "EEXIST") log.debug(`Could not seed session owners: ${e.message}`);
@@ -30242,7 +30309,7 @@ async function recordSessionOwners(sessionIds, key) {
   const ids = new Set([...sessionIds].filter((id) => !id.startsWith("pid-") && !owners.has(id)));
   if (ids.size === 0) return;
   try {
-    await ensureDir(path76.dirname(sessionOwnersPath()));
+    await ensureDir(path77.dirname(sessionOwnersPath()));
     await fs34.promises.appendFile(
       sessionOwnersPath(),
       [...ids].map((sessionId) => JSON.stringify({ sessionId, dataHomeKey: key })).join("\n") + "\n"
@@ -30317,14 +30384,14 @@ __export(dashboard_scope_exports, {
   runsOfLog: () => runsOfLog
 });
 import fs35 from "fs";
-import path77 from "path";
+import path78 from "path";
 async function filterEventsByScope(events, config) {
   if (!config) return events;
   const ownKey = await dataHomeKey(getDataHome(config));
   const keys = /* @__PURE__ */ new Set([ownKey]);
   if (config.projectRoot) {
-    const legacy = await dataHomeKey(path77.join(config.projectRoot, ".teamai"));
-    if (legacy !== await dataHomeKey(path77.join(getUserHome(), ".teamai"))) keys.add(legacy);
+    const legacy = await dataHomeKey(path78.join(config.projectRoot, ".teamai"));
+    if (legacy !== await dataHomeKey(path78.join(getUserHome(), ".teamai"))) keys.add(legacy);
   }
   const { resolveConfigForDir: resolveConfigForDir2 } = await Promise.resolve().then(() => (init_config(), config_exports));
   const resolvesHere = /* @__PURE__ */ new Map();
@@ -30497,7 +30564,7 @@ __export(stats_exports, {
   showStats: () => showStats
 });
 import YAML17 from "yaml";
-import path78 from "path";
+import path79 from "path";
 function aggregateUsage(events) {
   const map = /* @__PURE__ */ new Map();
   for (const event of events) {
@@ -30528,7 +30595,7 @@ async function loadReportedStats() {
       const { readableReportsWorktree: readableReportsWorktree2 } = await Promise.resolve().then(() => (init_reports_branch(), reports_branch_exports));
       statsRoot = await readableReportsWorktree2(config);
     }
-    const statsPath = path78.join(statsRoot, "stats", `${config.username}.yaml`);
+    const statsPath = path79.join(statsRoot, "stats", `${config.username}.yaml`);
     const content = await readFileSafe(statsPath);
     if (!content) return null;
     const parsed = YAML17.parse(content);
@@ -30745,11 +30812,11 @@ __export(import_lock_exports, {
   acquireImportLock: () => acquireImportLock,
   isImportInProgress: () => isImportInProgress
 });
-import { writeFile as writeFile2, readFile as readFile2, unlink, stat, mkdir } from "fs/promises";
-import path79 from "path";
+import { writeFile as writeFile2, readFile as readFile3, unlink, stat, mkdir } from "fs/promises";
+import path80 from "path";
 import os10 from "os";
 function lockPathFor(teamRepoPath) {
-  return path79.join(path79.dirname(path79.resolve(teamRepoPath)), ".teamai-import.lock");
+  return path80.join(path80.dirname(path80.resolve(teamRepoPath)), ".teamai-import.lock");
 }
 async function acquireImportLock(teamRepoPath) {
   const lockPath = lockPathFor(teamRepoPath);
@@ -30757,12 +30824,12 @@ async function acquireImportLock(teamRepoPath) {
   refCounts.set(lockPath, count + 1);
   if (count === 0) {
     try {
-      await mkdir(path79.dirname(lockPath), { recursive: true });
+      await mkdir(path80.dirname(lockPath), { recursive: true });
       const meta = {
         pid: process.pid,
         host: os10.hostname(),
         startedAt: (/* @__PURE__ */ new Date()).toISOString(),
-        teamRepo: path79.resolve(teamRepoPath)
+        teamRepo: path80.resolve(teamRepoPath)
       };
       await writeFile2(lockPath, JSON.stringify(meta, null, 2), "utf8");
     } catch (e) {
@@ -30791,7 +30858,7 @@ async function isImportInProgress(teamRepoPath) {
   const lockPath = lockPathFor(teamRepoPath);
   let raw;
   try {
-    raw = await readFile2(lockPath, "utf8");
+    raw = await readFile3(lockPath, "utf8");
   } catch {
     return false;
   }
@@ -30873,7 +30940,7 @@ __export(team_push_exports, {
 import YAML18 from "yaml";
 import fs36 from "fs";
 import { createHash as createHash9 } from "crypto";
-import path80 from "path";
+import path81 from "path";
 async function readExistingStats(statsPath) {
   try {
     const content = await readFileSafe(statsPath);
@@ -31332,7 +31399,7 @@ async function snapshotWrittenAt(config) {
   const mtime = (file) => fs36.promises.stat(file).then((stat10) => stat10.mtimeMs, () => void 0);
   const own = await mtime(scopeSnapshotPath("prompt-tokens", config));
   if (own === void 0) return mtime(sharedSnapshotPath("prompt-tokens"));
-  const stats = config ? await mtime(path80.join(getReportsDir(config), "stats", `${config.username}.yaml`)) : void 0;
+  const stats = config ? await mtime(path81.join(getReportsDir(config), "stats", `${config.username}.yaml`)) : void 0;
   return stats === void 0 ? own : Math.min(own, stats);
 }
 async function reportedBaselines(events, metrics, currentDaily, config, persist) {
@@ -31458,9 +31525,9 @@ async function reportUsageToTeam(repoPath, username, options) {
     const commitMsg = hasUsage ? `[teamai] Update usage stats for ${username}` : hasInterventions || hasPromptTokens || hasDaily ? `[teamai] Update session stats for ${username}` : `[teamai] Update votes for ${username}`;
     const writeReportFiles = async (writeRoot2) => {
       if (hasStats) {
-        const statsDir = path80.join(writeRoot2, "stats");
+        const statsDir = path81.join(writeRoot2, "stats");
         await ensureDir(statsDir);
-        const statsPath = path80.join(statsDir, `${username}.yaml`);
+        const statsPath = path81.join(statsDir, `${username}.yaml`);
         const existing = await readExistingStats(statsPath);
         if (useReportsBranch) {
           const previousContent = await readFileSafe(statsPath);
@@ -31526,7 +31593,7 @@ async function reportUsageToTeam(repoPath, username, options) {
         log.debug(`Skipping report: import in progress for ${repoPath} (would reset uncommitted artifacts)`);
         return false;
       }
-      const yamlPath = path80.join(repoPath, "teamai.yaml");
+      const yamlPath = path81.join(repoPath, "teamai.yaml");
       const workingContent = await readFileSafe(yamlPath);
       const committedContent = workingContent === null ? null : await getFileContentAtRev(repoPath, "HEAD", "teamai.yaml");
       const pendingTeamConfig = workingContent !== null && (committedContent === null || committedContent.toString() !== workingContent) ? workingContent : null;
@@ -31613,16 +31680,16 @@ var init_team_push = __esm({
 });
 
 // src/doctor-special-hosts.ts
-import path81 from "path";
+import path82 from "path";
 import { readdir as readdir2 } from "fs/promises";
 async function canonicalSkillNames(repoRoot) {
-  const skillsRoot = path81.join(repoRoot, "skills");
+  const skillsRoot = path82.join(repoRoot, "skills");
   try {
     const entries = await readdir2(skillsRoot, { withFileTypes: true });
     const names = [];
     for (const entry of entries) {
       if (!entry.isDirectory()) continue;
-      if (await pathExists(path81.join(skillsRoot, entry.name, "SKILL.md"))) names.push(entry.name);
+      if (await pathExists(path82.join(skillsRoot, entry.name, "SKILL.md"))) names.push(entry.name);
     }
     return names.sort();
   } catch {
@@ -31686,7 +31753,7 @@ async function buildSpecialHostDiagnostics(localConfig, teamConfig, hosts) {
         check: async () => {
           if (!root || skillNames.length === 0) return false;
           const results = await Promise.all(
-            skillNames.map((name) => pathExists(path81.join(root, "skills", name, "SKILL.md")))
+            skillNames.map((name) => pathExists(path82.join(root, "skills", name, "SKILL.md")))
           );
           return results.every(Boolean);
         },
@@ -31700,10 +31767,10 @@ async function buildSpecialHostDiagnostics(localConfig, teamConfig, hosts) {
         source: "local",
         id: "host.dsh.instructions",
         name: "DSH managed AGENTS.md matches the canonical instruction source",
-        check: async () => Boolean(source && target && await filesMatch(path81.join(localConfig.repo.localPath, source), target)),
+        check: async () => Boolean(source && target && await filesMatch(path82.join(localConfig.repo.localPath, source), target)),
         fix: "Run `teamai pull` to restore the managed DSH instruction file"
       });
-      const projectInstructions = path81.join(process.cwd(), "AGENTS.md");
+      const projectInstructions = path82.join(process.cwd(), "AGENTS.md");
       if (localConfig.scope === "user" && target && await pathExists(projectInstructions) && await filesMatch(projectInstructions, target)) {
         diagnostics.notices.push(
           `${displayName}: selected (${root ?? "unresolved"})`,
@@ -31724,14 +31791,14 @@ var init_doctor_special_hosts = __esm({
 });
 
 // src/doctor-delivery.ts
-import path82 from "path";
+import path83 from "path";
 import fs37 from "fs";
 import { isDeepStrictEqual as isDeepStrictEqual2 } from "util";
 async function skillIsDiscoverable(skillDir, skillName) {
-  const content = await readFileSafe(path82.join(skillDir, "SKILL.md"));
+  const content = await readFileSafe(path83.join(skillDir, "SKILL.md"));
   if (!content) return false;
-  const { data, valid } = splitFrontmatter2(content);
-  if (!valid) return false;
+  const { data, valid: valid2 } = splitFrontmatter2(content);
+  if (!valid2) return false;
   return data.name === skillName;
 }
 async function isReadableFile(filePath) {
@@ -31757,7 +31824,7 @@ async function walkDelivery(handler, ctx, items, classify) {
     for (const target of targets) {
       let delivery = byTool.get(target.tool);
       if (!delivery) {
-        delivery = { dir: path82.dirname(target.dest), problems: /* @__PURE__ */ new Map() };
+        delivery = { dir: path83.dirname(target.dest), problems: /* @__PURE__ */ new Map() };
         byTool.set(target.tool, delivery);
       }
       const problem = await classify(target, item);
@@ -32068,7 +32135,7 @@ async function envDeliveryProblems(ctx) {
   const declared = resolution.entries.map((entry) => entry.entry);
   const deliverable = new Set(declared.map((variable) => variable.key));
   const problems = [];
-  const envShPath = path82.join(getDataHome(localConfig), "env.sh");
+  const envShPath = path83.join(getDataHome(localConfig), "env.sh");
   const envSh = await readFileSafe(envShPath);
   if (envSh === null) {
     if (declared.length === 0) return none;
@@ -32112,7 +32179,7 @@ async function envDeliveryProblems(ctx) {
   const home = getUserHome();
   const staleProfiles = [];
   for (const name of SHELL_PROFILE_CANDIDATE_NAMES) {
-    const candidate = path82.join(home, name);
+    const candidate = path83.join(home, name);
     if (sameFile(candidate, profilePath)) continue;
     const content = await readFileSafe(candidate);
     if (content && findEnvBlockFor(content, envShPath)) staleProfiles.push(candidate);
@@ -32152,7 +32219,7 @@ async function buildDocsCheck(ctx) {
   const stale = [...localFiles.filter((file) => !known.has(file)), ...staleDirectories];
   const missing = [];
   for (const file of teamFiles) {
-    if (!await isReadableFile(path82.join(dest, file))) missing.push(file);
+    if (!await isReadableFile(path83.join(dest, file))) missing.push(file);
   }
   return [{
     name: "Team docs delivered",
@@ -32180,7 +32247,7 @@ async function buildNamespaceNotes(ctx) {
     const claudemdFiles = team.claudemdFiles.map((file) => file.split("/")).filter((segments) => segments.length <= 2 && (segments[segments.length - 1] ?? "").endsWith(".md"));
     return [
       ...repeatedNames2(team.skills, (item) => item.name, (item) => item.relativePath).map(([name, sources]) => `skills: "${name}" is defined in ${listed(sources)} (legacy mode: only one of them is installed)`),
-      ...repeatedNames2(firstLevelRules, (item) => path82.posix.basename(item.name), (item) => item.relativePath).map(([name, sources]) => `rules: "${name}" is defined in ${listed(sources)} (legacy mode: each is delivered at its own path)`),
+      ...repeatedNames2(firstLevelRules, (item) => path83.posix.basename(item.name), (item) => item.relativePath).map(([name, sources]) => `rules: "${name}" is defined in ${listed(sources)} (legacy mode: each is delivered at its own path)`),
       ...repeatedNames2(claudemdFiles, (segments) => segments[segments.length - 1] ?? "", (segments) => `claudemd/${segments.join("/")}`).map(([name, sources]) => `claudemd: "${name}" is defined in ${listed(sources)} (legacy mode: all of them are in the managed block)`)
     ];
   }
@@ -32200,7 +32267,7 @@ async function readNamespaceNoteInputs(teamConfig, localConfig) {
       mode: "legacy",
       skills: await getHandler2("skills").scanTeamForPull(teamConfig, localConfig),
       rules: await getHandler2("rules").scanTeamForPull(teamConfig, localConfig),
-      claudemdFiles: await listFilesRecursive(path82.join(localConfig.repo.localPath, "claudemd"))
+      claudemdFiles: await listFilesRecursive(path83.join(localConfig.repo.localPath, "claudemd"))
     };
   }
   return {
@@ -32236,7 +32303,7 @@ __export(doctor_exports, {
   resolveDoctorContext: () => resolveDoctorContext,
   runChecks: () => runChecks
 });
-import path83 from "path";
+import path84 from "path";
 async function buildEnabledToolChecks(ctx) {
   const { localConfig, toolPaths } = ctx;
   if (!localConfig.enabledAgents) return [];
@@ -32288,10 +32355,10 @@ async function buildHookChecks(toolPaths, hookToolPaths, baseDir, localConfig) {
       continue;
     }
     const settings = hookToolPaths[tool]?.settings;
-    const hookPath = paths.hooks ? path83.join(resolveToolBaseDir(tool, localConfig), paths.hooks) : settings ? path83.join(baseDir, settings) : void 0;
+    const hookPath = paths.hooks ? path84.join(resolveToolBaseDir(tool, localConfig), paths.hooks) : settings ? path84.join(baseDir, settings) : void 0;
     if (!hookPath) continue;
     const settingsPath = hookPath;
-    const parentDir = path83.dirname(settingsPath);
+    const parentDir = path84.dirname(settingsPath);
     const installed2 = tool === COPILOT_TOOL_ID ? await isToolInstalledForConfig(tool, paths.hooks ?? paths.settings ?? "", localConfig) : await pathExists(parentDir);
     if (!installed2) continue;
     checks.push({
@@ -32314,7 +32381,7 @@ async function buildHookChecks(toolPaths, hookToolPaths, baseDir, localConfig) {
 async function hasInstalledCodexHooks(toolPaths, baseDir) {
   for (const [tool, paths] of Object.entries(toolPaths)) {
     if (!isCodexTrustGatedTool(tool) || !paths.settings) continue;
-    const settingsPath = path83.join(baseDir, paths.settings);
+    const settingsPath = path84.join(baseDir, paths.settings);
     if (!await pathExists(settingsPath)) continue;
     const content = await readFileSafe(settingsPath);
     if (content?.includes("teamai hook-dispatch")) return true;
@@ -32554,7 +32621,7 @@ __export(coauthor_reconcile_exports, {
   reconcileCoAuthorForConfig: () => reconcileCoAuthorForConfig,
   spliceCodexAttribution: () => spliceCodexAttribution
 });
-import path84 from "path";
+import path85 from "path";
 function familyOf(tool) {
   if (CODEX_TOOLS3.has(tool)) return "codex";
   return CURSOR_TOOLS3.has(tool) ? "cursor" : "claude";
@@ -32573,28 +32640,28 @@ async function resolveTargets(teamConfig, localConfig) {
     const family = familyOf(tool);
     const probe = paths.settings ?? paths.skills ?? paths.agents;
     if (!probe) continue;
-    const probeDir = path84.dirname(probe);
-    const toolRoot = probeDir === "." ? path84.join(baseDir, probe) : path84.join(baseDir, probeDir);
+    const probeDir = path85.dirname(probe);
+    const toolRoot = probeDir === "." ? path85.join(baseDir, probe) : path85.join(baseDir, probeDir);
     if (!await pathExists(toolRoot)) {
       log.debug(`[coauthor] Skipping ${tool}: tool not installed`);
       continue;
     }
     if (family === "claude") {
       if (!paths.settings) continue;
-      targets.push({ tool, family, file: path84.join(baseDir, paths.settings) });
+      targets.push({ tool, family, file: path85.join(baseDir, paths.settings) });
     } else if (family === "codex") {
       if (projectScope) {
         log.debug(`[coauthor] Skipping ${tool}: co-author is user-scope only`);
         continue;
       }
       const home = tool === "tcodex" ? ".tcodex" : tool === "codex-internal" ? ".codex-internal" : ".codex";
-      targets.push({ tool, family, file: path84.join(userHome, home, "config.toml") });
+      targets.push({ tool, family, file: path85.join(userHome, home, "config.toml") });
     } else {
       if (projectScope) {
         log.debug(`[coauthor] Skipping ${tool}: co-author is user-scope only`);
         continue;
       }
-      targets.push({ tool, family, file: path84.join(userHome, ".cursor", "cli-config.json") });
+      targets.push({ tool, family, file: path85.join(userHome, ".cursor", "cli-config.json") });
     }
   }
   return targets;
@@ -32726,8 +32793,8 @@ __export(pull_exports, {
   retainMissingUnselectedTargets: () => retainMissingUnselectedTargets,
   userScopeRecord: () => userScopeRecord
 });
-import path85 from "path";
-import { readFile as readFile3, stat as stat2 } from "fs/promises";
+import path86 from "path";
+import { readFile as readFile4, stat as stat2 } from "fs/promises";
 import matter6 from "gray-matter";
 async function retainMissingUnselectedTargets(home, type, resources, localConfig) {
   const manifest = await loadManagedResourceManifest(home);
@@ -32825,8 +32892,8 @@ async function cleanupInactiveNamespaceSkills(teamConfig, localConfig, retainedS
       if (BUILTIN_SKILL_NAMES.has(skillName)) continue;
       if (retainedSkillNames.has(skillName)) continue;
       if (!inactiveSkillNames.has(skillName)) continue;
-      const localSkillDir = path85.join(skillsDir, skillName);
-      if (protectedPaths.has(path85.resolve(localSkillDir))) continue;
+      const localSkillDir = path86.join(skillsDir, skillName);
+      if (protectedPaths.has(path86.resolve(localSkillDir))) continue;
       if (!await skillSafeToRemove(localSkillDir, inactiveSkillSources?.get(skillName))) {
         log.warn(`[${localConfig.scope}] Kept skill "${skillName}" (${tool}): it has local changes or unpushed files not in the team repo (or could not be verified). Push or back them up, then delete it manually.`);
         continue;
@@ -32873,8 +32940,8 @@ async function cleanupTombstonedResources(freshConfig, localConfig, scopeLabel, 
       const baseDir = resolveToolBaseDir(tool, localConfig);
       for (const name of tombstones) {
         for (const extension of tombstoneExtensions(type, tool)) {
-          const localPath = path85.join(baseDir, dir, `${name}${extension}`);
-          if (protectedPaths.has(path85.resolve(localPath)) || !await pathExists(localPath)) continue;
+          const localPath = path86.join(baseDir, dir, `${name}${extension}`);
+          if (protectedPaths.has(path86.resolve(localPath)) || !await pathExists(localPath)) continue;
           if (type === "skills" && await hasVcsMetadataRecursive(localPath)) {
             log.warn(`[${scopeLabel}] Kept tombstoned skill "${name}" (${tool}): it has local VCS metadata (.git) that may hold unpushed history. Back it up, then delete it manually.`);
             continue;
@@ -32897,7 +32964,7 @@ async function reconcileEnvForUnchangedRepo(freshConfig, localConfig, roleContex
     const envHandler2 = new EnvHandler();
     await envHandler2.writeResolvedEnv(resolution.entries.map((entry) => entry.entry), freshConfig, localConfig);
   } catch (e) {
-    const envShPath = path85.join(getDataHome(localConfig), "env.sh");
+    const envShPath = path86.join(getDataHome(localConfig), "env.sh");
     log.warn(
       `[${localConfig.scope}] Could not refresh env variables: ${e.message}. ${envShPath} may still export variables the team no longer delivers to this directory. Fix the cause, run \`teamai pull --force\`, then open a new shell.`
     );
@@ -32911,7 +32978,7 @@ function warnStubNotDeployed(scopeLabel, e) {
 async function checkoutKey(projectRoot) {
   const id = managedMcpWorkspaceId(projectRoot);
   try {
-    const dotGit = await stat2(path85.join(projectRoot, ".git"));
+    const dotGit = await stat2(path86.join(projectRoot, ".git"));
     return dotGit.isFile() ? `${id}-${dotGit.ino}-${Math.trunc(dotGit.birthtimeMs)}` : `${id}-${dotGit.ino}`;
   } catch {
     return id;
@@ -32979,10 +33046,10 @@ async function getExistingLocalNames(type, items, teamConfig, localConfig) {
   if (type === "skills") {
     for (const [_tool, toolPath] of Object.entries(scopedToolPaths(teamConfig, localConfig))) {
       if (!toolPath.skills) continue;
-      const skillsDir = path85.join(baseDir, toolPath.skills);
+      const skillsDir = path86.join(baseDir, toolPath.skills);
       if (!await pathExists(skillsDir)) continue;
       for (const item of items) {
-        const skillDir = path85.join(skillsDir, item.name);
+        const skillDir = path86.join(skillsDir, item.name);
         if (await pathExists(skillDir)) {
           existing.add(item.name);
         }
@@ -33065,6 +33132,17 @@ async function pullForScope(localConfig, options, reported, policy = {}, result)
     log.persist(reason);
     return;
   }
+  try {
+    await assertCompatibleCore(localConfig.repo.localPath);
+  } catch (error) {
+    process.exitCode = 1;
+    if (result) {
+      result.resourceSyncFailed = true;
+      result.blockedScopes.add(localConfig);
+    }
+    log.error(`[${scopeLabel}] Core compatibility check failed: ${error.message}`);
+    return;
+  }
   const freshConfig = await loadTeamConfig(localConfig.repo.localPath);
   if (!freshConfig) {
     process.exitCode = 1;
@@ -33144,20 +33222,20 @@ async function pullForScope(localConfig, options, reported, policy = {}, result)
         }
       }
       const publishedRoots = syncKnowledge ? await indexableLearningsRoots(localConfig) : [];
-      const docsRepoDir = path85.join(localConfig.repo.localPath, "docs");
-      const rulesRepoDir = path85.join(localConfig.repo.localPath, "rules");
-      const skillsRepoDir = path85.join(localConfig.repo.localPath, "skills");
+      const docsRepoDir = path86.join(localConfig.repo.localPath, "docs");
+      const rulesRepoDir = path86.join(localConfig.repo.localPath, "rules");
+      const skillsRepoDir = path86.join(localConfig.repo.localPath, "skills");
       const reportsRoot = await resolveReportsReadRoot();
-      const votesDir = reportsRoot ? path85.join(reportsRoot, "votes") : void 0;
+      const votesDir = reportsRoot ? path86.join(reportsRoot, "votes") : void 0;
       const activeLearningsNamespaces = roleContext?.activeNamespaces.learnings ?? [];
       const countLearnings = async (baseDir) => {
         if (!await pathExists(baseDir)) return [];
         const names = (await listFiles(baseDir)).filter((f) => f.endsWith(".md"));
         for (const ns of activeLearningsNamespaces) {
-          const nsDir = path85.join(baseDir, ns);
+          const nsDir = path86.join(baseDir, ns);
           if (await pathExists(nsDir)) {
             names.push(
-              ...(await listFilesRecursive(nsDir)).filter((f) => f.endsWith(".md")).map((f) => path85.join(ns, f))
+              ...(await listFilesRecursive(nsDir)).filter((f) => f.endsWith(".md")).map((f) => path86.join(ns, f))
             );
           }
         }
@@ -33187,7 +33265,7 @@ async function pullForScope(localConfig, options, reported, policy = {}, result)
         }
       }
       const hasAnySource = effectiveLearningsDir || await pathExists(docsRepoDir) || await pathExists(rulesRepoDir) || await pathExists(skillsRepoDir);
-      const repoCodebaseDir = path85.join(localConfig.repo.localPath, "docs", "team-codebase");
+      const repoCodebaseDir = path86.join(localConfig.repo.localPath, "docs", "team-codebase");
       const effectiveCodebaseDir = await pathExists(repoCodebaseDir) ? repoCodebaseDir : void 0;
       if (hasAnySource || effectiveCodebaseDir) {
         const votesExist = votesDir ? await pathExists(votesDir) : false;
@@ -33451,15 +33529,15 @@ async function pullForScope(localConfig, options, reported, policy = {}, result)
       if (isAgentExcluded(localConfig, tool) || usesManagedPolicy(freshConfig, localConfig) && !isHostSelected(localConfig, tool)) continue;
       if (!toolPath.skills) continue;
       if (!await ResourceHandler.isToolInstalled(toolPath.skills, baseDir)) continue;
-      const skillsDir = path85.join(baseDir, toolPath.skills);
+      const skillsDir = path86.join(baseDir, toolPath.skills);
       if (!await pathExists(skillsDir)) continue;
       const localDirs = await listDirs(skillsDir);
       for (const dir of localDirs) {
         if (BUILTIN_SKILL_NAMES.has(dir)) continue;
         if (desiredSkillNames.has(dir)) continue;
         if (!knownRepoSkillNames.has(dir)) continue;
-        const skillDir = path85.join(skillsDir, dir);
-        if (protectedPaths.has(path85.resolve(skillDir))) continue;
+        const skillDir = path86.join(skillsDir, dir);
+        if (protectedPaths.has(path86.resolve(skillDir))) continue;
         if (!await skillSafeToRemove(skillDir, knownRepoSkillSources?.get(dir))) {
           log.warn(`[${scopeLabel}] Kept skill "${dir}" (${tool}): it has local changes or unpushed files not in the team repo (or could not be verified). Push or back them up, then delete it manually.`);
           continue;
@@ -33469,13 +33547,13 @@ async function pullForScope(localConfig, options, reported, policy = {}, result)
       }
       if (excludedSkills.size > 0) {
         for (const namespace of localDirs) {
-          const namespaceDir2 = path85.join(skillsDir, namespace);
-          if (await pathExists(path85.join(namespaceDir2, "SKILL.md"))) continue;
+          const namespaceDir2 = path86.join(skillsDir, namespace);
+          if (await pathExists(path86.join(namespaceDir2, "SKILL.md"))) continue;
           for (const skillName of await listDirs(namespaceDir2)) {
             if (!excludedSkills.has(skillName) || BUILTIN_SKILL_NAMES.has(skillName)) continue;
-            const nestedSkillDir = path85.join(namespaceDir2, skillName);
-            if (protectedPaths.has(path85.resolve(nestedSkillDir))) continue;
-            if (!await pathExists(path85.join(nestedSkillDir, "SKILL.md"))) continue;
+            const nestedSkillDir = path86.join(namespaceDir2, skillName);
+            if (protectedPaths.has(path86.resolve(nestedSkillDir))) continue;
+            if (!await pathExists(path86.join(nestedSkillDir, "SKILL.md"))) continue;
             await remove(nestedSkillDir);
             log.debug(`Removed excluded skill ${namespace}/${skillName} from ${tool}`);
           }
@@ -33571,12 +33649,12 @@ async function pullForScope(localConfig, options, reported, policy = {}, result)
       const { listFiles: listFiles2, readFileSafe: readFileSafe3 } = await Promise.resolve().then(() => (init_fs(), fs_exports));
       const { getRecommendations: getRecommendations2, displayRecommendations: displayRecommendations2 } = await Promise.resolve().then(() => (init_skill_recommend(), skill_recommend_exports));
       const reportsRoot = await resolveReportsReadRoot();
-      const statsDir = reportsRoot ? path85.join(reportsRoot, "stats") : void 0;
+      const statsDir = reportsRoot ? path86.join(reportsRoot, "stats") : void 0;
       const files = statsDir ? await listFiles2(statsDir) : [];
       const teamStats = [];
       for (const file of files) {
         if (!file.endsWith(".yaml")) continue;
-        const content = await readFileSafe3(path85.join(statsDir, file));
+        const content = await readFileSafe3(path86.join(statsDir, file));
         if (!content) continue;
         try {
           const parsed = YAML28.parse(content);
@@ -33669,10 +33747,10 @@ function compileClaudemd(contents) {
 async function reconcileManagedInstructions(config, localConfig, roleContext, scopeLabel, options = {}) {
   try {
     assertHostRootsStable(localConfig);
-    const sourcePath = path85.join(localConfig.repo.localPath, config.sharing.instructions?.source ?? "AGENTS.md");
+    const sourcePath = path86.join(localConfig.repo.localPath, config.sharing.instructions?.source ?? "AGENTS.md");
     let source = await readFileSafe(sourcePath);
     if (!source) {
-      const cultureRaw = await readFileSafe(path85.join(localConfig.repo.localPath, "culture.md"));
+      const cultureRaw = await readFileSafe(path86.join(localConfig.repo.localPath, "culture.md"));
       const culture = cultureRaw ? compileCulture(cultureRaw) : null;
       const shared = compileClaudemd((await collectClaudemdFiles(localConfig.repo.localPath, roleContext)).contents);
       source = [culture, shared].filter((block) => !!block).join("\n\n") || null;
@@ -33689,7 +33767,7 @@ async function reconcileManagedInstructions(config, localConfig, roleContext, sc
     };
     if (localConfig.scope === "project") {
       if (source || isRecallEnabled(localConfig, config)) {
-        const target = path85.join(resolveBaseDir(localConfig), "AGENTS.md");
+        const target = path86.join(resolveBaseDir(localConfig), "AGENTS.md");
         const body = [source, isRecallEnabled(localConfig, config) ? compileRecallRulesBlock() : null].filter((block) => !!block).join("\n\n").trim();
         resources.push({
           id: "instructions:project-agents",
@@ -33723,13 +33801,18 @@ ${instructionSection.end}`
           id: `instructions:${tool}`,
           type: "instructions",
           targets: [{
-            path: specialInstructionPath ?? path85.join(baseDir, instructionPath),
+            path: specialInstructionPath ?? path86.join(baseDir, instructionPath),
             kind: "file",
             tool,
-            ...specialInstructionPath ? { hostRoot: path85.dirname(specialInstructionPath) } : {},
-            // User scope's host instruction file is a complete TeamAI-managed file.
-            content: `${blocks.join("\n\n").trim()}
-`
+            ...specialInstructionPath ? { hostRoot: path86.dirname(specialInstructionPath) } : {},
+            section: instructionSection,
+            legacyContent: `${blocks.join("\n\n").trim()}
+`,
+            content: `${instructionSection.start}
+<!-- DO NOT EDIT: This section is auto-managed by teamai -->
+
+${blocks.join("\n\n").trim()}
+${instructionSection.end}`
           }],
           ...retainTargetPaths.length > 0 ? { retainTargetPaths } : {}
         });
@@ -33760,10 +33843,10 @@ async function syncManagedInstructions(config, localConfig, roleContext, scopeLa
     if (result.conflicts.length > 0) throw new Error("Instruction conflicts require resolution; local files were preserved");
     return;
   }
-  const culturePath = path85.join(localConfig.repo.localPath, "culture.md");
+  const culturePath = path86.join(localConfig.repo.localPath, "culture.md");
   let compiledCulture;
   try {
-    const cultureContent = await readFile3(culturePath, "utf8");
+    const cultureContent = await readFile4(culturePath, "utf8");
     compiledCulture = compileCulture(cultureContent) ?? void 0;
     if (compiledCulture === void 0) {
       log.warn(`Skipped team culture sync because ${culturePath} is empty or invalid`);
@@ -33779,7 +33862,7 @@ async function syncManagedInstructions(config, localConfig, roleContext, scopeLa
     for (const [tool, toolPath] of Object.entries(scopedToolPaths(config, localConfig))) {
       if (isAgentExcluded(localConfig, tool) || !toolPath.claudemd) continue;
       if (toolPath.rules && !await isToolInstalledForConfig(tool, toolPath.rules, localConfig)) continue;
-      const claudeMdPath = path85.join(resolveToolBaseDir(tool, localConfig), toolPath.claudemd);
+      const claudeMdPath = path86.join(resolveToolBaseDir(tool, localConfig), toolPath.claudemd);
       try {
         if (compiledCulture) {
           await injectClaudeMdSection(
@@ -33807,7 +33890,7 @@ async function syncManagedInstructions(config, localConfig, roleContext, scopeLa
     for (const [tool, toolPath] of Object.entries(scopedToolPaths(config, localConfig))) {
       if (isAgentExcluded(localConfig, tool) || !toolPath.claudemd) continue;
       if (toolPath.rules && !await isToolInstalledForConfig(tool, toolPath.rules, localConfig)) continue;
-      const claudeMdPath = path85.join(resolveToolBaseDir(tool, localConfig), toolPath.claudemd);
+      const claudeMdPath = path86.join(resolveToolBaseDir(tool, localConfig), toolPath.claudemd);
       try {
         if (compiled) {
           await injectClaudeMdSection(
@@ -33842,7 +33925,7 @@ async function injectRecallBlockIntoTools(config, localConfig, scopeLabel) {
       if (!toolPath.claudemd || !toolPath.agents) continue;
       if (!await isToolInstalledForConfig(tool, toolPath.agents, localConfig)) continue;
       const baseDir = resolveToolBaseDir(tool, localConfig);
-      const claudeMdPath = path85.join(baseDir, toolPath.claudemd);
+      const claudeMdPath = path86.join(baseDir, toolPath.claudemd);
       try {
         await injectClaudeMdSection(
           claudeMdPath,
@@ -33919,7 +34002,7 @@ function compileRecallRulesBlock() {
 }
 async function legacyHooksNeedReinject() {
   const home = getUserHome();
-  const primarySettings = path85.join(home, ".claude", "settings.json");
+  const primarySettings = path86.join(home, ".claude", "settings.json");
   if (!await pathExists(primarySettings)) return false;
   const content = await readFileSafe(primarySettings);
   if (!content) return false;
@@ -33964,7 +34047,7 @@ async function pull(options, result) {
       return false;
     }
     if (config.repo.kind === "http") return true;
-    const lock = path85.join(getDataHome(config), SYNC_LOCK_FILENAME);
+    const lock = path86.join(getDataHome(config), SYNC_LOCK_FILENAME);
     if (await acquireLock(lock, { dryRun: options.dryRun })) {
       if (!options.dryRun) heldLocks.set(config, lock);
       return true;
@@ -34288,6 +34371,7 @@ var init_pull = __esm({
     init_learnings_mirror();
     init_async();
     init_post_pull();
+    init_core_compatibility();
     FILE_NOT_FOUND_ERROR_CODE = "ENOENT";
     CONTRIBUTORS_FILE3 = "CONTRIBUTORS";
     FORCED_FULL_SYNC_REV = "";
@@ -34302,10 +34386,10 @@ __export(opencode_config_exports, {
   opencodeRulesGlob: () => opencodeRulesGlob,
   reconcileOpencodeInstructions: () => reconcileOpencodeInstructions
 });
-import path86 from "path";
+import path87 from "path";
 function opencodeRulesGlob(configFileAbs, rulesDirAbs) {
-  const rel = path86.relative(path86.dirname(configFileAbs), rulesDirAbs);
-  const relPosix = rel.split(path86.sep).join("/");
+  const rel = path87.relative(path87.dirname(configFileAbs), rulesDirAbs);
+  const relPosix = rel.split(path87.sep).join("/");
   return `${relPosix}/*.md`;
 }
 async function reconcileOpencodeInstructions(configFileAbs, glob, present) {
@@ -34362,7 +34446,7 @@ __export(rules_exports, {
   RulesHandler: () => RulesHandler,
   hermesRulesText: () => hermesRulesText
 });
-import path87 from "path";
+import path88 from "path";
 function renderRuleForTool(tool, source) {
   if (usesCursorMdcRules(tool)) return teamRuleToCursorMdc(source);
   if (usesCopilotInstructions(tool)) return teamRuleToCopilotInstructions(source);
@@ -34415,7 +34499,7 @@ var init_rules = __esm({
        * with the latest mtime.
        */
       async scanLocalForPush(teamConfig, localConfig) {
-        const teamRulesDir = path87.join(localConfig.repo.localPath, "rules");
+        const teamRulesDir = path88.join(localConfig.repo.localPath, "rules");
         const teamRules = new Set(
           await pathExists(teamRulesDir) ? (await listFilesRecursive(teamRulesDir)).filter((f) => f.endsWith(".md")) : []
         );
@@ -34434,7 +34518,7 @@ var init_rules = __esm({
           const rulesPath = toolPath.rules;
           if (!rulesPath) continue;
           if (tool !== SELF_KNOWLEDGE_SCAN_KEY && isAgentExcluded(localConfig, tool)) continue;
-          const rulesDir = path87.join(resolveToolBaseDir(tool, localConfig), rulesPath);
+          const rulesDir = path88.join(resolveToolBaseDir(tool, localConfig), rulesPath);
           if (!await pathExists(rulesDir)) continue;
           const ext = ruleFileExtensionForTool(tool);
           const isMdcTool = usesCursorMdcRules(tool);
@@ -34445,14 +34529,14 @@ var init_rules = __esm({
             const name = file.slice(0, -ext.length);
             if (tombstones.has(name)) continue;
             if (EXCLUDED_RULE_NAMES.has(name)) continue;
-            const localFilePath = path87.join(rulesDir, file);
+            const localFilePath = path88.join(rulesDir, file);
             let teamFileName = `${name}.md`;
             const placed = placedResourcePath(placedRules, "rules", name);
             const placedName = placed?.slice("rules/".length);
             if (placedName && teamRules.has(placedName)) teamFileName = placedName;
             const teamRelPath = `rules/${teamFileName}`;
             if (teamRules.has(teamFileName)) {
-              const teamFilePath = path87.join(teamRulesDir, teamFileName);
+              const teamFilePath = path88.join(teamRulesDir, teamFileName);
               const localRule = await readFileSafe(localFilePath) ?? "";
               const teamRule = await readTeamRule(teamFilePath);
               const equal2 = isMdcTool ? cursorMdcBodyEqualsTeamMd(
@@ -34462,7 +34546,7 @@ var init_rules = __esm({
               if (equal2) continue;
               if (tool === SELF_KNOWLEDGE_SCAN_KEY && await isPastVersionOf(localConfig.repo.localPath, localFilePath, teamRelPath)) {
                 log.warn(
-                  `[rules] Skipped ${name}: ${path87.relative(resolveToolBaseDir(tool, localConfig), localFilePath)} is an older version of ${teamRelPath}, which has changed on the team since. Copy the current file over it (or delete it) before editing.`
+                  `[rules] Skipped ${name}: ${path88.relative(resolveToolBaseDir(tool, localConfig), localFilePath)} is an older version of ${teamRelPath}, which has changed on the team since. Copy the current file over it (or delete it) before editing.`
                 );
                 continue;
               }
@@ -34502,19 +34586,19 @@ var init_rules = __esm({
         return items;
       }
       async scanTeamForPull(_teamConfig, localConfig) {
-        const rulesDir = path87.join(localConfig.repo.localPath, "rules");
+        const rulesDir = path88.join(localConfig.repo.localPath, "rules");
         if (!await pathExists(rulesDir)) return [];
         const files = await listFilesRecursive(rulesDir);
         return files.filter((f) => f.endsWith(".md")).map((f) => ({
           name: f.replace(/\.md$/, ""),
           type: "rules",
-          sourcePath: path87.join(rulesDir, f),
+          sourcePath: path88.join(rulesDir, f),
           relativePath: `rules/${f}`
         }));
       }
       async pushItem(item, _teamConfig, localConfig) {
-        const rulesRoot = path87.join(localConfig.repo.localPath, "rules");
-        const dest = path87.resolve(localConfig.repo.localPath, item.relativePath);
+        const rulesRoot = path88.join(localConfig.repo.localPath, "rules");
+        const dest = path88.resolve(localConfig.repo.localPath, item.relativePath);
         assertWithinRoot(
           rulesRoot,
           dest,
@@ -34556,13 +34640,13 @@ var init_rules = __esm({
             log.debug(`Skipping rule sync for ${tool}: tool not installed`);
             continue;
           }
-          const destDir = path87.join(resolveToolBaseDir(tool, localConfig), toolPath.rules);
+          const destDir = path88.join(resolveToolBaseDir(tool, localConfig), toolPath.rules);
           const ext = ruleFileExtensionForTool(tool);
           targets.push({
             tool,
-            dest: path87.join(destDir, `${localName}${ext}`),
+            dest: path88.join(destDir, `${localName}${ext}`),
             content: source === null ? void 0 : renderRuleForTool(tool, source),
-            ...localName !== item.name ? { supersedes: path87.join(destDir, `${item.name}${ext}`) } : {}
+            ...localName !== item.name ? { supersedes: path88.join(destDir, `${item.name}${ext}`) } : {}
           });
         }
         return targets;
@@ -34577,7 +34661,7 @@ var init_rules = __esm({
        * (#649 review).
        */
       async localNameFor(teamName, localConfig) {
-        const bareName = path87.basename(teamName);
+        const bareName = path88.basename(teamName);
         if (bareName === teamName) return teamName;
         const placed = placedResourcePath(
           (await loadStateForScope(localConfig)).placedRules,
@@ -34585,7 +34669,7 @@ var init_rules = __esm({
           bareName
         );
         if (placed !== `rules/${teamName}.md`) return teamName;
-        if (await pathExists(path87.join(localConfig.repo.localPath, "rules", `${bareName}.md`)) && await deliversEveryNamespace(localConfig)) return teamName;
+        if (await pathExists(path88.join(localConfig.repo.localPath, "rules", `${bareName}.md`)) && await deliversEveryNamespace(localConfig)) return teamName;
         return bareName;
       }
       /**
@@ -34593,14 +34677,14 @@ var init_rules = __esm({
        */
       async pullItem(item, teamConfig, localConfig) {
         for (const { tool, dest, content, supersedes } of await this.deliveryTargets(teamConfig, localConfig, item)) {
-          const destDir = path87.dirname(dest);
+          const destDir = path88.dirname(dest);
           try {
             if (content === void 0) {
               throw new Error(`Cannot read rule source ${item.sourcePath}`);
             }
             await ensureDir(destDir);
             await writeFile(dest, content);
-            const legacyCopy = path87.join(destDir, `${path87.basename(dest, path87.extname(dest))}.md`);
+            const legacyCopy = path88.join(destDir, `${path88.basename(dest, path88.extname(dest))}.md`);
             if (dest !== legacyCopy) await remove(legacyCopy);
             if (supersedes) await remove(supersedes);
             log.debug(`Synced rule ${item.name} \u2192 ${tool}`);
@@ -34620,7 +34704,7 @@ var init_rules = __esm({
           name
         );
         if (!placed) return null;
-        if (!await pathExists(path87.join(localConfig.repo.localPath, placed))) return null;
+        if (!await pathExists(path88.join(localConfig.repo.localPath, placed))) return null;
         return placed.slice("rules/".length, -".md".length);
       }
       /**
@@ -34635,13 +34719,13 @@ var init_rules = __esm({
        */
       async removeItem(name, teamConfig, localConfig) {
         const removed = [];
-        const teamFile = path87.join(localConfig.repo.localPath, "rules", `${name}.md`);
+        const teamFile = path88.join(localConfig.repo.localPath, "rules", `${name}.md`);
         if (await pathExists(teamFile)) {
           await remove(teamFile);
           removed.push(teamFile);
         }
         const localNames = /* @__PURE__ */ new Set([name]);
-        const bareName = path87.basename(name);
+        const bareName = path88.basename(name);
         if (bareName !== name) {
           const placed = placedResourcePath(
             (await loadStateForScope(localConfig)).placedRules,
@@ -34658,7 +34742,7 @@ var init_rules = __esm({
           const extensions = /* @__PURE__ */ new Set([ruleFileExtensionForTool(tool), ".md"]);
           for (const localName of localNames) {
             for (const extension of extensions) {
-              const filePath = path87.join(baseDir, toolPath.rules, `${localName}${extension}`);
+              const filePath = path88.join(baseDir, toolPath.rules, `${localName}${extension}`);
               if (await pathExists(filePath)) {
                 await remove(filePath);
                 removed.push(filePath);
@@ -34702,7 +34786,7 @@ var init_rules = __esm({
         const { placedRules, pendingPushes } = state;
         for (const name of Object.keys(placedRules ?? {})) {
           const placed = placedResourcePath(placedRules, "rules", name);
-          if (placed && await pathExists(path87.join(localConfig.repo.localPath, placed))) {
+          if (placed && await pathExists(path88.join(localConfig.repo.localPath, placed))) {
             teamRuleNames.add(name);
           }
         }
@@ -34721,7 +34805,7 @@ var init_rules = __esm({
           if (isAgentExcluded(localConfig, tool)) continue;
           if (!await isToolInstalledForConfig(tool, toolPath.rules, localConfig)) continue;
           const baseDir = resolveToolBaseDir(tool, localConfig);
-          const destDir = path87.join(baseDir, toolPath.rules);
+          const destDir = path88.join(baseDir, toolPath.rules);
           if (!await pathExists(destDir)) continue;
           const ext = ruleFileExtensionForTool(tool);
           const localFiles = await listFilesRecursive(destDir);
@@ -34731,7 +34815,7 @@ var init_rules = __esm({
             if ((tool === "joycode" || tool === "omp" || tool === "pi" || usesCopilotInstructions(tool)) && !tombstones.has(ruleName)) {
               const replaced = teamRuleNames.has(ruleName) ? void 0 : replacedByName.get(ruleName);
               if (replaced === void 0 || localFile !== `${ruleName}${ext}`) continue;
-              const deployed = path87.join(destDir, localFile);
+              const deployed = path88.join(destDir, localFile);
               if (await isDeliveredRender(tool, deployed, replaced, localConfig.repo.localPath, deliveredRevs)) {
                 await remove(deployed);
                 log.debug(`Removed ${localFile} from ${tool}: a namespace rule replaces it`);
@@ -34743,14 +34827,14 @@ var init_rules = __esm({
               continue;
             }
             if (isLegacyCursorRuleFile(tool, localFile)) {
-              await remove(path87.join(destDir, localFile));
+              await remove(path88.join(destDir, localFile));
               log.debug(`Removed legacy .md rule ${localFile} from ${tool}`);
               continue;
             }
             if (!localFile.endsWith(ext)) continue;
             if (EXCLUDED_RULE_NAMES.has(ruleName)) continue;
             if (!teamRuleNames.has(ruleName)) {
-              const fullPath = path87.join(destDir, localFile);
+              const fullPath = path88.join(destDir, localFile);
               await remove(fullPath);
               log.debug(`Removed stale rule ${localFile} from ${tool}`);
             }
@@ -34760,7 +34844,7 @@ var init_rules = __esm({
         for (const [tool, toolPath] of Object.entries(scopedToolPaths(teamConfig, localConfig))) {
           if (!toolPath.claudemd) continue;
           const baseDir = resolveToolBaseDir(tool, localConfig);
-          const claudeMdPath = path87.join(baseDir, toolPath.claudemd);
+          const claudeMdPath = path88.join(baseDir, toolPath.claudemd);
           try {
             const content = await readFileSafe(claudeMdPath);
             if (!content || !content.includes(TEAMAI_RULES_START)) continue;
@@ -34814,9 +34898,9 @@ var init_rules = __esm({
         if (!await ResourceHandler.isToolInstalled(paths.rules, baseDir)) return null;
         const configRel = localConfig.scope === "project" ? paths.mcpProject : paths.mcp;
         if (!configRel) return null;
-        const configFile = path87.join(baseDir, configRel);
+        const configFile = path88.join(baseDir, configRel);
         const { opencodeRulesGlob: opencodeRulesGlob2 } = await Promise.resolve().then(() => (init_opencode_config(), opencode_config_exports));
-        return { configFile, glob: opencodeRulesGlob2(configFile, path87.join(baseDir, paths.rules)) };
+        return { configFile, glob: opencodeRulesGlob2(configFile, path88.join(baseDir, paths.rules)) };
       }
       /**
        * Recursively remove empty subdirectories under a given directory.
@@ -34842,7 +34926,7 @@ var init_rules = __esm({
             if (supersedes) continue;
             if (!await isDeliveredRender(tool, dest, item, localConfig.repo.localPath, deliveredRevs)) continue;
             await remove(dest);
-            touchedDirs.add(path87.join(resolveToolBaseDir(tool, localConfig), scopedToolPaths(teamConfig, localConfig)[tool].rules));
+            touchedDirs.add(path88.join(resolveToolBaseDir(tool, localConfig), scopedToolPaths(teamConfig, localConfig)[tool].rules));
             log.debug(`Removed unselected team rule ${item.name} from ${tool}`);
           }
         }
@@ -34852,7 +34936,7 @@ var init_rules = __esm({
         if (!await pathExists(dir)) return;
         const subdirs = await listDirs(dir);
         for (const sub of subdirs) {
-          const subPath = path87.join(dir, sub);
+          const subPath = path88.join(dir, sub);
           await this.removeEmptyDirs(subPath);
           const remaining = await listFilesRecursive(subPath);
           const remainingDirs = await listDirs(subPath);
@@ -34912,9 +34996,9 @@ var marketplace_exports = {};
 __export(marketplace_exports, {
   refreshMarketplace: () => refreshMarketplace
 });
-import path88 from "path";
+import path89 from "path";
 async function extractSkillDescription2(skillDir) {
-  const skillMdPath = path88.join(skillDir, SKILL_MD3);
+  const skillMdPath = path89.join(skillDir, SKILL_MD3);
   const content = await readFileSafe(skillMdPath);
   if (!content) return "";
   const { data } = parseFrontmatter(content);
@@ -34923,7 +35007,7 @@ async function extractSkillDescription2(skillDir) {
   return String(desc).replace(/\s+/g, " ").trim();
 }
 async function refreshMarketplace(repoPath) {
-  const marketplacePath = path88.join(repoPath, MARKETPLACE_PATH);
+  const marketplacePath = path89.join(repoPath, MARKETPLACE_PATH);
   if (!await pathExists(marketplacePath)) {
     return false;
   }
@@ -34937,11 +35021,11 @@ async function refreshMarketplace(repoPath) {
     return false;
   }
   if (!Array.isArray(marketplace.plugins)) return false;
-  const skillsDir = path88.join(repoPath, "skills");
+  const skillsDir = path89.join(repoPath, "skills");
   const currentSkills = /* @__PURE__ */ new Set();
   const dirs = await listDirs(skillsDir);
   for (const dir of dirs) {
-    const hasSkillMd = await pathExists(path88.join(skillsDir, dir, SKILL_MD3));
+    const hasSkillMd = await pathExists(path89.join(skillsDir, dir, SKILL_MD3));
     if (hasSkillMd) {
       currentSkills.add(dir);
     }
@@ -34960,7 +35044,7 @@ async function refreshMarketplace(repoPath) {
   for (const skillName of currentSkills) {
     const existing = existingPlugins.get(skillName);
     if (existing) {
-      const desc = await extractSkillDescription2(path88.join(skillsDir, skillName));
+      const desc = await extractSkillDescription2(path89.join(skillsDir, skillName));
       if (desc && desc !== existing.description) {
         existing.description = desc;
         changed = true;
@@ -34968,7 +35052,7 @@ async function refreshMarketplace(repoPath) {
       updatedPlugins.push(existing);
       existingPlugins.delete(skillName);
     } else {
-      const desc = await extractSkillDescription2(path88.join(skillsDir, skillName));
+      const desc = await extractSkillDescription2(path89.join(skillsDir, skillName));
       updatedPlugins.push({
         name: skillName,
         source: `./skills/${skillName}`,
@@ -35143,16 +35227,16 @@ __export(manifest_exports, {
 });
 import crypto9 from "crypto";
 import fs38 from "fs";
-import path89 from "path";
+import path90 from "path";
 import YAML19 from "yaml";
 function packageManifestPath(repoPath) {
-  return path89.join(repoPath, PACKAGE_MANIFEST_FILENAME);
+  return path90.join(repoPath, PACKAGE_MANIFEST_FILENAME);
 }
 function packageLockPath(cwd) {
-  return path89.join(cwd, PACKAGE_LOCK_FILENAME);
+  return path90.join(cwd, PACKAGE_LOCK_FILENAME);
 }
 async function ensurePackageLockIgnored(cwd) {
-  const gitignorePath = path89.join(cwd, ".gitignore");
+  const gitignorePath = path90.join(cwd, ".gitignore");
   const content = await readFileSafe(gitignorePath);
   if (content?.split("\n").some((line) => line.trim() === PACKAGE_LOCK_FILENAME)) return;
   const prefix = content && !content.endsWith("\n") ? `${content}
@@ -35226,7 +35310,7 @@ function projectNpmDeclarationHash(manifest) {
   return npm.length > 0 ? packageSetHash({ npm }) : null;
 }
 function packageProjectKey(cwd) {
-  let normalized = path89.resolve(cwd);
+  let normalized = path90.resolve(cwd);
   try {
     normalized = fs38.realpathSync.native(normalized);
   } catch {
@@ -35256,8 +35340,8 @@ __export(push_exports, {
   filterExistingTopLevelPaths: () => filterExistingTopLevelPaths,
   push: () => push
 });
-import { chmod as chmod2, readFile as readFile4, stat as stat3 } from "fs/promises";
-import path90 from "path";
+import { chmod as chmod2, readFile as readFile5, stat as stat3 } from "fs/promises";
+import path91 from "path";
 import YAML20 from "yaml";
 async function filterExistingTopLevelPaths(repoPath, candidates) {
   const seen = /* @__PURE__ */ new Set();
@@ -35267,7 +35351,7 @@ async function filterExistingTopLevelPaths(repoPath, candidates) {
     seen.add(candidate);
     const trimmed = candidate.replace(/\/+$/, "");
     if (!trimmed) continue;
-    if (await pathExists(path90.join(repoPath, trimmed))) {
+    if (await pathExists(path91.join(repoPath, trimmed))) {
       result.push(candidate);
     }
   }
@@ -35439,7 +35523,7 @@ async function hasGitModeChange(git, filePath) {
 }
 async function readFileSnapshot(filePath) {
   try {
-    const [content, stats] = await Promise.all([readFile4(filePath), stat3(filePath)]);
+    const [content, stats] = await Promise.all([readFile5(filePath), stat3(filePath)]);
     return { content, mode: stats.mode & 511 };
   } catch {
     return null;
@@ -35520,7 +35604,7 @@ async function placeNewResources(args) {
           const placedAt = withNamespace(item.relativePath, destination.namespace);
           let taken;
           for (const candidate of collisionPaths(type, placedAt)) {
-            if (await pathExists(path90.join(localConfig.repo.localPath, candidate))) {
+            if (await pathExists(path91.join(localConfig.repo.localPath, candidate))) {
               taken = candidate;
               break;
             }
@@ -35627,7 +35711,7 @@ ${items.map((i) => `- [${i.type}] ${i.name}`).join("\n")}`
     });
     await checkoutMaster(localConfig.repo.localPath);
     for (const rel of pushedFiles) {
-      await pruneEmptyDirs(path90.resolve(localConfig.repo.localPath, rel));
+      await pruneEmptyDirs(path91.resolve(localConfig.repo.localPath, rel));
     }
     return prFailed ? "pr-failed" : "pushed";
   } catch (e) {
@@ -35656,7 +35740,7 @@ async function push(options, result) {
     return;
   }
   try {
-    const configContent = await readFileSafe(path90.join(localConfig.repo.localPath, "teamai.yaml"));
+    const configContent = await readFileSafe(path91.join(localConfig.repo.localPath, "teamai.yaml"));
     const rawConfig = configContent === null ? null : YAML20.parse(configContent);
     if (rawConfig && typeof rawConfig === "object" && !Array.isArray(rawConfig) && Object.prototype.hasOwnProperty.call(rawConfig, "packages")) {
       const { loadPackageManifest: loadPackageManifest2 } = await Promise.resolve().then(() => (init_manifest(), manifest_exports));
@@ -35668,7 +35752,7 @@ async function push(options, result) {
     return;
   }
   if (localConfig.repo.kind === "self") {
-    const selfSyncLock = path90.join(getDataHome(localConfig), SYNC_LOCK_FILENAME);
+    const selfSyncLock = path91.join(getDataHome(localConfig), SYNC_LOCK_FILENAME);
     if (!await acquireLock(selfSyncLock, { dryRun: options.dryRun })) {
       log.error("Another teamai pull/push/migration is in progress for this project. Re-run once it finishes.");
       process.exitCode = 1;
@@ -35687,7 +35771,7 @@ async function push(options, result) {
         const pendingTeamConfig = await pendingSelfTeamConfig(localConfig);
         await withKnowledgeWorktree2(localConfig, async (wtConfig) => {
           if (pendingTeamConfig !== null) {
-            await writeFile(path90.join(wtConfig.repo.localPath, "teamai.yaml"), pendingTeamConfig);
+            await writeFile(path91.join(wtConfig.repo.localPath, "teamai.yaml"), pendingTeamConfig);
           }
           await pushCore(wtConfig, teamConfig, options, pendingTeamConfig, result);
         });
@@ -35704,7 +35788,7 @@ async function push(options, result) {
     }
     return;
   }
-  const syncLock = path90.join(getDataHome(localConfig), SYNC_LOCK_FILENAME);
+  const syncLock = path91.join(getDataHome(localConfig), SYNC_LOCK_FILENAME);
   const locked = await acquireLock(syncLock, { dryRun: options.dryRun });
   if (!locked) {
     log.error("Another teamai pull/push is in progress for this project. Re-run once it finishes.");
@@ -35718,11 +35802,11 @@ async function push(options, result) {
   }
 }
 async function pendingSelfTeamConfig(localConfig) {
-  const activeConfigPath = path90.join(localConfig.repo.localPath, "teamai.yaml");
+  const activeConfigPath = path91.join(localConfig.repo.localPath, "teamai.yaml");
   const activeConfig = await readFileSafe(activeConfigPath);
   const businessRoot = localConfig.repo.businessRepoRoot ?? localConfig.projectRoot;
   if (activeConfig === null || !businessRoot) return null;
-  const relativeConfigPath = path90.relative(businessRoot, activeConfigPath).split(path90.sep).join("/");
+  const relativeConfigPath = path91.relative(businessRoot, activeConfigPath).split(path91.sep).join("/");
   const committed = await getFileContentAtRev(businessRoot, "HEAD", relativeConfigPath);
   return committed === null || committed.toString() !== activeConfig ? activeConfig : null;
 }
@@ -35733,7 +35817,7 @@ async function pushCore(localConfig, teamConfig, options, initialPendingTeamConf
   const restorePendingEnvFiles = async () => {
     const lost = [];
     for (const [relativePath, { content, mode }] of pendingEnvFiles) {
-      const target = path90.join(localConfig.repo.localPath, ...relativePath.split("/"));
+      const target = path91.join(localConfig.repo.localPath, ...relativePath.split("/"));
       try {
         await writeFile(target, content);
         await chmod2(target, mode);
@@ -35761,7 +35845,7 @@ async function pushCore(localConfig, teamConfig, options, initialPendingTeamConf
         process.exitCode = 1;
         return;
       }
-      const yamlPath = path90.join(repoPath, "teamai.yaml");
+      const yamlPath = path91.join(repoPath, "teamai.yaml");
       const workingContent = await readFileSafe(yamlPath);
       if (workingContent !== null) {
         const committed = await getFileContentAtRev(repoPath, "HEAD", "teamai.yaml");
@@ -35964,7 +36048,7 @@ async function pushCore(localConfig, teamConfig, options, initialPendingTeamConf
   }
   spin.stop();
   if (options.skill) {
-    const skillBasename = path90.basename(
+    const skillBasename = path91.basename(
       options.skill.startsWith("~") ? options.skill.slice(1).replace(/^[/\\]+/, "") : options.skill
     );
     try {
@@ -35975,37 +36059,37 @@ async function pushCore(localConfig, teamConfig, options, initialPendingTeamConf
       return;
     }
     const os16 = await import("os");
-    const skillPath2 = options.skill.startsWith("~") ? path90.join(os16.homedir(), options.skill.slice(1)) : path90.resolve(options.skill);
+    const skillPath2 = options.skill.startsWith("~") ? path91.join(os16.homedir(), options.skill.slice(1)) : path91.resolve(options.skill);
     let matchedItem;
     for (const item of allItems) {
       if (item.type !== "skills") continue;
-      if (path90.resolve(item.sourcePath) === skillPath2) {
+      if (path91.resolve(item.sourcePath) === skillPath2) {
         matchedItem = item;
         break;
       }
-      if (item.name === path90.basename(skillPath2)) {
+      if (item.name === path91.basename(skillPath2)) {
         matchedItem = item;
         break;
       }
       const skillInput = options.skill.replace(/^~/, os16.homedir());
-      if (item.sourcePath.endsWith(skillInput) || item.sourcePath.includes(path90.sep + skillInput)) {
+      if (item.sourcePath.endsWith(skillInput) || item.sourcePath.includes(path91.sep + skillInput)) {
         matchedItem = item;
         break;
       }
     }
     if (!matchedItem) {
-      if (await pathExists(skillPath2) && await pathExists(path90.join(skillPath2, "SKILL.md"))) {
-        const skillName = path90.basename(skillPath2);
+      if (await pathExists(skillPath2) && await pathExists(path91.join(skillPath2, "SKILL.md"))) {
+        const skillName = path91.basename(skillPath2);
         let namespace;
         let status2 = "new";
-        const teamSkillsDir = path90.join(localConfig.repo.localPath, "skills");
+        const teamSkillsDir = path91.join(localConfig.repo.localPath, "skills");
         if (await pathExists(teamSkillsDir)) {
           const { listDirs: listDirs2 } = await Promise.resolve().then(() => (init_fs(), fs_exports));
           const topDirs = await listDirs2(teamSkillsDir);
           for (const dir of topDirs) {
-            const candidatePath = path90.join(teamSkillsDir, dir, skillName);
+            const candidatePath = path91.join(teamSkillsDir, dir, skillName);
             if (await pathExists(candidatePath)) {
-              const isNamespace = !await pathExists(path90.join(teamSkillsDir, dir, "SKILL.md"));
+              const isNamespace = !await pathExists(path91.join(teamSkillsDir, dir, "SKILL.md"));
               if (isNamespace) {
                 namespace = dir;
               }
@@ -36013,7 +36097,7 @@ async function pushCore(localConfig, teamConfig, options, initialPendingTeamConf
               break;
             }
           }
-          if (!namespace && await pathExists(path90.join(teamSkillsDir, skillName))) {
+          if (!namespace && await pathExists(path91.join(teamSkillsDir, skillName))) {
             status2 = "modified";
           }
         }
@@ -36078,7 +36162,7 @@ async function pushCore(localConfig, teamConfig, options, initialPendingTeamConf
     for (const item of allItems) {
       if (item.type !== "skills") continue;
       const placedAt = skillNamespacePath(skillsDestination, item.name);
-      if (item.status === "new" && await pathExists(path90.join(localConfig.repo.localPath, placedAt))) {
+      if (item.status === "new" && await pathExists(path91.join(localConfig.repo.localPath, placedAt))) {
         log.error(
           `[skills] ${item.name} cannot be placed: ${placedAt} already exists in the team repo, and this is a new skill, so pushing it there would overwrite that copy. Pull and edit the existing one, rename yours, or pass --role <ns> to choose another namespace.`
         );
@@ -36250,7 +36334,7 @@ async function pushCore(localConfig, teamConfig, options, initialPendingTeamConf
       await checkoutMaster(localConfig.repo.localPath);
     }
     if (pendingTeamConfig !== null && configPending && (groupIndex < configGroupIndex || outcome === "failed")) {
-      await writeFile(path90.join(localConfig.repo.localPath, "teamai.yaml"), pendingTeamConfig);
+      await writeFile(path91.join(localConfig.repo.localPath, "teamai.yaml"), pendingTeamConfig);
     }
     if (outcome === "pushed" || outcome === "pr-failed") {
       for (const item of group.items) pendingEnvFiles.delete(item.relativePath);
@@ -36410,7 +36494,7 @@ __export(git_exports, {
 import { spawnSync as spawnSync7 } from "child_process";
 import fs39 from "fs";
 import { realpath } from "fs/promises";
-import path91 from "path";
+import path92 from "path";
 import fse14 from "fs-extra";
 import simpleGit from "simple-git";
 function gitBinary(options = {}) {
@@ -36431,9 +36515,9 @@ function stillExecutable(binary) {
   }
 }
 function lookUpGit(pathEnv) {
-  for (const dir of pathEnv.split(path91.delimiter)) {
-    if (!path91.isAbsolute(dir)) return "git";
-    const candidate = path91.join(dir, "git");
+  for (const dir of pathEnv.split(path92.delimiter)) {
+    if (!path92.isAbsolute(dir)) return "git";
+    const candidate = path92.join(dir, "git");
     let stat10;
     try {
       stat10 = fs39.statSync(candidate);
@@ -36463,7 +36547,7 @@ async function isGitRepo(localPath) {
   if (!await fse14.pathExists(localPath)) {
     return false;
   }
-  return fse14.pathExists(path91.join(localPath, ".git"));
+  return fse14.pathExists(path92.join(localPath, ".git"));
 }
 async function initRepo(remote, localPath) {
   await fse14.ensureDir(localPath);
@@ -36524,7 +36608,7 @@ async function hasCommits(localPath) {
 }
 async function commitPaths(localPath, message, files) {
   const git = createGit(localPath);
-  const existing = files.filter((f) => fs39.existsSync(path91.join(localPath, f)));
+  const existing = files.filter((f) => fs39.existsSync(path92.join(localPath, f)));
   if (existing.length === 0) return false;
   let added = 0;
   for (const f of existing) {
@@ -36638,7 +36722,7 @@ async function pushRepoDirectly(localPath, message, files) {
 }
 async function pushLearningToOrigin(repoPath, relPath, message) {
   const git = createGit(repoPath);
-  await git.add([`learnings/${relPath.split(path91.sep).join("/")}`]);
+  await git.add([`learnings/${relPath.split(path92.sep).join("/")}`]);
   const status2 = await git.status();
   if (status2.staged.length > 0) {
     await git.commit(message);
@@ -36815,7 +36899,7 @@ async function isDedicatedRepoRoot(repoPath) {
   }
 }
 async function resolveAnchors(cwd) {
-  const dir = path91.resolve(cwd ?? process.cwd());
+  const dir = path92.resolve(cwd ?? process.cwd());
   const known = anchorsByDir.get(dir);
   if (known) return known;
   const anchors = await readAnchors(cwd);
@@ -36973,10 +37057,10 @@ __export(bootstrap_exports, {
   bootstrapSelfRepo: () => bootstrapSelfRepo,
   previewSelfBootstrap: () => previewSelfBootstrap
 });
-import path92 from "path";
+import path93 from "path";
 import YAML21 from "yaml";
 async function readSelfModeMarker(dir) {
-  const yamlPath = path92.join(dir, ".teamai", "teamai.yaml");
+  const yamlPath = path93.join(dir, ".teamai", "teamai.yaml");
   const content = await readFileSafe(yamlPath);
   if (!content) return null;
   try {
@@ -36991,7 +37075,7 @@ async function readSelfModeMarker(dir) {
 async function findPendingBootstrap(businessRepoRoot, dryRun) {
   const { resolveProjectDataHome: resolveProjectDataHome2 } = await Promise.resolve().then(() => (init_config(), config_exports));
   const partitionHome = await resolveProjectDataHome2(businessRepoRoot, { dryRun });
-  const configPath = path92.join(partitionHome, "config.yaml");
+  const configPath = path93.join(partitionHome, "config.yaml");
   const legacyConfigPath = getConfigPath("project", businessRepoRoot);
   if (await pathExists(configPath) || await pathExists(legacyConfigPath)) return "already";
   const marker = await readSelfModeMarker(businessRepoRoot);
@@ -36999,7 +37083,7 @@ async function findPendingBootstrap(businessRepoRoot, dryRun) {
   return { partitionHome, configPath, marker };
 }
 async function planSelfBootstrap(businessRepoRoot, partitionHome, marker, silent, dryRun) {
-  const localPath = path92.join(businessRepoRoot, ".teamai");
+  const localPath = path93.join(businessRepoRoot, ".teamai");
   const remoteUrl = await getRemoteUrl(businessRepoRoot) ?? marker.repo ?? "";
   if (!remoteUrl) {
     log.debug("[bootstrap] no remote/repo to derive provider from; skipping");
@@ -37084,7 +37168,7 @@ async function bootstrapSelfRepo(dir, opts) {
   const pending = await findPendingBootstrap(businessRepoRoot, false);
   if (typeof pending === "string") return pending;
   const { configPath } = pending;
-  const lockPath = path92.join(businessRepoRoot, ".teamai", BOOTSTRAP_LOCK_FILENAME);
+  const lockPath = path93.join(businessRepoRoot, ".teamai", BOOTSTRAP_LOCK_FILENAME);
   const locked = await acquireLock(lockPath);
   if (!locked) {
     log.debug("[bootstrap] another bootstrap is in progress; skipping");
@@ -37126,9 +37210,9 @@ async function bootstrapSelfRepo(dir, opts) {
     try {
       const { updateReports: updateReports2 } = await Promise.resolve().then(() => (init_reports_branch(), reports_branch_exports));
       await updateReports2(localConfig, async (wt) => {
-        const memberDir = path92.join(wt, "members");
+        const memberDir = path93.join(wt, "members");
         await ensureDir(memberDir);
-        const memberPath = path92.join(memberDir, `${username}.yaml`);
+        const memberPath = path93.join(memberDir, `${username}.yaml`);
         if (await pathExists(memberPath)) return null;
         const inherited = await getMemberConfig(localConfig.repo.localPath, username);
         const config = inherited ? mergeMemberConfig(inherited, { username }).config : { username, displayName: username, registeredAt: (/* @__PURE__ */ new Date()).toISOString() };
@@ -37189,7 +37273,7 @@ __export(config_exports, {
 import YAML22 from "yaml";
 import { ZodError } from "zod";
 import fs40 from "fs";
-import path93 from "path";
+import path94 from "path";
 async function migrateLegacyRoleConfig(config, configPath, options = {}) {
   if (config.primaryRole) {
     return config;
@@ -37221,7 +37305,7 @@ async function migrateLegacyRoleConfig(config, configPath, options = {}) {
   return migrated;
 }
 async function loadTeamConfig(repoPath) {
-  const content = await readFileSafe(path93.join(repoPath, "teamai.yaml"));
+  const content = await readFileSafe(path94.join(repoPath, "teamai.yaml"));
   if (!content) {
     log.debug("teamai.yaml not found in repo");
     return null;
@@ -37281,7 +37365,7 @@ async function throwMissingOrInvalid(configPath) {
   throw new Error(`The teamai config at ${configPath} could not be read: ${why}. ${BROKEN_CONFIG_ADVICE}`);
 }
 async function throwTeamConfigMissingOrInvalid(repoPath) {
-  const teamConfigPath = path93.join(repoPath, "teamai.yaml");
+  const teamConfigPath = path94.join(repoPath, "teamai.yaml");
   if (!await pathExists(teamConfigPath)) {
     throw new Error("Team config (teamai.yaml) not found. Check your repo path.");
   }
@@ -37294,7 +37378,7 @@ async function loadLocalConfigForScope(scope, projectRoot, options = {}) {
     if (!projectRoot) return null;
     const detected = await detectProjectConfig(projectRoot, void 0, options);
     if (!detected) return null;
-    return migrateLegacyRoleConfig(detected, path93.join(getDataHome(detected), "config.yaml"), options);
+    return migrateLegacyRoleConfig(detected, path94.join(getDataHome(detected), "config.yaml"), options);
   }
   const configPath = getConfigPath(scope, projectRoot);
   const content = await readFileSafe(expandHome(configPath));
@@ -37310,12 +37394,12 @@ async function loadLocalConfigForScope(scope, projectRoot, options = {}) {
 }
 async function saveLocalConfigForScope(config, _scope, _projectRoot) {
   const dataHome = getDataHome(config);
-  const configPath = path93.join(dataHome, "config.yaml");
+  const configPath = path94.join(dataHome, "config.yaml");
   await writeFileAtomic(expandHome(configPath), serializeLocalConfig(config));
   try {
     if (config.scope === "project" && config.projectRoot) {
       const partition = await resolveProjectDataHome(config.projectRoot);
-      if (path93.resolve(expandHome(dataHome)) === path93.resolve(partition)) {
+      if (path94.resolve(expandHome(dataHome)) === path94.resolve(partition)) {
         const anchors = await resolveAnchors(config.projectRoot);
         if (anchors) await writeAnchorFile(partition, anchors.projectAnchor);
       }
@@ -37335,13 +37419,13 @@ async function saveStateForScope(state, localConfig) {
 }
 async function resolveProjectDataHome(projectRoot, options = {}) {
   const anchors = await resolveAnchors(projectRoot);
-  return anchors ? resolvePartitionDir(anchors.projectAnchor, options) : path93.join(projectRoot, ".teamai");
+  return anchors ? resolvePartitionDir(anchors.projectAnchor, options) : path94.join(projectRoot, ".teamai");
 }
 async function resolveDataHomeForScope(scope, projectRoot) {
   if (scope !== "project" || !projectRoot) return getTeamaiHome("user");
   const detected = await detectProjectConfig(projectRoot);
   if (detected) return getDataHome(detected);
-  return path93.join(projectRoot, ".teamai");
+  return path94.join(projectRoot, ".teamai");
 }
 async function resolveConfigForDir(dir) {
   const target = dir ?? process.cwd();
@@ -37361,7 +37445,7 @@ async function detectProjectConfig(cwd, onUnreadable, options = {}) {
   const dir = cwd ?? process.cwd();
   const anchors = await resolveAnchors(dir);
   if (anchors) {
-    const legacyDir = path93.join(anchors.workspaceRoot, ".teamai");
+    const legacyDir = path94.join(anchors.workspaceRoot, ".teamai");
     const partitionDir = await resolvePartitionDir(anchors.projectAnchor, options);
     const fromPartition = await readConfigFrom(partitionDir, anchors.workspaceRoot, void 0, onUnreadable);
     if (fromPartition) return fromPartition;
@@ -37369,7 +37453,7 @@ async function detectProjectConfig(cwd, onUnreadable, options = {}) {
     if (healed) return healed;
     return readConfigFrom(legacyDir, anchors.workspaceRoot, void 0, onUnreadable);
   }
-  return readConfigFrom(path93.join(dir, ".teamai"), dir, dir, onUnreadable, options);
+  return readConfigFrom(path94.join(dir, ".teamai"), dir, dir, onUnreadable, options);
 }
 async function selfHealAndReadPartition(workspaceRoot, partitionDir, onUnreadable, options = {}) {
   if (options.dryRun) return previewSelfHeal(workspaceRoot, partitionDir, workspaceRoot);
@@ -37383,7 +37467,7 @@ async function selfHealAndReadPartition(workspaceRoot, partitionDir, onUnreadabl
   return readConfigFrom(partitionDir, workspaceRoot, void 0, onUnreadable);
 }
 async function readConfigFrom(dataHomeDir, projectRoot, selfHealRepoRoot, onUnreadable, options = {}) {
-  const configPath = path93.join(dataHomeDir, "config.yaml");
+  const configPath = path94.join(dataHomeDir, "config.yaml");
   if (!await pathExists(configPath)) {
     if (!selfHealRepoRoot) return null;
     if (options.dryRun) return previewSelfHeal(selfHealRepoRoot, dataHomeDir, projectRoot);
@@ -37430,7 +37514,7 @@ function anchorProjectConfig(config, dataHomeDir, projectRoot) {
   if (config.repo.kind === "self") {
     resolved.repo = {
       ...config.repo,
-      localPath: path93.join(projectRoot, ".teamai"),
+      localPath: path94.join(projectRoot, ".teamai"),
       businessRepoRoot: projectRoot
     };
   }
@@ -37441,10 +37525,10 @@ function isUserTeamaiDir(dataHomeDir, projectRoot) {
     try {
       return fs40.realpathSync(p);
     } catch {
-      return path93.resolve(p);
+      return path94.resolve(p);
     }
   };
-  return path93.resolve(dataHomeDir) === path93.join(path93.resolve(projectRoot), ".teamai") && real(projectRoot) === real(getUserHome());
+  return path94.resolve(dataHomeDir) === path94.join(path94.resolve(projectRoot), ".teamai") && real(projectRoot) === real(getUserHome());
 }
 function describeConfigError(e) {
   if (e instanceof ZodError) {
@@ -37515,7 +37599,7 @@ var init_base2 = __esm({
 });
 
 // src/pkg/adapters/claude-plugin.ts
-import path94 from "path";
+import path95 from "path";
 function marketplaceSource(marketplace) {
   if (!marketplace.ref) return marketplace.repo;
   const separator = marketplace.repo.includes("://") || marketplace.repo.endsWith(".git") ? "#" : "@";
@@ -37529,9 +37613,9 @@ function marketplaceSourceLocation(marketplace) {
   return void 0;
 }
 function marketplaceLocationsEqual(declared, actual, cwd) {
-  const looksLocal = (value) => path94.isAbsolute(value) || /^\.{1,2}[\\/]/.test(value) || /^[a-zA-Z]:[\\/]/.test(value);
+  const looksLocal = (value) => path95.isAbsolute(value) || /^\.{1,2}[\\/]/.test(value) || /^[a-zA-Z]:[\\/]/.test(value);
   if (looksLocal(declared) || looksLocal(actual)) {
-    return path94.resolve(cwd, declared) === path94.resolve(cwd, actual);
+    return path95.resolve(cwd, declared) === path95.resolve(cwd, actual);
   }
   return declared.replace(/[\\/]+$/, "") === actual.replace(/[\\/]+$/, "");
 }
@@ -37796,7 +37880,7 @@ var init_claude_plugin = __esm({
 });
 
 // src/pkg/adapters/npm.ts
-import path95 from "path";
+import path96 from "path";
 import semver from "semver";
 function satisfiesDeclaredVersion(declared, actual) {
   const range = semver.validRange(declared);
@@ -37835,12 +37919,12 @@ var init_npm = __esm({
         super(executor);
       }
       async detect(cwd) {
-        return pathExists(path95.join(cwd, "package.json"));
+        return pathExists(path96.join(cwd, "package.json"));
       }
       async snapshotLocal(cwd, declaration) {
         const local = declaration.filter((spec) => !spec.global);
         if (local.length === 0) return [];
-        const lock = await readJson(path95.join(cwd, "package-lock.json"));
+        const lock = await readJson(path96.join(cwd, "package-lock.json"));
         return lock ? extractNpmLockEntries(lock, local) : [];
       }
       async snapshotGlobal(declaration) {
@@ -38521,7 +38605,7 @@ __export(migrate_exports, {
   queueKeptInCheckout: () => queueKeptInCheckout,
   runMigration: () => runMigration
 });
-import path96 from "path";
+import path97 from "path";
 import fse15 from "fs-extra";
 import YAML23 from "yaml";
 import { realpath as realpath2 } from "fs/promises";
@@ -38531,11 +38615,11 @@ function isSkippedEntry(name) {
 async function planMigration(cwd) {
   const anchors = await resolveAnchors(cwd ?? process.cwd());
   if (!anchors) return null;
-  const legacyDir = path96.join(anchors.workspaceRoot, ".teamai");
+  const legacyDir = path97.join(anchors.workspaceRoot, ".teamai");
   const partitionDir = await resolvePartitionDir(anchors.projectAnchor);
-  const legacyConfig = path96.join(legacyDir, "config.yaml");
+  const legacyConfig = path97.join(legacyDir, "config.yaml");
   const legacyContent = await readFileSafe(legacyConfig);
-  const gateContent = legacyContent ?? await readFileSafe(path96.join(partitionDir, "config.yaml"));
+  const gateContent = legacyContent ?? await readFileSafe(path97.join(partitionDir, "config.yaml"));
   if (!gateContent) return null;
   let scope;
   let kind;
@@ -38546,9 +38630,9 @@ async function planMigration(cwd) {
     kind = parsed.repo.kind;
     legacyOwner = queueOwner(parsed);
   } catch (e) {
-    if (legacyContent !== null && await holdsQueued(path96.join(legacyDir, SELF_LEGACY_QUEUE))) {
+    if (legacyContent !== null && await holdsQueued(path97.join(legacyDir, SELF_LEGACY_QUEUE))) {
       log.warn(
-        `Kept the learnings queued in ${path96.join(legacyDir, SELF_LEGACY_QUEUE)}: ${legacyConfig} cannot be read (${(e instanceof Error ? e.message : String(e)).split("\n")[0]}), so teamai cannot tell which install they belong to. Fix that file; the next init, pull or push moves them.`
+        `Kept the learnings queued in ${path97.join(legacyDir, SELF_LEGACY_QUEUE)}: ${legacyConfig} cannot be read (${(e instanceof Error ? e.message : String(e)).split("\n")[0]}), so teamai cannot tell which install they belong to. Fix that file; the next init, pull or push moves them.`
       );
     }
     return null;
@@ -38602,7 +38686,7 @@ async function readPartitionState(partitionDir, workspaceRoot) {
 }
 async function anyExists(dir, names) {
   for (const n of names) {
-    if (await pathExists(path96.join(dir, n))) return true;
+    if (await pathExists(path97.join(dir, n))) return true;
   }
   return false;
 }
@@ -38616,11 +38700,11 @@ async function runMigration(plan, opts = {}) {
     } else if (mode === "self") {
       const present = [];
       for (const n of [SELF_LEGACY_QUEUE, ...SELF_A1_ENTRIES]) {
-        if (await pathExists(path96.join(legacyDir, n))) present.push(n);
+        if (await pathExists(path97.join(legacyDir, n))) present.push(n);
       }
       const stale = [];
       for (const n of SELF_STALE_ENTRIES) {
-        if (await pathExists(path96.join(legacyDir, n))) stale.push(n);
+        if (await pathExists(path97.join(legacyDir, n))) stale.push(n);
       }
       log.info(
         `[dry-run] self mode: would relocate ${present.length} machine-data item(s) (${present.join(", ")}) from ${legacyDir} to ${partitionDir}` + (stale.length > 0 ? ` and delete ${stale.join(", ")}` : "") + ", leaving team knowledge in place."
@@ -38637,7 +38721,7 @@ async function runMigration(plan, opts = {}) {
     }
     return "dry-run";
   }
-  const lockPath = path96.join(legacyDir, SYNC_LOCK_FILENAME);
+  const lockPath = path97.join(legacyDir, SYNC_LOCK_FILENAME);
   if (!await acquireLock(lockPath)) {
     log.debug("migration skipped: a concurrent pull/push holds the sync lock");
     return "busy";
@@ -38665,7 +38749,7 @@ async function runMigration(plan, opts = {}) {
       log.success(`Retired ${legacyDir} to ${backup2}: this project's data already lives in ${partitionDir}`);
       return "migrated";
     }
-    const partition = await readPartitionState(partitionDir, path96.dirname(legacyDir));
+    const partition = await readPartitionState(partitionDir, path97.dirname(legacyDir));
     if (partition.state === "built") {
       if (!await queueSettled(legacyDir, partitionDir, plan.legacyOwner)) return "skipped";
       await releaseLock(lockPath);
@@ -38679,18 +38763,18 @@ async function runMigration(plan, opts = {}) {
       return "skipped";
     }
     await remove(staging);
-    await fse15.ensureDir(path96.dirname(partitionDir));
+    await fse15.ensureDir(path97.dirname(partitionDir));
     await fse15.copy(legacyDir, staging, {
       overwrite: true,
       filter: (src) => {
-        const rel = path96.relative(legacyDir, src);
+        const rel = path97.relative(legacyDir, src);
         if (!rel) return true;
-        const top = rel.split(path96.sep)[0];
+        const top = rel.split(path97.sep)[0];
         return !isSkippedEntry(top);
       }
     });
     await verifyStaging(legacyDir, staging);
-    await rebaseConfigPaths(path96.join(staging, "config.yaml"), legacyDir, partitionDir);
+    await rebaseConfigPaths(path97.join(staging, "config.yaml"), legacyDir, partitionDir);
     await remove(partitionDir);
     await fse15.rename(staging, partitionDir);
     await writeAnchorFile(partitionDir, anchor);
@@ -38720,9 +38804,9 @@ async function maybeMigrate(opts = {}) {
 async function settleOrphanQueue() {
   const anchors = await resolveAnchors(process.cwd());
   if (!anchors) return;
-  const legacyDir = path96.join(anchors.workspaceRoot, ".teamai");
-  if (!await holdsQueued(path96.join(legacyDir, SELF_LEGACY_QUEUE))) return;
-  if (await pathExists(path96.join(legacyDir, "config.yaml"))) return;
+  const legacyDir = path97.join(anchors.workspaceRoot, ".teamai");
+  if (!await holdsQueued(path97.join(legacyDir, SELF_LEGACY_QUEUE))) return;
+  if (await pathExists(path97.join(legacyDir, "config.yaml"))) return;
   const partitionDir = await resolvePartitionDir(anchors.projectAnchor);
   const partition = await readPartitionState(partitionDir, anchors.workspaceRoot);
   if (partition.state !== "built") return;
@@ -38746,7 +38830,7 @@ async function queueKeptInCheckout(migration) {
   }
   const anchors = await resolveAnchors(process.cwd());
   if (!anchors) return null;
-  const legacyDir = path96.join(anchors.workspaceRoot, ".teamai");
+  const legacyDir = path97.join(anchors.workspaceRoot, ".teamai");
   const home = getUserHome();
   if (anchors.workspaceRoot === await realpath2(home).catch(() => home)) return null;
   const config = await detectProjectConfig(anchors.workspaceRoot);
@@ -38768,7 +38852,7 @@ async function queueKeptInCheckout(migration) {
       case "built":
         return keptInCheckout(
           `its queue, ${queueDir}, is inside this checkout`,
-          `Set repo.localPath in ${path96.join(partitionDir, "config.yaml")} to a path outside it, then run this again.`
+          `Set repo.localPath in ${path97.join(partitionDir, "config.yaml")} to a path outside it, then run this again.`
         );
       default: {
         const unhandled = partition;
@@ -38776,7 +38860,7 @@ async function queueKeptInCheckout(migration) {
       }
     }
   }
-  const queue = path96.join(legacyDir, SELF_LEGACY_QUEUE);
+  const queue = path97.join(legacyDir, SELF_LEGACY_QUEUE);
   if (await holdsQueued(queue)) {
     return keptInCheckout(
       `the learnings queued in ${queue} could not be moved; see the warning above`,
@@ -38789,8 +38873,8 @@ function keptInCheckout(cause, next) {
   return `teamai could not move this checkout's data into the project's shared data directory (${cause}). Nothing was saved. ${next}`;
 }
 function isInside(p, dir) {
-  const rel = path96.relative(dir, p);
-  return rel === "" || !rel.startsWith("..") && !path96.isAbsolute(rel);
+  const rel = path97.relative(dir, p);
+  return rel === "" || !rel.startsWith("..") && !path97.isAbsolute(rel);
 }
 async function rebaseConfigPaths(stagedConfig, legacyDir, partitionDir) {
   const content = await readFileSafe(stagedConfig);
@@ -38812,10 +38896,10 @@ async function rebasePath(p, fromDir, toDir) {
   if (!p) return p;
   const expanded = expandHome(p);
   const canonical = await realpath2(expanded).catch(() => expanded);
-  const rel = path96.relative(fromDir, canonical);
+  const rel = path97.relative(fromDir, canonical);
   if (rel === "") return toDir;
-  if (rel.startsWith("..") || path96.isAbsolute(rel)) return p;
-  return path96.join(toDir, rel);
+  if (rel.startsWith("..") || path97.isAbsolute(rel)) return p;
+  return path97.join(toDir, rel);
 }
 async function retireLegacy(legacyDir) {
   if (await holdsSelfKnowledge(legacyDir)) {
@@ -38823,18 +38907,18 @@ async function retireLegacy(legacyDir) {
       `migration refused to rename ${legacyDir} to .bak: it holds single-repo team knowledge (teamai.yaml mode: self) committed to main. This is a guard against wiping knowledge \u2014 self installs relocate machine data selectively, never by renaming the whole directory.`
     );
   }
-  await writeFile(path96.join(legacyDir, ".gitignore"), BACKUP_GITIGNORE);
+  await writeFile(path97.join(legacyDir, ".gitignore"), BACKUP_GITIGNORE);
   const backup = await freeBackupPath(legacyDir);
   const retained = (await fse15.readdir(legacyDir)).filter((name) => LIFECYCLE_ENTRIES.has(name));
   if (retained.length === 0) {
     await fse15.rename(legacyDir, backup);
   } else {
     await fse15.ensureDir(backup);
-    await writeFile(path96.join(backup, ".gitignore"), BACKUP_GITIGNORE);
+    await writeFile(path97.join(backup, ".gitignore"), BACKUP_GITIGNORE);
     const entries = (await fse15.readdir(legacyDir)).sort((a, b) => Number(a === "config.yaml") - Number(b === "config.yaml"));
     for (const entry of entries) {
       if (LIFECYCLE_ENTRIES.has(entry) || entry === ".gitignore") continue;
-      await fse15.rename(path96.join(legacyDir, entry), path96.join(backup, entry));
+      await fse15.rename(path97.join(legacyDir, entry), path97.join(backup, entry));
     }
   }
   return backup;
@@ -38849,7 +38933,7 @@ async function freeBackupPath(legacyDir) {
 async function retireSupersededInstall(legacyDir, partitionDir, previousOwner) {
   const present = [];
   for (const name of SUPERSEDED_ENTRIES) {
-    const src = path96.join(legacyDir, name);
+    const src = path97.join(legacyDir, name);
     if (!await pathExists(src)) continue;
     if (name === "env" && await isDirectory2(src)) continue;
     present.push(name);
@@ -38857,13 +38941,13 @@ async function retireSupersededInstall(legacyDir, partitionDir, previousOwner) {
   const backup = await freeBackupPath(legacyDir);
   if (present.length > 0) {
     await fse15.ensureDir(backup);
-    await writeFile(path96.join(backup, ".gitignore"), BACKUP_GITIGNORE);
+    await writeFile(path97.join(backup, ".gitignore"), BACKUP_GITIGNORE);
   }
-  const move = (name) => fse15.move(path96.join(legacyDir, name), path96.join(backup, name));
+  const move = (name) => fse15.move(path97.join(legacyDir, name), path97.join(backup, name));
   for (const name of present) if (name !== "config.yaml") await move(name);
   if (!await queueSettled(legacyDir, partitionDir, previousOwner)) {
     log.warn(
-      `Kept ${path96.join(legacyDir, "config.yaml")} beside the learnings still queued in ${path96.join(legacyDir, SELF_LEGACY_QUEUE)}: it tells the next run which install queued them. The next init, pull or push tries again.`
+      `Kept ${path97.join(legacyDir, "config.yaml")} beside the learnings still queued in ${path97.join(legacyDir, SELF_LEGACY_QUEUE)}: it tells the next run which install queued them. The next init, pull or push tries again.`
     );
     return false;
   }
@@ -38875,7 +38959,7 @@ async function retireSupersededInstall(legacyDir, partitionDir, previousOwner) {
   return true;
 }
 async function holdsSelfKnowledge(dir) {
-  const content = await readFileSafe(path96.join(dir, "teamai.yaml"));
+  const content = await readFileSafe(path97.join(dir, "teamai.yaml"));
   if (!content) return false;
   try {
     const raw = YAML23.parse(content);
@@ -38887,12 +38971,12 @@ async function holdsSelfKnowledge(dir) {
 async function migrateSelfA1(legacyDir, partitionDir, legacyOwner) {
   await fse15.ensureDir(partitionDir);
   if (!await queueSettled(legacyDir, partitionDir, legacyOwner)) return false;
-  for (const name of SELF_STALE_ENTRIES) await remove(path96.join(legacyDir, name));
+  for (const name of SELF_STALE_ENTRIES) await remove(path97.join(legacyDir, name));
   const moved = [];
   for (const name of SELF_A1_ENTRIES) {
-    const src = path96.join(legacyDir, name);
+    const src = path97.join(legacyDir, name);
     if (!await pathExists(src)) continue;
-    const dest = path96.join(partitionDir, name);
+    const dest = path97.join(partitionDir, name);
     if (await pathExists(dest)) {
       if (await isDirectory2(src)) {
         await mergeDirIntoPartition(src, dest);
@@ -38923,7 +39007,7 @@ async function migrateSelfA1(legacyDir, partitionDir, legacyOwner) {
   return true;
 }
 async function settleCheckoutQueue(legacyDir, partitionDir, owner) {
-  const queue = path96.join(legacyDir, SELF_LEGACY_QUEUE);
+  const queue = path97.join(legacyDir, SELF_LEGACY_QUEUE);
   if (!await pathExists(queue)) return;
   const settled = await withQueueLock(partitionDir, () => settleByPartitionOwner(legacyDir, partitionDir, owner));
   if (settled.status === "busy") {
@@ -38933,8 +39017,8 @@ async function settleCheckoutQueue(legacyDir, partitionDir, owner) {
   }
 }
 async function settleByPartitionOwner(legacyDir, partitionDir, owner) {
-  const queue = path96.join(legacyDir, SELF_LEGACY_QUEUE);
-  const partition = await readPartitionState(partitionDir, path96.dirname(legacyDir));
+  const queue = path97.join(legacyDir, SELF_LEGACY_QUEUE);
+  const partition = await readPartitionState(partitionDir, path97.dirname(legacyDir));
   switch (partition.state) {
     case "absent":
       await drainLegacyQueue(legacyDir, partitionDir);
@@ -38959,28 +39043,28 @@ async function settleByPartitionOwner(legacyDir, partitionDir, owner) {
 }
 async function queueSettled(legacyDir, partitionDir, legacyOwner) {
   await settleCheckoutQueue(legacyDir, partitionDir, legacyOwner);
-  return !await holdsQueued(path96.join(legacyDir, SELF_LEGACY_QUEUE));
+  return !await holdsQueued(path97.join(legacyDir, SELF_LEGACY_QUEUE));
 }
 async function holdsQueued(queue) {
   return await countQueued(queue) > 0;
 }
 async function drainLegacyQueue(legacyDir, partitionDir) {
-  const src = path96.join(legacyDir, SELF_LEGACY_QUEUE);
+  const src = path97.join(legacyDir, SELF_LEGACY_QUEUE);
   if (!await pathExists(src)) return;
-  const dest = path96.join(partitionDir, SELF_LEGACY_QUEUE);
+  const dest = path97.join(partitionDir, SELF_LEGACY_QUEUE);
   const kept = [];
   let moved = 0;
   let placed = 0;
   for (const relPath of await listFilesRecursive(src)) {
-    const from = path96.join(src, relPath);
-    const to = path96.join(dest, relPath);
+    const from = path97.join(src, relPath);
+    const to = path97.join(dest, relPath);
     const content = await readFileIfExists(from);
     if (content === null) continue;
     const existing = await readFileIfExists(to);
     if (existing === null) {
       const tmp = `${to}.${process.pid}.tmp`;
       await remove(tmp);
-      await fse15.ensureDir(path96.dirname(to));
+      await fse15.ensureDir(path97.dirname(to));
       await fse15.writeFile(tmp, content);
       await fse15.rename(tmp, to);
       moved++;
@@ -38998,7 +39082,7 @@ async function drainLegacyQueue(legacyDir, partitionDir) {
   if (moved > 0) log.success(`Moved ${moved} queued learning(s) from ${src} to ${dest}.`);
   if (kept.length > 0) {
     log.warn(
-      `Kept ${kept.length} queued learning(s) in ${src}: ${dest} already has a different file under the same name (${kept.map((f) => path96.relative(src, f)).join(", ")}). Compare the two, delete the one you do not want, and the next init, pull or push moves what is left.`
+      `Kept ${kept.length} queued learning(s) in ${src}: ${dest} already has a different file under the same name (${kept.map((f) => path97.relative(src, f)).join(", ")}). Compare the two, delete the one you do not want, and the next init, pull or push moves what is left.`
     );
     return;
   }
@@ -39015,9 +39099,9 @@ async function mergeDirIntoPartition(src, dest) {
   await fse15.ensureDir(dest);
   const children = await fse15.readdir(src);
   for (const child of children) {
-    const childDest = path96.join(dest, child);
+    const childDest = path97.join(dest, child);
     if (await pathExists(childDest)) continue;
-    const childSrc = path96.join(src, child);
+    const childSrc = path97.join(src, child);
     const tmp = `${childDest}.${process.pid}.tmp`;
     await remove(tmp);
     await fse15.copy(childSrc, tmp, { overwrite: true });
@@ -39029,7 +39113,7 @@ async function listMigratableEntries(legacyDir) {
   return names.filter((n) => !isSkippedEntry(n));
 }
 async function verifyStaging(legacyDir, staging) {
-  const stagedConfig = path96.join(staging, "config.yaml");
+  const stagedConfig = path97.join(staging, "config.yaml");
   const content = await readFileSafe(stagedConfig);
   if (!content) throw new Error(`migration verify: ${stagedConfig} missing after copy`);
   try {
@@ -39037,10 +39121,10 @@ async function verifyStaging(legacyDir, staging) {
   } catch (e) {
     throw new Error(`migration verify: staged config.yaml is invalid (${e.message})`);
   }
-  const legacyGit = path96.join(legacyDir, "team-repo", ".git");
+  const legacyGit = path97.join(legacyDir, "team-repo", ".git");
   if (await pathExists(legacyGit)) {
-    const stagedRepo = path96.join(staging, "team-repo");
-    if (!await pathExists(path96.join(stagedRepo, ".git"))) {
+    const stagedRepo = path97.join(staging, "team-repo");
+    if (!await pathExists(path97.join(stagedRepo, ".git"))) {
       throw new Error("migration verify: team-repo/.git missing after copy (clone would be broken)");
     }
     try {
@@ -39055,7 +39139,7 @@ async function verifyStaging(legacyDir, staging) {
   }
   const expected = await listMigratableEntries(legacyDir);
   for (const name of expected) {
-    if (!await pathExists(path96.join(staging, name))) {
+    if (!await pathExists(path97.join(staging, name))) {
       throw new Error(`migration verify: ${name} missing after copy`);
     }
   }
@@ -39130,7 +39214,7 @@ __export(status_exports, {
   list: () => list,
   status: () => status
 });
-import path97 from "path";
+import path98 from "path";
 import YAML24 from "yaml";
 async function status(options) {
   if (options.all) {
@@ -39169,9 +39253,9 @@ async function status(options) {
   const repoPath = localConfig.repo.localPath;
   const counts = {};
   counts.skills = (await new SkillsHandler().scanTeamForPull(teamConfig, localConfig)).length;
-  const rulesFiles = (await listFilesRecursive(path97.join(repoPath, "rules"))).filter((f) => f.endsWith(".md"));
+  const rulesFiles = (await listFilesRecursive(path98.join(repoPath, "rules"))).filter((f) => f.endsWith(".md"));
   counts.rules = rulesFiles.length;
-  counts.docs = await new DocsHandler().countDocFiles(path97.join(repoPath, "docs"));
+  counts.docs = await new DocsHandler().countDocFiles(path98.join(repoPath, "docs"));
   const origins = {};
   const count = (type, resolution) => {
     counts[type] = resolution.kind === "resolved" ? resolution.entries.length : 0;
@@ -39226,12 +39310,12 @@ async function statusAll() {
   }
   let orphanCount = 0;
   for (const slug of slugs.sort()) {
-    const partitionDir = path97.join(root, slug);
+    const partitionDir = path98.join(root, slug);
     const anchor = await readAnchorFile(partitionDir);
     let projectPath = anchor;
     let scope;
     let kind;
-    const cfgRaw = await readFileSafe(path97.join(partitionDir, "config.yaml"));
+    const cfgRaw = await readFileSafe(path98.join(partitionDir, "config.yaml"));
     if (cfgRaw) {
       try {
         const parsed = LocalConfigSchema.parse(YAML24.parse(cfgRaw));
@@ -39475,7 +39559,7 @@ __export(skill_cmd_exports, {
   skillList: () => skillList,
   skillShow: () => skillShow
 });
-import path98 from "path";
+import path99 from "path";
 async function skillShow(name, options) {
   const team = await detectTeam();
   const served = await resolveServableSkill(name, void 0, team);
@@ -39493,7 +39577,7 @@ async function skillShow(name, options) {
     printSkillCard({
       name: served.skill.name,
       source: { kind: "builtin" },
-      description: truncate(await readSkillDescription(path98.join(served.skill.dir, "SKILL.md")), DESCRIPTION_MAX),
+      description: truncate(await readSkillDescription(path99.join(served.skill.dir, "SKILL.md")), DESCRIPTION_MAX),
       contributors: [],
       tags: [],
       primaryPath: served.skill.dir,
@@ -39524,7 +39608,7 @@ async function skillShow(name, options) {
   const resolved = located;
   const resolvedName = resolved.name;
   const source = resolved.primaryOrigin === "builtin" ? { kind: "builtin" } : classifySkill(resolvedName, await buildClassifyContext(localConfig));
-  const description = truncate(await readSkillDescription(path98.join(resolved.primaryPath, "SKILL.md")), DESCRIPTION_MAX);
+  const description = truncate(await readSkillDescription(path99.join(resolved.primaryPath, "SKILL.md")), DESCRIPTION_MAX);
   const contributors = await SkillsHandler.readContributors(resolved.primaryPath);
   const tagsConfig = await loadTagsConfig(localConfig.repo.localPath);
   const tags = tagsConfig?.skills?.[resolvedName] ?? [];
@@ -39542,7 +39626,7 @@ async function skillShow(name, options) {
   });
   if (options.verbose) {
     console.log("");
-    console.log(`  Verbose: SKILL.md path is ${path98.join(resolved.primaryPath, "SKILL.md")}`);
+    console.log(`  Verbose: SKILL.md path is ${path99.join(resolved.primaryPath, "SKILL.md")}`);
   }
 }
 async function skillList(options) {
@@ -39577,24 +39661,24 @@ async function skillList(options) {
   console.log("");
 }
 async function locateSkill(name, localConfig, agents, served) {
-  const teamSkillsDir = path98.join(localConfig.repo.localPath, "skills");
-  const flat = path98.join(teamSkillsDir, name);
-  if (await pathExists(path98.join(flat, "SKILL.md"))) {
+  const teamSkillsDir = path99.join(localConfig.repo.localPath, "skills");
+  const flat = path99.join(teamSkillsDir, name);
+  if (await pathExists(path99.join(flat, "SKILL.md"))) {
     return { kind: "found", name, primaryPath: flat, primaryOrigin: "team" };
   }
   if (await pathExists(teamSkillsDir)) {
     const namespaces = await listDirs(teamSkillsDir);
     for (const ns of namespaces) {
-      const candidate = path98.join(teamSkillsDir, ns, name);
-      if (await pathExists(path98.join(candidate, "SKILL.md"))) {
+      const candidate = path99.join(teamSkillsDir, ns, name);
+      if (await pathExists(path99.join(candidate, "SKILL.md"))) {
         return { kind: "found", name, primaryPath: candidate, primaryOrigin: "team", namespace: ns };
       }
     }
   }
   for (const agent of LEGACY_BUILTIN_SKILL_NAMES.has(name) ? [] : agents) {
     if (!agent.installed) continue;
-    const candidate = path98.join(agent.absoluteSkillsPath, name);
-    if (await pathExists(path98.join(candidate, "SKILL.md"))) {
+    const candidate = path99.join(agent.absoluteSkillsPath, name);
+    if (await pathExists(path99.join(candidate, "SKILL.md"))) {
       return { kind: "found", name, primaryPath: candidate, primaryOrigin: "agent" };
     }
   }
@@ -39608,8 +39692,8 @@ async function collectInstalledAgents(name, agents) {
   const matches = [];
   for (const agent of agents) {
     if (!agent.installed) continue;
-    const skillDir = path98.join(agent.absoluteSkillsPath, name);
-    if (await pathExists(path98.join(skillDir, "SKILL.md"))) {
+    const skillDir = path99.join(agent.absoluteSkillsPath, name);
+    if (await pathExists(path99.join(skillDir, "SKILL.md"))) {
       matches.push({ agent, path: skillDir });
     }
   }
@@ -40088,7 +40172,7 @@ __export(roles_cmd_exports, {
   rolesSet: () => rolesSet,
   rolesUpdate: () => rolesUpdate
 });
-import path99 from "path";
+import path100 from "path";
 import YAML25 from "yaml";
 function parseNamespaces(input) {
   return input.split(",").map((s) => s.trim()).filter(Boolean);
@@ -40098,7 +40182,7 @@ async function rolesInit(options) {
   const repoPath = localConfig.repo.localPath;
   const selfMode = localConfig.repo.kind === "self";
   if (!selfMode) await pullLatest(repoPath);
-  const manifestPath2 = path99.join(repoPath, "manifest", "roles.yaml");
+  const manifestPath2 = path100.join(repoPath, "manifest", "roles.yaml");
   if (await pathExists(manifestPath2)) {
     log.warn(`Roles manifest already exists at ${manifestPath2}`);
     const overwrite = await askConfirmation("Overwrite existing manifest? [y/N] ");
@@ -40169,7 +40253,7 @@ async function rolesInit(options) {
   const commitMsg = `[teamai] Initialize roles manifest with ${roles.length} role(s)`;
   await runManifestEdit(localConfig, "Roles", async (editRepoPath, editConfig) => {
     await saveRolesManifest(editRepoPath, manifest);
-    log.success(`Manifest written to ${path99.join(editRepoPath, "manifest", "roles.yaml")}`);
+    log.success(`Manifest written to ${path100.join(editRepoPath, "manifest", "roles.yaml")}`);
     await pushManifestChange({
       repoPath: editRepoPath,
       teamConfig,
@@ -40455,7 +40539,7 @@ __export(projects_cmd_exports, {
   projectsSet: () => projectsSet,
   projectsUpdate: () => projectsUpdate
 });
-import path100 from "path";
+import path101 from "path";
 import YAML26 from "yaml";
 function parseIds(input) {
   const flat = input.flatMap((s) => s.split(","));
@@ -40562,11 +40646,11 @@ async function projectsMembers(projectId, _options) {
   const members = [];
   const listed2 = /* @__PURE__ */ new Set();
   for (const root of memberReadRoots(membersRoot, localConfig)) {
-    const files = (await listFiles(path100.join(root, "members"))).filter((f) => f.endsWith(".yaml") || f.endsWith(".yml"));
+    const files = (await listFiles(path101.join(root, "members"))).filter((f) => f.endsWith(".yaml") || f.endsWith(".yml"));
     for (const file of files) {
       if (listed2.has(file)) continue;
       listed2.add(file);
-      const content = await readFileSafe(path100.join(root, "members", file));
+      const content = await readFileSafe(path101.join(root, "members", file));
       if (!content) continue;
       try {
         const member = MemberConfigSchema.parse(YAML26.parse(content));
@@ -40941,18 +41025,18 @@ var uninstall_exports = {};
 __export(uninstall_exports, {
   uninstall: () => uninstall
 });
-import path101 from "path";
+import path102 from "path";
 function hasToolResources(r) {
   return r.hookFiles.length > 0 || r.openclawHookDirs.length > 0 || r.opencodeHookScopes.length > 0 || r.ompHookFile !== null || r.piHookFiles.length > 0 || r.dshHookFile !== null || r.claudeMdFiles.length > 0 || r.skillDirs.length > 0 || r.ruleFiles.length > 0 || r.agentFiles.length > 0;
 }
 async function collectTeamSkillNames(repoPath) {
-  const teamSkillsDir = path101.join(repoPath, "skills");
+  const teamSkillsDir = path102.join(repoPath, "skills");
   if (!await pathExists(teamSkillsDir)) return /* @__PURE__ */ new Set();
   const names = /* @__PURE__ */ new Set();
   const topDirs = await listDirs(teamSkillsDir);
   for (const dir of topDirs) {
-    const dirPath = path101.join(teamSkillsDir, dir);
-    const hasSkillMd = await pathExists(path101.join(dirPath, "SKILL.md"));
+    const dirPath = path102.join(teamSkillsDir, dir);
+    const hasSkillMd = await pathExists(path102.join(dirPath, "SKILL.md"));
     if (hasSkillMd) {
       names.add(dir);
     } else {
@@ -40965,7 +41049,7 @@ async function collectTeamSkillNames(repoPath) {
   return names;
 }
 async function collectTeamRuleNames(repoPath) {
-  const teamRulesDir = path101.join(repoPath, "rules");
+  const teamRulesDir = path102.join(repoPath, "rules");
   if (!await pathExists(teamRulesDir)) return /* @__PURE__ */ new Set();
   const files = await listFilesRecursive(teamRulesDir);
   return new Set(
@@ -40973,7 +41057,7 @@ async function collectTeamRuleNames(repoPath) {
   );
 }
 async function collectTeamAgentNames(repoPath) {
-  const teamAgentsDir = path101.join(repoPath, "agents");
+  const teamAgentsDir = path102.join(repoPath, "agents");
   if (!await pathExists(teamAgentsDir)) return /* @__PURE__ */ new Set();
   const names = /* @__PURE__ */ new Set();
   for (const { dir } of await listTeamAgentDirs(teamAgentsDir)) {
@@ -40991,7 +41075,7 @@ function isEmptyHooksResidue(parsed) {
 function opencodePluginTargets(baseDir, scope) {
   const home = getUserHome();
   const targets = [{ baseDir: home, scope: "user" }];
-  if (scope === "project" && path101.resolve(baseDir) !== path101.resolve(home)) {
+  if (scope === "project" && path102.resolve(baseDir) !== path102.resolve(home)) {
     targets.push({ baseDir, scope: "project" });
   }
   return targets;
@@ -41011,7 +41095,7 @@ async function discoverToolResources(tool, toolPath, baseDir, scopeRoot, teamSki
   };
   if (managedStaticHosts && EXPLICIT_ONLY_HOSTS.has(normalizeHostId(tool))) return res;
   if (toolPath.hooks) {
-    const hooksPath = path101.join(baseDir, toolPath.hooks);
+    const hooksPath = path102.join(baseDir, toolPath.hooks);
     if (await pathExists(hooksPath) && (await hasTeamaiHooks(hooksPath, tool, standaloneHookManifestPath) || isEmptyHooksResidue(await readJson(hooksPath)))) {
       res.hookFiles.push({
         path: hooksPath,
@@ -41027,18 +41111,18 @@ async function discoverToolResources(tool, toolPath, baseDir, scopeRoot, teamSki
     const { resolveOpencodePluginDir: resolveOpencodePluginDir2, OPENCODE_HOOK_FILE: OPENCODE_HOOK_FILE2 } = await Promise.resolve().then(() => (init_opencode_hooks(), opencode_hooks_exports));
     for (const target of opencodePluginTargets(baseDir, scope)) {
       const pluginDir = resolveOpencodePluginDir2(target.baseDir, target.scope);
-      if (await pathExists(path101.join(pluginDir, OPENCODE_HOOK_FILE2))) {
+      if (await pathExists(path102.join(pluginDir, OPENCODE_HOOK_FILE2))) {
         res.opencodeHookScopes.push(target);
       } else if (await pathExists(pluginDir)) {
         const files = await listFilesRecursive(pluginDir);
-        if (files.some((f) => path101.basename(f).startsWith("teamai-agent-"))) {
+        if (files.some((f) => path102.basename(f).startsWith("teamai-agent-"))) {
           res.opencodeHookScopes.push(target);
         }
       }
     }
   } else if (tool === "omp") {
     const { resolveOmpExtensionsDir: resolveOmpExtensionsDir2, OMP_HOOK_FILE: OMP_HOOK_FILE2 } = await Promise.resolve().then(() => (init_omp_hooks(), omp_hooks_exports));
-    const extFile = path101.join(resolveOmpExtensionsDir2(), OMP_HOOK_FILE2);
+    const extFile = path102.join(resolveOmpExtensionsDir2(), OMP_HOOK_FILE2);
     if (await pathExists(extFile)) {
       res.ompHookFile = extFile;
     }
@@ -41051,64 +41135,64 @@ async function discoverToolResources(tool, toolPath, baseDir, scopeRoot, teamSki
       PI_HOOK_FILE: PI_HOOK_FILE2
     } = await Promise.resolve().then(() => (init_pi_hooks(), pi_hooks_exports));
     if (await hasPiHooks2()) {
-      res.piHookFiles.push(path101.join(resolvePiExtensionsDir2(), PI_HOOK_FILE2));
+      res.piHookFiles.push(path102.join(resolvePiExtensionsDir2(), PI_HOOK_FILE2));
     }
     for (const file of await listFiles(resolvePiExtensionsDir2())) {
-      const base = path101.basename(file);
+      const base = path102.basename(file);
       if (!base.startsWith("teamai-agent-") || !base.endsWith(".ts")) continue;
       const slug = base.slice("teamai-agent-".length, -".ts".length);
       if (await hasPiAgentHook2(slug)) {
-        res.piHookFiles.push(path101.join(resolvePiExtensionsDir2(), file));
+        res.piHookFiles.push(path102.join(resolvePiExtensionsDir2(), file));
       }
     }
-    if (path101.resolve(baseDir) !== path101.resolve(getUserHome()) && await hasPiHooks2(baseDir)) {
-      res.piHookFiles.push(path101.join(resolvePiProjectExtensionsDir2(baseDir), PI_HOOK_FILE2));
+    if (path102.resolve(baseDir) !== path102.resolve(getUserHome()) && await hasPiHooks2(baseDir)) {
+      res.piHookFiles.push(path102.join(resolvePiProjectExtensionsDir2(baseDir), PI_HOOK_FILE2));
     }
   } else if (toolPath.settings) {
     for (const { baseDir: hookBaseDir, manifestPath: manifestPath2 } of hookTargets) {
-      const settingsRel = path101.resolve(hookBaseDir) === path101.resolve(getUserHome()) ? hookSettingsPath ?? toolPath.settings : toolPath.settings;
-      const settingsPath = path101.join(hookBaseDir, settingsRel);
+      const settingsRel = path102.resolve(hookBaseDir) === path102.resolve(getUserHome()) ? hookSettingsPath ?? toolPath.settings : toolPath.settings;
+      const settingsPath = path102.join(hookBaseDir, settingsRel);
       if (await pathExists(settingsPath) && (await hasTeamaiHooks(settingsPath, tool, manifestPath2) || isEmptyHooksResidue(await readJson(settingsPath)))) {
         res.hookFiles.push({ path: settingsPath, tool, manifestPath: manifestPath2 });
       }
     }
   } else {
-    const defaultHooksDir = path101.join(baseDir, `.${tool}`, "hooks");
+    const defaultHooksDir = path102.join(baseDir, `.${tool}`, "hooks");
     const resolvedHooksDir = resolveOpenClawHooksDir(tool);
     const dirsToCheck = /* @__PURE__ */ new Set([defaultHooksDir, resolvedHooksDir]);
     const workspaceDir = await resolveOpenclawWorkspaceDir();
     if (workspaceDir) {
-      dirsToCheck.add(path101.join(workspaceDir, "hooks"));
+      dirsToCheck.add(path102.join(workspaceDir, "hooks"));
     }
     for (const hooksDir of dirsToCheck) {
-      if (await pathExists(path101.join(hooksDir, OPENCLAW_HOOK_DIR))) {
+      if (await pathExists(path102.join(hooksDir, OPENCLAW_HOOK_DIR))) {
         res.openclawHookDirs.push({ hooksDir, tool });
       }
     }
   }
   if (toolPath.claudemd) {
-    const claudeMdPath = path101.join(baseDir, toolPath.claudemd);
+    const claudeMdPath = path102.join(baseDir, toolPath.claudemd);
     const content = await readFileSafe(claudeMdPath);
     if (content && CLAUDEMD_MARKER_PAIRS.some(([start]) => content.includes(start))) {
       res.claudeMdFiles.push(claudeMdPath);
     }
   }
   if (toolPath.skills) {
-    const configuredSkills = path101.join(baseDir, toolPath.skills);
+    const configuredSkills = path102.join(baseDir, toolPath.skills);
     const skillRoots = /* @__PURE__ */ new Map([[configuredSkills, skillsGuardBase(scopeRoot, configuredSkills)]]);
     if (tool === "openclaw") {
       const workspaceDir = await resolveOpenclawWorkspaceDir();
       if (workspaceDir) {
-        const workspaceSkills = path101.join(workspaceDir, "skills");
+        const workspaceSkills = path102.join(workspaceDir, "skills");
         skillRoots.set(workspaceSkills, skillsGuardBase(scopeRoot, workspaceSkills));
       }
     }
     if (tool === "hermes") {
-      const hermesSkills = path101.join(getHermesHome(), "skills");
+      const hermesSkills = path102.join(getHermesHome(), "skills");
       skillRoots.set(hermesSkills, skillsGuardBase(scopeRoot, hermesSkills));
     }
     if (tool === CODEX_TOOL) {
-      const sharedSkills = path101.join(baseDir, SHARED_AGENT_SKILLS_PATH);
+      const sharedSkills = path102.join(baseDir, SHARED_AGENT_SKILLS_PATH);
       skillRoots.set(sharedSkills, skillsGuardBase(scopeRoot, sharedSkills));
     }
     for (const [skillsDir, rootBase] of skillRoots) {
@@ -41116,33 +41200,33 @@ async function discoverToolResources(tool, toolPath, baseDir, scopeRoot, teamSki
         const dirs = await listDirs(skillsDir);
         for (const dir of dirs) {
           if (teamSkillNames.has(dir)) {
-            res.skillDirs.push({ dir: path101.join(skillsDir, dir), baseDir: rootBase });
+            res.skillDirs.push({ dir: path102.join(skillsDir, dir), baseDir: rootBase });
           }
         }
       }
     }
   }
   if (toolPath.rules) {
-    const rulesDir = path101.join(baseDir, toolPath.rules);
+    const rulesDir = path102.join(baseDir, toolPath.rules);
     if (await pathExists(rulesDir)) {
       const files = await listFilesRecursive(rulesDir);
       for (const file of files) {
         const ruleName = ruleStemFromFilename(file);
         if (ruleName === null) continue;
         if (teamRuleNames.has(ruleName)) {
-          res.ruleFiles.push(path101.join(rulesDir, file));
+          res.ruleFiles.push(path102.join(rulesDir, file));
         }
       }
     }
   }
   if (toolPath.agents) {
-    const agentsDir = path101.join(baseDir, toolPath.agents);
+    const agentsDir = path102.join(baseDir, toolPath.agents);
     if (await pathExists(agentsDir)) {
       for (const file of await listFiles(agentsDir)) {
-        const name = agentStemFromFilename(path101.basename(file));
+        const name = agentStemFromFilename(path102.basename(file));
         if (name === null) continue;
         if (!teamAgentNames.has(name) && !BUILTIN_AGENT_NAMES.has(name)) continue;
-        res.agentFiles.push(path101.join(agentsDir, file));
+        res.agentFiles.push(path102.join(agentsDir, file));
       }
     }
   }
@@ -41162,7 +41246,7 @@ async function buildRemovalPlan(localConfig, teamConfig, agentFilter) {
   const teamRuleNames = await collectTeamRuleNames(repoPath);
   for (const name of BUILTIN_RULE_NAMES) teamRuleNames.add(name);
   const teamAgentNames = await collectTeamAgentNames(repoPath);
-  const localAgentManifestPath = path101.join(
+  const localAgentManifestPath = path102.join(
     getUserHome(),
     ".teamai",
     "local-agent",
@@ -41288,10 +41372,10 @@ async function buildRemovalPlan(localConfig, teamConfig, agentFilter) {
     plan.mcpServers.sort();
     const configuredProfilePath = teamConfig.sharing.env.shellProfilePath ? expandHome(teamConfig.sharing.env.shellProfilePath) : await detectShellProfile();
     const home = getUserHome();
-    const envShPath = path101.join(getDataHome(localConfig), "env.sh");
+    const envShPath = path102.join(getDataHome(localConfig), "env.sh");
     const candidateProfilePaths = Array.from(/* @__PURE__ */ new Set([
       configuredProfilePath,
-      ...SHELL_PROFILE_CANDIDATE_NAMES.map((name) => path101.join(home, name))
+      ...SHELL_PROFILE_CANDIDATE_NAMES.map((name) => path102.join(home, name))
     ]));
     for (const candidate of candidateProfilePaths) {
       const profileContent = await readFileSafe(candidate);
@@ -41328,15 +41412,15 @@ function printSummary(plan, agentFilter) {
   if (plan.openclawHookDirs.length > 0) {
     console.log(`   OpenClaw Hooks (${plan.openclawHookDirs.length} directories):`);
     for (const { hooksDir } of plan.openclawHookDirs) {
-      console.log(`     ${path101.join(hooksDir, OPENCLAW_HOOK_DIR)}/`);
+      console.log(`     ${path102.join(hooksDir, OPENCLAW_HOOK_DIR)}/`);
     }
     console.log("");
   }
   if (plan.opencodeHookScopes.length > 0) {
     console.log(`   OpenCode Hooks (${plan.opencodeHookScopes.length} plugin dirs):`);
     for (const { baseDir, scope } of plan.opencodeHookScopes) {
-      const configDir = scope === "project" ? ".opencode" : path101.join(".config", "opencode");
-      console.log(`     ${path101.join(baseDir, configDir, "plugin")}/teamai-*.ts`);
+      const configDir = scope === "project" ? ".opencode" : path102.join(".config", "opencode");
+      console.log(`     ${path102.join(baseDir, configDir, "plugin")}/teamai-*.ts`);
     }
     console.log("");
   }
@@ -41365,7 +41449,7 @@ function printSummary(plan, agentFilter) {
   if (plan.skillDirs.length > 0) {
     console.log(`   Skills (${plan.skillDirs.length} directories):`);
     for (const { dir: skillDir } of plan.skillDirs) {
-      const suffix = isCliOwnedSkillName(path101.basename(skillDir)) ? "   (TeamAI-packaged files only; anything you added stays)" : "";
+      const suffix = isCliOwnedSkillName(path102.basename(skillDir)) ? "   (TeamAI-packaged files only; anything you added stays)" : "";
       console.log(`     ${skillDir}${suffix}`);
     }
     console.log("");
@@ -41444,7 +41528,7 @@ async function executeRemoval(plan) {
       const pluginDir = resolveOpencodePluginDir2(baseDir, scope);
       if (await pathExists(pluginDir)) {
         for (const rel of await listFilesRecursive(pluginDir)) {
-          if (path101.basename(rel).startsWith("teamai-agent-")) await remove(path101.join(pluginDir, rel));
+          if (path102.basename(rel).startsWith("teamai-agent-")) await remove(path102.join(pluginDir, rel));
         }
       }
     } catch (e) {
@@ -41510,7 +41594,7 @@ async function executeRemoval(plan) {
   const failedSkillDirs = [];
   for (const { dir: skillDir, baseDir } of plan.skillDirs) {
     try {
-      const name = path101.basename(skillDir);
+      const name = path102.basename(skillDir);
       if (isCliOwnedSkillName(name)) {
         const result = await removeOwnedFiles(skillDir, await ownedSkillFiles(name), baseDir);
         if (prunedWhole(result)) removedSkillDirs++;
@@ -41557,7 +41641,7 @@ async function executeRemoval(plan) {
   if (plan.agentFiles.length > 0) {
     log.success(`Removed ${plan.agentFiles.length} agent files`);
   }
-  const envShPath = path101.join(plan.teamaiHome, "env.sh");
+  const envShPath = path102.join(plan.teamaiHome, "env.sh");
   for (const profilePath of plan.shellProfiles) {
     try {
       const content = await readFileSafe(profilePath);
@@ -41628,9 +41712,9 @@ async function uninstall(opts) {
     const lifecyclePlan = await uninstallManagedResources(lifecycleHome, { tool: agentKey, plan: true });
     const managedPaths = await managedManifestTargetPaths(lifecycleHome);
     const plan = await buildRemovalPlan(localConfig, teamConfig, agentKey);
-    plan.skillDirs = plan.skillDirs.filter((entry) => !managedPaths.has(path101.resolve(entry.dir)));
-    plan.agentFiles = plan.agentFiles.filter((entry) => !managedPaths.has(path101.resolve(entry)));
-    plan.claudeMdFiles = plan.claudeMdFiles.filter((entry) => !managedPaths.has(path101.resolve(entry)));
+    plan.skillDirs = plan.skillDirs.filter((entry) => !managedPaths.has(path102.resolve(entry.dir)));
+    plan.agentFiles = plan.agentFiles.filter((entry) => !managedPaths.has(path102.resolve(entry)));
+    plan.claudeMdFiles = plan.claudeMdFiles.filter((entry) => !managedPaths.has(path102.resolve(entry)));
     const hasTargetConfigState = agentKey && (localConfig.enabledAgents?.map(normalizeHostId).includes(agentKey) || localConfig.hostRoots?.[normalizeHostId(agentKey)]);
     if (isPlanEmpty(plan) && lifecyclePlan.planned.length === 0 && lifecyclePlan.conflicts.length === 0 && !hasTargetConfigState) {
       log.info("Nothing to uninstall");
@@ -41733,7 +41817,7 @@ async function uninstall(opts) {
       process.exitCode = 2;
       return;
     }
-    const home = path101.join(getUserHome(), ".teamai");
+    const home = path102.join(getUserHome(), ".teamai");
     if (!await pathExists(home)) {
       log.info("Nothing to uninstall");
       return;
@@ -41994,11 +42078,11 @@ __export(hooks_cmd_exports, {
   hooksList: () => hooksList,
   hooksRemove: () => hooksRemove
 });
-import path102 from "path";
+import path103 from "path";
 function formatDisplayPath(settingsPath) {
   const home = getUserHome();
   if (settingsPath === home) return "~";
-  if (settingsPath.startsWith(home + path102.sep) || settingsPath.startsWith(home + "/")) {
+  if (settingsPath.startsWith(home + path103.sep) || settingsPath.startsWith(home + "/")) {
     return `~${settingsPath.slice(home.length)}`;
   }
   return settingsPath;
@@ -42020,11 +42104,11 @@ function formatHooksList(rows) {
 async function adapterHookArtifacts(tool) {
   if (tool === "omp") {
     const { resolveOmpExtensionsDir: resolveOmpExtensionsDir2, OMP_HOOK_FILE: OMP_HOOK_FILE2 } = await Promise.resolve().then(() => (init_omp_hooks(), omp_hooks_exports));
-    return [path102.join(resolveOmpExtensionsDir2(), OMP_HOOK_FILE2)];
+    return [path103.join(resolveOmpExtensionsDir2(), OMP_HOOK_FILE2)];
   }
   if (tool === "opencode") {
     const { resolveOpencodePluginDir: resolveOpencodePluginDir2, OPENCODE_HOOK_FILE: OPENCODE_HOOK_FILE2 } = await Promise.resolve().then(() => (init_opencode_hooks(), opencode_hooks_exports));
-    return [path102.join(resolveOpencodePluginDir2(getUserHome(), "user"), OPENCODE_HOOK_FILE2)];
+    return [path103.join(resolveOpencodePluginDir2(getUserHome(), "user"), OPENCODE_HOOK_FILE2)];
   }
   if (tool === "hermes") {
     const { getReportScriptPath: getReportScriptPath2 } = await Promise.resolve().then(() => (init_hermes_hooks(), hermes_hooks_exports));
@@ -42034,8 +42118,8 @@ async function adapterHookArtifacts(tool) {
     const { resolveOpenclawWorkspaceDir: resolveOpenclawWorkspaceDir2, OPENCLAW_HOOK_DIR: OPENCLAW_HOOK_DIR2 } = await Promise.resolve().then(() => (init_openclaw_hooks(), openclaw_hooks_exports));
     const workspace = await resolveOpenclawWorkspaceDir2();
     if (!workspace) return null;
-    const dir = path102.join(workspace, "hooks", OPENCLAW_HOOK_DIR2);
-    return [path102.join(dir, "HOOK.md"), path102.join(dir, "handler.ts")];
+    const dir = path103.join(workspace, "hooks", OPENCLAW_HOOK_DIR2);
+    return [path103.join(dir, "HOOK.md"), path103.join(dir, "handler.ts")];
   }
   return null;
 }
@@ -42072,7 +42156,7 @@ async function hooksList(_options) {
   for (const [tool, paths] of Object.entries(scopedToolPaths(teamConfig, localConfig))) {
     if (isAgentExcluded(localConfig, tool)) continue;
     if (tool === "pi") {
-      const hookPath2 = path102.join(resolvePiExtensionsDir(), PI_HOOK_FILE);
+      const hookPath2 = path103.join(resolvePiExtensionsDir(), PI_HOOK_FILE);
       rows.push({
         tool,
         status: await hasPiHooks() ? "installed" : "missing",
@@ -42081,7 +42165,7 @@ async function hooksList(_options) {
       });
       continue;
     }
-    const hookPath = paths.hooks ? path102.join(resolveToolBaseDir(tool, localConfig), paths.hooks) : hookScopedPaths[tool]?.settings ? path102.join(baseDir, hookScopedPaths[tool].settings) : void 0;
+    const hookPath = paths.hooks ? path103.join(resolveToolBaseDir(tool, localConfig), paths.hooks) : hookScopedPaths[tool]?.settings ? path103.join(baseDir, hookScopedPaths[tool].settings) : void 0;
     if (hookPath) {
       if (seenSettingsFiles.has(hookPath)) continue;
       seenSettingsFiles.add(hookPath);
@@ -42167,7 +42251,7 @@ async function hooksRemove(_options) {
   const copilotPaths = scopedToolPaths(teamConfig, localConfig)[COPILOT_TOOL_ID];
   if (copilotPaths?.hooks) {
     await reconcileHooks(
-      path102.join(resolveToolBaseDir(COPILOT_TOOL_ID, localConfig), copilotPaths.hooks),
+      path103.join(resolveToolBaseDir(COPILOT_TOOL_ID, localConfig), copilotPaths.hooks),
       COPILOT_TOOL_ID,
       [],
       {
@@ -42205,10 +42289,10 @@ __export(mcp_cmd_exports, {
   mcpList: () => mcpList,
   mcpRemove: () => mcpRemove
 });
-import path103 from "path";
+import path104 from "path";
 function displayPath(p) {
   const home = getUserHome();
-  if (p === home || p.startsWith(home + path103.sep)) return `~${p.slice(home.length)}`;
+  if (p === home || p.startsWith(home + path104.sep)) return `~${p.slice(home.length)}`;
   return p;
 }
 async function mcpList(_options) {
@@ -42307,7 +42391,7 @@ var init_mcp_cmd = __esm({
 
 // src/session-collector.ts
 import fs41 from "fs";
-import path104 from "path";
+import path105 from "path";
 function isValuable(summary) {
   return summary.interventionCount > 0 || summary.distinctTools >= SUBSTANTIAL_TOOL_COUNT;
 }
@@ -42390,7 +42474,7 @@ function monthKey(summary) {
 async function appendMonthlyLog(dir, summary, options = {}) {
   await ensureDir(dir);
   const month = monthKey(summary);
-  const file = path104.join(dir, `${month}.md`);
+  const file = path105.join(dir, `${month}.md`);
   const block = renderSessionMarkdown(summary, options);
   const marker = `<!-- teamai:session ${summary.sessionId} -->`;
   let existing = "";
@@ -42420,7 +42504,7 @@ async function pruneMonthlyLogs(dir, now, retentionDays = 90) {
     const monthEnd = new Date(Date.UTC(Number(m[1]), Number(m[2]), 0, 23, 59, 59));
     if (monthEnd.getTime() < cutoff) {
       try {
-        await fs41.promises.unlink(path104.join(dir, entry));
+        await fs41.promises.unlink(path105.join(dir, entry));
         removed.push(entry);
       } catch {
       }
@@ -42447,7 +42531,7 @@ var save_session_exports = {};
 __export(save_session_exports, {
   saveSession: () => saveSession
 });
-import path105 from "path";
+import path106 from "path";
 function mostRecentSessionId(events) {
   let best;
   for (const e of events) {
@@ -42532,10 +42616,10 @@ async function saveSession(options) {
       const pushed = await withTimeout(
         updateReports2(localConfig, async (wt) => {
           ran = true;
-          const teamDir2 = path105.join(wt, "sessions", username);
+          const teamDir2 = path106.join(wt, "sessions", username);
           const written = await appendMonthlyLog(teamDir2, summary, { includePrompt: options.includePrompt });
           if (!written) return null;
-          rel = path105.relative(wt, written);
+          rel = path106.relative(wt, written);
           return { files: [rel], message: commitMsg };
         }),
         1e4,
@@ -42554,7 +42638,7 @@ async function saveSession(options) {
     return;
   }
   const repoPath = localConfig.repo.localPath;
-  const teamDir = path105.join(repoPath, "sessions", username);
+  const teamDir = path106.join(repoPath, "sessions", username);
   const spin = spinner("Pushing session summary to team...").start();
   try {
     try {
@@ -42567,7 +42651,7 @@ async function saveSession(options) {
       spin.info("Session already present in the team log \u2014 nothing to push.");
       return;
     }
-    const rel = path105.relative(repoPath, written);
+    const rel = path106.relative(repoPath, written);
     await withTimeout(pushRepoDirectly(repoPath, commitMsg, [rel]), 1e4, "Push timeout (10s)");
     spin.succeed(`Pushed: ${rel}`);
   } catch (e) {
@@ -42592,12 +42676,12 @@ var init_save_session = __esm({
 
 // src/dashboard/workspaces.ts
 import fs42 from "fs/promises";
-import path106 from "path";
+import path107 from "path";
 import { createHash as createHash10 } from "crypto";
 import YAML27 from "yaml";
 async function configAt(home) {
   try {
-    return LocalConfigSchema.parse(YAML27.parse(await fs42.readFile(path106.join(home, "config.yaml"), "utf8")));
+    return LocalConfigSchema.parse(YAML27.parse(await fs42.readFile(path107.join(home, "config.yaml"), "utf8")));
   } catch {
     return null;
   }
@@ -42612,7 +42696,7 @@ function ownerOf(event, projects) {
   return matches.sort((a, b) => Math.max(...b.roots.filter((root) => inside(cwd, root)).map((root) => root.length)) - Math.max(...a.roots.filter((root) => inside(cwd, root)).map((root) => root.length)))[0].id;
 }
 async function dashboardWorkspaces(events) {
-  const home = path106.join(getUserHome(), ".teamai");
+  const home = path107.join(getUserHome(), ".teamai");
   const user = await configAt(home);
   const result = [{ id: "user", label: "User scope", scope: "user", root: getUserHome(), config: user, roots: [] }];
   const seen = /* @__PURE__ */ new Set();
@@ -42624,29 +42708,29 @@ async function dashboardWorkspaces(events) {
     seen.add(root);
     result.push({
       id: createHash10("sha256").update(root).digest("hex").slice(0, 24),
-      label: path106.basename(root),
+      label: path107.basename(root),
       scope: "project",
       root,
       config,
       roots: [.../* @__PURE__ */ new Set([root, ...await listWorktrees(root).catch(() => [])])]
     });
   }
-  const partitions = path106.join(home, "projects");
+  const partitions = path107.join(home, "projects");
   for (const entry of await fs42.readdir(partitions, { withFileTypes: true }).catch(() => [])) {
     if (!entry.isDirectory()) continue;
-    const dataHome = path106.join(partitions, entry.name);
-    const root = (await fs42.readFile(path106.join(dataHome, "anchor"), "utf8").catch(() => "")).trim();
-    if (path106.isAbsolute(root)) await add(root, dataHome);
+    const dataHome = path107.join(partitions, entry.name);
+    const root = (await fs42.readFile(path107.join(dataHome, "anchor"), "utf8").catch(() => "")).trim();
+    if (path107.isAbsolute(root)) await add(root, dataHome);
   }
   for (const anchor of new Set(events.flatMap((event) => event.projectAnchor ? [event.projectAnchor] : []))) {
-    await add(anchor, path106.join(anchor, ".teamai"));
+    await add(anchor, path107.join(anchor, ".teamai"));
   }
   const unnamed = events.filter((event) => !event.projectAnchor || !seen.has(event.projectAnchor));
   for (const cwd of /* @__PURE__ */ new Set([process.cwd(), ...unnamed.map((event) => event.cwd).filter(Boolean)])) {
     const anchors = await resolveAnchors(cwd).catch(() => null);
     if (anchors) {
-      await add(anchors.projectAnchor, path106.join(anchors.workspaceRoot, ".teamai"));
-    } else if (cwd) await add(cwd, path106.join(cwd, ".teamai"));
+      await add(anchors.projectAnchor, path107.join(anchors.workspaceRoot, ".teamai"));
+    } else if (cwd) await add(cwd, path107.join(cwd, ".teamai"));
   }
   const projects = result.filter((w) => w.scope === "project");
   if (events.some((event) => event.cwd && !ownerOf(event, projects))) {
@@ -42672,7 +42756,7 @@ var init_workspaces = __esm({
     init_home();
     init_git2();
     init_config();
-    inside = (cwd, root) => cwd === root || cwd.startsWith(root + path106.sep);
+    inside = (cwd, root) => cwd === root || cwd.startsWith(root + path107.sep);
   }
 });
 
@@ -43374,7 +43458,7 @@ var init_ai_client = __esm({
 });
 
 // src/maintenance/promote.ts
-import path107 from "path";
+import path108 from "path";
 import matter7 from "gray-matter";
 async function findPromotionCandidates(learningsDirs, votesDir) {
   const confidenceMap = await computeAllConfidence(votesDir);
@@ -43461,9 +43545,9 @@ Output ONLY the transformed markdown content (including YAML frontmatter with ti
 }
 async function executePromotion(candidate, repoPath, options = {}) {
   const category = options.category ?? candidate.suggestedCategory;
-  const targetDir = path107.join(repoPath, category);
+  const targetDir = path108.join(repoPath, category);
   await ensureDir(targetDir);
-  const targetPath = path107.join(targetDir, candidate.filename);
+  const targetPath = path108.join(targetDir, candidate.filename);
   if (options.dryRun) {
     log.info(`[dry-run] Would promote ${candidate.docId} -> ${category}/${candidate.filename}`);
     return { targetPath, marked: null };
@@ -43478,8 +43562,8 @@ async function executePromotion(candidate, repoPath, options = {}) {
   const { data, content: body } = matter7(originalContent);
   data.promoted_to = `${category}/${candidate.filename}`;
   const updated = matter7.stringify(body, data);
-  const markPath = options.learningsWriteDir && !isInWriteRoot(candidate.path, options.learningsWriteDir) ? path107.join(options.learningsWriteDir, candidate.filename) : candidate.path;
-  await ensureDir(path107.dirname(markPath));
+  const markPath = options.learningsWriteDir && !isInWriteRoot(candidate.path, options.learningsWriteDir) ? path108.join(options.learningsWriteDir, candidate.filename) : candidate.path;
+  await ensureDir(path108.dirname(markPath));
   await writeFile(markPath, updated);
   log.success(`Promoted: ${candidate.docId} -> ${category}/${candidate.filename}`);
   return { targetPath, marked: markPath };
@@ -43527,7 +43611,7 @@ async function aggregatePerDocVotes(votesDir) {
   for (const file of voteFiles) {
     if (!file.endsWith(".yaml") && !file.endsWith(".yml")) continue;
     const username = file.replace(/\.(yaml|yml)$/, "");
-    const filePath = path107.join(votesDir, file);
+    const filePath = path108.join(votesDir, file);
     try {
       const data = await loadUserVotes2(filePath);
       for (const [docId, entry] of Object.entries(data.votes)) {
@@ -43559,7 +43643,7 @@ var init_promote = __esm({
 });
 
 // src/maintenance/prune.ts
-import path108 from "path";
+import path109 from "path";
 import matter8 from "gray-matter";
 async function findPruneCandidates(learningsDirs, votesDir, options = {}) {
   const threshold = options.threshold ?? DEFAULT_THRESHOLD;
@@ -43616,9 +43700,9 @@ async function executePrune(learningsWriteDir, candidates, options = {}) {
       continue;
     }
     if (options.archive) {
-      const archiveDir = path108.join(learningsWriteDir, "_archive");
+      const archiveDir = path109.join(learningsWriteDir, "_archive");
       await ensureDir(archiveDir);
-      const archivedCopy = path108.join(archiveDir, candidate.filename);
+      const archivedCopy = path109.join(archiveDir, candidate.filename);
       await copyFile(candidate.path, archivedCopy);
       await remove(candidate.path);
       changed.push(candidate.path, archivedCopy);
@@ -43652,7 +43736,7 @@ var init_prune = __esm({
 });
 
 // src/maintenance/quality-update.ts
-import path109 from "path";
+import path110 from "path";
 async function findStaleEntries(votesDir, knowledgeDirs, options = {}) {
   const minRecalled = options.minRecalled ?? DEFAULT_MIN_RECALLED;
   const maxUpvoted = options.maxUpvoted ?? DEFAULT_MAX_UPVOTED;
@@ -43662,7 +43746,7 @@ async function findStaleEntries(votesDir, knowledgeDirs, options = {}) {
   for (const file of voteFiles) {
     if (!file.endsWith(".yaml") && !file.endsWith(".yml")) continue;
     const username = file.replace(/\.(yaml|yml)$/, "");
-    const filePath = path109.join(votesDir, file);
+    const filePath = path110.join(votesDir, file);
     try {
       const data = await loadUserVotes(filePath);
       for (const [docId, entry] of Object.entries(data.votes)) {
@@ -43699,7 +43783,7 @@ async function resolveDocPath(docId, dirs) {
   const filename = docId.endsWith(".md") ? docId : `${docId}.md`;
   for (const dir of [dirs.docs, dirs.rules, dirs.skills]) {
     if (!dir) continue;
-    const candidate = path109.join(dir, filename);
+    const candidate = path110.join(dir, filename);
     if (await pathExists(candidate)) return candidate;
   }
   return null;
@@ -43722,7 +43806,7 @@ async function findRelatedAdoptedLearnings(staleEntry, votesDir, learningsDirs, 
   for (const file of voteFiles) {
     if (!file.endsWith(".yaml") && !file.endsWith(".yml")) continue;
     try {
-      const data = await loadUserVotes(path109.join(votesDir, file));
+      const data = await loadUserVotes(path110.join(votesDir, file));
       for (const [docId, entry] of Object.entries(data.votes)) {
         if (docId === staleEntry.docId) continue;
         if ((entry.upvoted_count ?? 0) > 0) {
@@ -44420,23 +44504,23 @@ __export(viz_exports, {
   resolveVizRoot: () => resolveVizRoot
 });
 import { promises as fs43 } from "fs";
-import path110 from "path";
+import path111 from "path";
 import os11 from "os";
 async function resolveVizRoot(opts) {
   if (opts.repo) {
-    const root = path110.resolve(opts.repo);
+    const root = path111.resolve(opts.repo);
     return {
       root,
       knowledgeRoot: root,
-      votesDir: path110.join(root, "votes"),
+      votesDir: path111.join(root, "votes"),
       // learnings-root ok: an explicit --repo path, with no config to resolve
-      learningsDir: path110.join(root, "learnings"),
+      learningsDir: path111.join(root, "learnings"),
       // learnings-root ok: same explicit --repo path
-      learningsDirs: [path110.join(root, "learnings")],
+      learningsDirs: [path111.join(root, "learnings")],
       // learnings-root ok: same explicit --repo path
-      indexLearningsDirs: [path110.join(root, "learnings")],
+      indexLearningsDirs: [path111.join(root, "learnings")],
       learningsNamespaces: { ok: true, namespaces: [] },
-      statsDir: path110.join(root, "stats"),
+      statsDir: path111.join(root, "stats"),
       indexPath: void 0,
       source: { scope: "team", label: "Team repo \xB7 aggregated across the team" }
     };
@@ -44471,12 +44555,12 @@ async function resolveVizRoot(opts) {
     return {
       root: knowledgeRoot,
       knowledgeRoot,
-      votesDir: path110.join(reportsRoot, "votes"),
+      votesDir: path111.join(reportsRoot, "votes"),
       learningsDir,
       learningsDirs,
       indexLearningsDirs,
       learningsNamespaces,
-      statsDir: path110.join(reportsRoot, "stats"),
+      statsDir: path111.join(reportsRoot, "stats"),
       indexPath,
       source
     };
@@ -44490,7 +44574,7 @@ async function resolveVizRoot(opts) {
     learningsDirs: [getUserLearningsDir()],
     indexLearningsDirs: [getUserLearningsDir()],
     learningsNamespaces: { ok: true, namespaces: [] },
-    statsDir: path110.join(teamaiHome, "stats"),
+    statsDir: path111.join(teamaiHome, "stats"),
     indexPath: getUserSearchIndexPath(),
     source: { scope: "local", label: "Local ~/.teamai \xB7 your recalls only" }
   };
@@ -44510,7 +44594,7 @@ async function aggregateTeamVotes(votesDir) {
   const byDoc = {};
   let activeContributors = 0;
   for (const file of files) {
-    const fullPath = path110.join(votesDir, file);
+    const fullPath = path111.join(votesDir, file);
     const userVotes = await loadUserVotes(fullPath);
     let userHasRecall = false;
     for (const [docId, entry] of Object.entries(userVotes.votes)) {
@@ -44532,8 +44616,8 @@ async function aggregateTeamVotes(votesDir) {
 async function loadEntries(paths) {
   let index = paths.indexPath ? await loadIndex(paths.indexPath) : null;
   if (!index || index.entries.length === 0) {
-    const tmpDir = await fs43.mkdtemp(path110.join(os11.tmpdir(), "teamai-viz-"));
-    const tmpIndexPath = path110.join(tmpDir, "index.json");
+    const tmpDir = await fs43.mkdtemp(path111.join(os11.tmpdir(), "teamai-viz-"));
+    const tmpIndexPath = path111.join(tmpDir, "index.json");
     const namespaces = paths.learningsNamespaces;
     if (!namespaces.ok) {
       console.warn(`Warning: the report shows the shared learnings only: ${namespaces.reason}. Your projects' learnings are left out until manifest/projects.yaml is fixed; \`teamai doctor\` shows the problem.`);
@@ -44542,9 +44626,9 @@ async function loadEntries(paths) {
       await buildIndex({
         learningsDirs: paths.indexLearningsDirs,
         learningsNamespaces: namespaces.ok ? namespaces.namespaces : [],
-        docsDir: path110.join(paths.knowledgeRoot, "docs"),
-        rulesDir: path110.join(paths.knowledgeRoot, "rules"),
-        skillsDir: path110.join(paths.knowledgeRoot, "skills"),
+        docsDir: path111.join(paths.knowledgeRoot, "docs"),
+        rulesDir: path111.join(paths.knowledgeRoot, "rules"),
+        skillsDir: path111.join(paths.knowledgeRoot, "skills"),
         votesDir: paths.votesDir,
         indexPath: tmpIndexPath
       });
@@ -44633,9 +44717,9 @@ async function buildVizData(paths) {
       return [];
     }),
     findStaleEntries(paths.votesDir, {
-      docs: path110.join(paths.knowledgeRoot, "docs"),
-      rules: path110.join(paths.knowledgeRoot, "rules"),
-      skills: path110.join(paths.knowledgeRoot, "skills")
+      docs: path111.join(paths.knowledgeRoot, "docs"),
+      rules: path111.join(paths.knowledgeRoot, "rules"),
+      skills: path111.join(paths.knowledgeRoot, "skills")
     }).catch((err) => {
       console.warn(`Warning: could not load stale entries: ${err.message}`);
       return [];
@@ -44710,11 +44794,11 @@ __export(dashboard_exports, {
 });
 import http from "http";
 import fs44 from "fs";
-import path111 from "path";
+import path112 from "path";
 async function startDashboard(port) {
   const serverPort = port ?? DASHBOARD_DEFAULT_PORT;
-  const eventsPath = path111.join(getUserHome(), ".teamai", "dashboard", "events.jsonl");
-  await ensureDir(path111.dirname(eventsPath));
+  const eventsPath = path112.join(getUserHome(), ".teamai", "dashboard", "events.jsonl");
+  await ensureDir(path112.dirname(eventsPath));
   try {
     await fs44.promises.access(eventsPath);
   } catch {
@@ -44754,8 +44838,8 @@ async function startDashboard(port) {
     }
   };
   let watchDebounce = null;
-  const eventsFileName = path111.basename(eventsPath);
-  const watcher = fs44.watch(path111.dirname(eventsPath), (_eventType, filename) => {
+  const eventsFileName = path112.basename(eventsPath);
+  const watcher = fs44.watch(path112.dirname(eventsPath), (_eventType, filename) => {
     if (filename && filename.toString() !== eventsFileName) return;
     if (watchDebounce) clearTimeout(watchDebounce);
     watchDebounce = setTimeout(() => void pushSessions(), 200);
@@ -45088,7 +45172,7 @@ __export(pkg_hint_exports, {
   takePendingPackageHint: () => takePendingPackageHint
 });
 import fs45 from "fs";
-import path112 from "path";
+import path113 from "path";
 function buildPackageHintMessage(npmCount, claudeCount, marketplaceCount = 0) {
   const summary = [
     npmCount > 0 ? `${npmCount} npm package${npmCount === 1 ? "" : "s"}` : "",
@@ -45157,21 +45241,21 @@ function sanitizeSessionId3(sessionId) {
   return sessionId.replace(/[^a-zA-Z0-9._-]/g, "_");
 }
 function packageHintDir() {
-  return path112.join(getUserHome(), ".teamai", "package-hints");
+  return path113.join(getUserHome(), ".teamai", "package-hints");
 }
 function claimPath(sessionId, manifestHash) {
-  return path112.join(
+  return path113.join(
     packageHintDir(),
     `${sanitizeSessionId3(sessionId)}.${manifestHash.slice(0, 16)}.claimed`
   );
 }
 function pendingPath(sessionId) {
-  return path112.join(packageHintDir(), `${sanitizeSessionId3(sessionId)}.pending.json`);
+  return path113.join(packageHintDir(), `${sanitizeSessionId3(sessionId)}.pending.json`);
 }
 async function claimPackageHint(sessionId, manifestHash) {
   const filePath = claimPath(sessionId, manifestHash);
   try {
-    await ensureDir(path112.dirname(filePath));
+    await ensureDir(path113.dirname(filePath));
     await fs45.promises.writeFile(filePath, "{}\n", { encoding: "utf-8", flag: "wx" });
     return true;
   } catch (error) {
@@ -45233,11 +45317,11 @@ var project_agent_root_exports = {};
 __export(project_agent_root_exports, {
   seedProjectAgentRoot: () => seedProjectAgentRoot
 });
-import path113 from "path";
+import path114 from "path";
 function isSafeRelativeRoot(root) {
   if (!root) return false;
   const posix = root.replaceAll("\\", "/");
-  if (path113.isAbsolute(root) || path113.isAbsolute(posix)) return false;
+  if (path114.isAbsolute(root) || path114.isAbsolute(posix)) return false;
   if (posix === "~" || posix.startsWith("~/")) return false;
   const segments = posix.split("/");
   if (segments.some((segment) => !segment || segment === "." || segment === "..")) return false;
@@ -45263,7 +45347,7 @@ async function seedProjectAgentRoot(tool, cwd) {
   if (!skillsPath) return;
   const root = toolInstallRoot(skillsPath);
   if (!isSafeRelativeRoot(root)) return;
-  const dest = path113.join(resolveBaseDir(projectConfig), root);
+  const dest = path114.join(resolveBaseDir(projectConfig), root);
   await ensureDir(dest);
   log.debug(`Seeded project agent root for ${id}: ${dest}`);
 }
@@ -45284,7 +45368,7 @@ __export(transcript_parser_exports, {
   parseTranscriptForVotes: () => parseTranscriptForVotes
 });
 import fs46 from "fs";
-import path114 from "path";
+import path115 from "path";
 import readline3 from "readline";
 function emptyResult() {
   return {
@@ -45400,8 +45484,8 @@ ${joined}` : joined;
   for (const { ref, id, cwd } of toolFileRefsById) {
     if (id !== void 0 && failedToolUseIds.has(id)) continue;
     const norm = normalizePathKey(ref);
-    if (cwd && !path114.isAbsolute(norm)) {
-      const resolved = normalizePathKey(path114.resolve(cwd, ref));
+    if (cwd && !path115.isAbsolute(norm)) {
+      const resolved = normalizePathKey(path115.resolve(cwd, ref));
       const byFullResolved = recalledFullPathToDocId.get(resolved);
       if (byFullResolved) adoptedSet.add(byFullResolved);
       continue;
@@ -45411,7 +45495,7 @@ ${joined}` : joined;
       adoptedSet.add(byFull);
       continue;
     }
-    const base = path114.basename(norm);
+    const base = path115.basename(norm);
     const byBase = recalledBasenameToDocId.get(normalizePathKey(base));
     if (!byBase) continue;
     const recalledPath = docIdToPath.get(byBase);
@@ -45454,10 +45538,10 @@ function pathSuffixMatches(a, b) {
   return true;
 }
 function indexRecalledPath(filePath, maps, docIdToPath) {
-  const docId = path114.basename(filePath).replace(/\.md$/i, "");
+  const docId = path115.basename(filePath).replace(/\.md$/i, "");
   if (!isValidDocId(docId)) return;
   maps.full.set(normalizePathKey(filePath), docId);
-  maps.base.set(normalizePathKey(path114.basename(filePath)), docId);
+  maps.base.set(normalizePathKey(path115.basename(filePath)), docId);
   if (docIdToPath && !docIdToPath.has(docId)) docIdToPath.set(docId, filePath);
 }
 function extractRecalledDocIdsFromComment(text, out) {
@@ -45507,7 +45591,7 @@ function extractRecalledDocIds(text, out, maps, docIdToPath, docIdToScope) {
       const fileMatch = line.match(/^File:\s*(.+)$/);
       if (fileMatch) {
         const filePath = fileMatch[1].trim();
-        const docId = path114.basename(filePath).replace(/\.md$/i, "");
+        const docId = path115.basename(filePath).replace(/\.md$/i, "");
         if (isValidDocId(docId)) {
           out.add(docId);
           indexRecalledPath(filePath, maps, docIdToPath);
@@ -45646,7 +45730,7 @@ function splitShellSegments(command) {
 function readerVerbOf(segment) {
   const words = segment.split(/\s+/).filter((w) => !/^[A-Za-z_][A-Za-z0-9_]*=/.test(w));
   if (words.length === 0) return null;
-  const cmd = path114.basename(words[0]);
+  const cmd = path115.basename(words[0]);
   return FILE_READER_COMMANDS.has(cmd) ? cmd : null;
 }
 function splitShellWords(segment) {
@@ -45760,7 +45844,7 @@ __export(votes_judge_exports, {
   parseJudgeOutput: () => parseJudgeOutput
 });
 import fs47 from "fs";
-import path115 from "path";
+import path116 from "path";
 function buildJudgePrompt(finalReply, candidates) {
   const reply = finalReply.length > MAX_REPLY_CHARS ? finalReply.slice(0, MAX_REPLY_CHARS) + "\n\u2026[truncated]" : finalReply;
   const FENCE = "<<<TEAMAI_UNTRUSTED>>>";
@@ -45800,8 +45884,8 @@ ${scrub(c.excerpt || "(no content available)")}`).join("\n\n");
 }
 function isUnderRoot(child, roots) {
   for (const root of roots) {
-    const rel = path115.relative(root, child);
-    if (rel === "" || !rel.startsWith("..") && !path115.isAbsolute(rel)) return true;
+    const rel = path116.relative(root, child);
+    if (rel === "" || !rel.startsWith("..") && !path116.isAbsolute(rel)) return true;
   }
   return false;
 }
@@ -45898,10 +45982,10 @@ __export(todowrite_hint_exports, {
   shouldSkipTodoWriteHint: () => shouldSkipTodoWriteHint,
   todoWriteHint: () => todoWriteHint
 });
-import path116 from "path";
+import path117 from "path";
 import fs48 from "fs";
 function getTodoWriteHintCachePath(sessionId) {
-  return path116.join(
+  return path117.join(
     getUserHome(),
     ".teamai",
     "sessions",
@@ -45924,7 +46008,7 @@ function readCache2(sessionId) {
 function writeCache2(sessionId, cache) {
   try {
     const cachePath = getTodoWriteHintCachePath(sessionId);
-    const dir = path116.dirname(cachePath);
+    const dir = path117.dirname(cachePath);
     if (!fs48.existsSync(dir)) fs48.mkdirSync(dir, { recursive: true });
     fs48.writeFileSync(cachePath, JSON.stringify(cache), "utf-8");
   } catch {
@@ -46007,12 +46091,12 @@ __export(mr_hint_exports, {
 });
 import { spawnSync as spawnSync8 } from "child_process";
 import fs49 from "fs";
-import path117 from "path";
+import path118 from "path";
 function repoSlug(owner, repo) {
   return `${owner}/${repo}`.replace(/[^a-zA-Z0-9_-]/g, "_");
 }
 function getCachePath2(owner, repo) {
-  return path117.join(
+  return path118.join(
     getUserHome(),
     ".teamai",
     "sessions",
@@ -46035,7 +46119,7 @@ function loadCache(owner, repo) {
 function saveCache(owner, repo, cache) {
   try {
     const cachePath = getCachePath2(owner, repo);
-    const dir = path117.dirname(cachePath);
+    const dir = path118.dirname(cachePath);
     if (!fs49.existsSync(dir)) fs49.mkdirSync(dir, { recursive: true });
     fs49.writeFileSync(cachePath, JSON.stringify(cache), "utf-8");
   } catch {
@@ -46182,7 +46266,7 @@ function buildHintMessage2(mrs) {
 async function computeMrHintOutput() {
   if (process.env.TEAMAI_MR_HINT_DISABLED === "1") return null;
   const rawCwd = process.env.TEAMAI_MR_HINT_CWD ?? process.cwd();
-  const cwd = path117.resolve(rawCwd);
+  const cwd = path118.resolve(rawCwd);
   try {
     if (!fs49.statSync(cwd).isDirectory()) {
       return null;
@@ -46251,7 +46335,7 @@ var init_mr_hint = __esm({
 });
 
 // src/hook-handlers.ts
-import path118 from "path";
+import path119 from "path";
 async function teamCorrectionKeywords(stdin, config) {
   if (typeof stdin.prompt !== "string" || !config) return [];
   try {
@@ -46528,7 +46612,7 @@ var init_hook_handlers = __esm({
           const voteData = await parseTranscriptForVotes2(transcriptPath);
           const { getVotesDir: getVotesDir2 } = await Promise.resolve().then(() => (init_types(), types_exports));
           const votesDir = getVotesDir2(localConfig);
-          const votePath = path118.join(votesDir, `${localConfig.username}.yaml`);
+          const votePath = path119.join(votesDir, `${localConfig.username}.yaml`);
           const eligible = eligibleUpvotes(voteData.adoptedDocIds, voteData.recalledDocScopes, localConfig.scope);
           let adoptedDocIds = [];
           if (eligible.length > 0) {
@@ -46599,7 +46683,7 @@ var init_hook_handlers = __esm({
           const alreadyCredited = new Set(voteData.adoptedDocIds);
           const { getVotesDir: getVotesDir2, getUserLearningsDir: getUserLearningsDir2, usesBranchWorktree: usesBranchWorktree2 } = await Promise.resolve().then(() => (init_types(), types_exports));
           const votesDir = getVotesDir2(localConfig);
-          const votePath = path118.join(votesDir, `${localConfig.username}.yaml`);
+          const votePath = path119.join(votesDir, `${localConfig.username}.yaml`);
           const { creditedDocIdsForSession: creditedDocIdsForSession2 } = await Promise.resolve().then(() => (init_votes(), votes_exports));
           const ledgerCredited = await creditedDocIdsForSession2(votePath, sessionId);
           const scopeEligible = new Set(
@@ -46616,7 +46700,7 @@ var init_hook_handlers = __esm({
             const { learningsBranch: learningsBranch2 } = await Promise.resolve().then(() => (init_learnings_branch(), learnings_branch_exports));
             const checkout = learningsBranch2.dir(localConfig);
             const foreign = await learningsBranch2.isForeignByFiles(localConfig);
-            const inCheckout = (root) => root === checkout || root.startsWith(`${checkout}${path118.sep}`);
+            const inCheckout = (root) => root === checkout || root.startsWith(`${checkout}${path119.sep}`);
             allowedRoots.push(
               ...learningsRoots2(localConfig).read.filter((root) => !foreign || !inCheckout(root)),
               pendingLearningsDir2(localConfig)
@@ -46733,7 +46817,7 @@ __export(hook_dispatch_cli_exports, {
 import { spawn as spawn4 } from "child_process";
 import fs50 from "fs";
 import os12 from "os";
-import path119 from "path";
+import path120 from "path";
 async function readStdin4(stream = process.stdin, timeoutMs = STDIN_READ_TIMEOUT_MS) {
   if (stream.isTTY) return "";
   const chunks = [];
@@ -46812,7 +46896,7 @@ async function trySpawnDetachedViaWmi(command, args, options = {}) {
   if (platform !== "win32") return false;
   let payloadFile;
   if (stdin !== void 0) {
-    payloadFile = path119.join(os12.tmpdir(), `teamai-hook-${process.pid}-${Date.now()}.json`);
+    payloadFile = path120.join(os12.tmpdir(), `teamai-hook-${process.pid}-${Date.now()}.json`);
     try {
       fs50.writeFileSync(payloadFile, stdin, "utf8");
     } catch {
@@ -46984,7 +47068,7 @@ var init_hook_dispatch_cli = __esm({
 });
 
 // src/wiki-engine/core/wiki-protocol.ts
-import path120 from "path";
+import path121 from "path";
 function safeIgnore(filePath) {
   const normalized = toPosix(filePath);
   const parts = normalized.split("/").filter(Boolean);
@@ -46998,7 +47082,7 @@ function safeIgnore(filePath) {
   return /\.(pem|key|p12|pfx)$/i.test(base);
 }
 function toPosix(value) {
-  return value.split(path120.sep).join("/");
+  return value.split(path121.sep).join("/");
 }
 var CONFIDENCE_SCORE_DEFAULTS, WIKI_CATEGORIES, SAFE_IGNORE_SEGMENTS, SENSITIVE_FILE_NAMES;
 var init_wiki_protocol = __esm({
@@ -47062,8 +47146,8 @@ __export(graph_index_schema_exports, {
   toPageSlug: () => toPageSlug,
   validateGraph: () => validateGraph
 });
-import { readFile as readFile5, writeFile as writeFile3, mkdir as mkdir2 } from "fs/promises";
-import path121 from "path";
+import { readFile as readFile6, writeFile as writeFile3, mkdir as mkdir2 } from "fs/promises";
+import path122 from "path";
 import { z as z12 } from "zod";
 function toPageSlug(relativePath) {
   return relativePath.replace(/\.md$/u, "").replace(/\\/g, "/");
@@ -47248,9 +47332,9 @@ function computeGraphHealth(graph) {
   };
 }
 async function loadGraphIndex(wikiRoot) {
-  const graphPath = path121.join(wikiRoot, ".indices", "graph-index.json");
+  const graphPath = path122.join(wikiRoot, ".indices", "graph-index.json");
   try {
-    const raw = await readFile5(graphPath, "utf8");
+    const raw = await readFile6(graphPath, "utf8");
     const parsed = JSON.parse(raw);
     return parseGraphIndex(parsed);
   } catch {
@@ -47258,9 +47342,9 @@ async function loadGraphIndex(wikiRoot) {
   }
 }
 async function saveGraphIndex(wikiRoot, graph) {
-  const dir = path121.join(wikiRoot, ".indices");
+  const dir = path122.join(wikiRoot, ".indices");
   await mkdir2(dir, { recursive: true });
-  const outPath = path121.join(dir, "graph-index.json");
+  const outPath = path122.join(dir, "graph-index.json");
   await writeFile3(outPath, JSON.stringify(graph, null, 2), "utf8");
   return outPath;
 }
@@ -47401,8 +47485,8 @@ var init_graph_index_schema = __esm({
 });
 
 // src/code-knowledge-recall.ts
-import { readFile as readFile6, readdir as readdir3 } from "fs/promises";
-import path122 from "path";
+import { readFile as readFile7, readdir as readdir3 } from "fs/promises";
+import path123 from "path";
 import matter9 from "gray-matter";
 function countOccurrences(text, token2) {
   let count = 0;
@@ -47537,9 +47621,9 @@ function extractSnippet(content, queryTokens, maxLen = 300) {
 async function loadWikiPages(wikiRoot, depth) {
   const pages = [];
   if (depth === "route") {
-    const routerPath = path122.join(wikiRoot, "router.md");
+    const routerPath = path123.join(wikiRoot, "router.md");
     try {
-      const content = await readFile6(routerPath, "utf-8");
+      const content = await readFile7(routerPath, "utf-8");
       const titleMatch = content.match(/^title:\s*(.+)$/m);
       const title = titleMatch ? titleMatch[1].trim() : "Team Wiki Router";
       pages.push({
@@ -47553,7 +47637,7 @@ async function loadWikiPages(wikiRoot, depth) {
     }
     return pages;
   }
-  const evidenceDir = path122.join(wikiRoot, "evidence", "code");
+  const evidenceDir = path123.join(wikiRoot, "evidence", "code");
   let projectDirs;
   try {
     const entries = await readdir3(evidenceDir, { withFileTypes: true });
@@ -47562,7 +47646,7 @@ async function loadWikiPages(wikiRoot, depth) {
     return pages;
   }
   for (const project of projectDirs) {
-    const projectDir = path122.join(evidenceDir, project);
+    const projectDir = path123.join(evidenceDir, project);
     await loadPagesRecursive(projectDir, `evidence/code/${project}`, pages, depth);
   }
   return pages;
@@ -47633,7 +47717,7 @@ async function loadPagesRecursive(dir, relativePath, pages, depth, currentDepth 
   if (currentDepth >= MAX_RECURSION_DEPTH) return;
   const entries = await readdir3(dir, { withFileTypes: true }).catch(() => []);
   for (const entry of entries) {
-    const fullPath = path122.join(dir, entry.name);
+    const fullPath = path123.join(dir, entry.name);
     if (entry.isDirectory()) {
       await loadPagesRecursive(
         fullPath,
@@ -47651,7 +47735,7 @@ async function loadPagesRecursive(dir, relativePath, pages, depth, currentDepth 
         if (depthFromProject <= 1 && NAVIGATION_FILES.has(entry.name)) continue;
       }
       try {
-        const content = await readFile6(fullPath, "utf-8");
+        const content = await readFile7(fullPath, "utf-8");
         let title;
         let sources;
         try {
@@ -47809,7 +47893,7 @@ __export(recall_exports, {
   normalizeLearningsScoreForRanking: () => normalizeLearningsScoreForRanking,
   recall: () => recall
 });
-import path123 from "path";
+import path124 from "path";
 import { existsSync as existsSync3 } from "fs";
 function isRelevantScore(score, isCodebaseHit, idfBaseline) {
   if (isCodebaseHit) return score >= CODEBASE_RELEVANCE_THRESHOLD;
@@ -47833,9 +47917,9 @@ function normalizeLearningsScoreForRanking(score, idfBaseline) {
 }
 function resolveReadablePath(indexedPath, filename, learningsBase) {
   if (indexedPath && existsSync3(indexedPath)) return indexedPath;
-  const underBase = learningsBase ? path123.join(learningsBase, filename) : null;
+  const underBase = learningsBase ? path124.join(learningsBase, filename) : null;
   if (underBase && existsSync3(underBase)) return underBase;
-  return indexedPath ?? underBase ?? path123.join("~", ".teamai", "learnings", filename);
+  return indexedPath ?? underBase ?? path124.join("~", ".teamai", "learnings", filename);
 }
 function formatResults(results) {
   const lines = [];
@@ -47893,7 +47977,7 @@ async function autoUpvote(results, config) {
   try {
     const { incrementRecalled: incrementRecalled2 } = await Promise.resolve().then(() => (init_votes(), votes_exports));
     const votesDir = getVotesDir(config);
-    const localVotePath = path123.join(votesDir, `${config.username}.yaml`);
+    const localVotePath = path124.join(votesDir, `${config.username}.yaml`);
     await ensureDir(votesDir);
     const docIds = results.map((r) => r.entry.filename.replace(/\.md$/i, ""));
     const applied = await incrementRecalled2(localVotePath, docIds);
@@ -47921,13 +48005,13 @@ async function loadOrBuildScopeIndex(localConfig, scopeLabel) {
   }
   let index = await loadIndex(indexPath);
   const needsRebuild = !index || isLegacyIndex(index);
-  if (needsRebuild && (effectiveLearningsDir || await pathExists(path123.join(localConfig.repo.localPath, "docs")) || await pathExists(path123.join(localConfig.repo.localPath, "rules")) || await pathExists(path123.join(localConfig.repo.localPath, "skills")))) {
+  if (needsRebuild && (effectiveLearningsDir || await pathExists(path124.join(localConfig.repo.localPath, "docs")) || await pathExists(path124.join(localConfig.repo.localPath, "rules")) || await pathExists(path124.join(localConfig.repo.localPath, "skills")))) {
     const { indexableVotesDir: indexableVotesDir2 } = await Promise.resolve().then(() => (init_reports_branch(), reports_branch_exports));
     const votesDir = await indexableVotesDir2(localConfig);
     const votesExist = votesDir !== void 0 && await pathExists(votesDir);
-    const docsDir = path123.join(localConfig.repo.localPath, "docs");
-    const rulesDir = path123.join(localConfig.repo.localPath, "rules");
-    const repoCodebaseDir = path123.join(localConfig.repo.localPath, "docs", "team-codebase");
+    const docsDir = path124.join(localConfig.repo.localPath, "docs");
+    const rulesDir = path124.join(localConfig.repo.localPath, "rules");
+    const repoCodebaseDir = path124.join(localConfig.repo.localPath, "docs", "team-codebase");
     const hasLegacyCodebase = await pathExists(repoCodebaseDir);
     if (hasLegacyCodebase) {
       log.warn(`Legacy 'docs/team-codebase' is no longer indexed. Migrate to 'teamwiki/' for code-knowledge recall.`);
@@ -48083,7 +48167,7 @@ async function recall(query, options) {
     }
   }
   const wikiConfig = projectConfig ?? scopeIndexes[0]?.config;
-  const wikiRoot = wikiConfig ? path123.join(wikiConfig.repo.localPath, "teamwiki") : path123.join(process.cwd(), ".teamai", "team-repo", "teamwiki");
+  const wikiRoot = wikiConfig ? path124.join(wikiConfig.repo.localPath, "teamwiki") : path124.join(process.cwd(), ".teamai", "team-repo", "teamwiki");
   const hasWiki = await pathExists(wikiRoot);
   if (scopeIndexes.length === 0 && !hasWiki) {
     if (options.check) {
@@ -48125,7 +48209,7 @@ async function recall(query, options) {
           votes: 0,
           type: "docs",
           domain: "technical",
-          path: path123.join(wikiRoot, cr.page),
+          path: path124.join(wikiRoot, cr.page),
           snippet: cr.snippet
         },
         score: Math.min(10, Math.log2(cr.score + 1) * 2),
@@ -48199,7 +48283,7 @@ __export(recall_toggle_exports, {
   recallEnable: () => recallEnable,
   recallStatus: () => recallStatus
 });
-import path124 from "path";
+import path125 from "path";
 async function removeRecallArtifacts(teamConfig, localConfig) {
   for (const [tool, toolPath] of Object.entries(scopedToolPaths(teamConfig, localConfig))) {
     if (usesManagedPolicy(teamConfig, localConfig) && !isHostSelected(localConfig, tool)) continue;
@@ -48207,7 +48291,7 @@ async function removeRecallArtifacts(teamConfig, localConfig) {
     if (toolPath.rules) {
       const extensions = /* @__PURE__ */ new Set([ruleFileExtensionForTool(tool), ".md"]);
       for (const extension of extensions) {
-        const ruleFile = path124.join(baseDir, toolPath.rules, `teamai-recall${extension}`);
+        const ruleFile = path125.join(baseDir, toolPath.rules, `teamai-recall${extension}`);
         if (await pathExists(ruleFile)) {
           await remove(ruleFile);
           log.debug(`Removed recall rule from ${tool}`);
@@ -48219,13 +48303,13 @@ async function removeRecallArtifacts(teamConfig, localConfig) {
       if (target) await pruneLegacyBuiltinSkills(tool, target, LEGACY_RECALL_SKILL_NAMES);
     }
     if (toolPath.agents) {
-      const agentsDir = path124.join(baseDir, toolPath.agents);
+      const agentsDir = path125.join(baseDir, toolPath.agents);
       const extensions = /* @__PURE__ */ new Set([".md"]);
       if (ALL_SUPPORTED_TOOLS.includes(tool)) {
         extensions.add(agentFileExtensionForTool(tool));
       }
       for (const extension of extensions) {
-        const agentFile = path124.join(agentsDir, `teamai-recall${extension}`);
+        const agentFile = path125.join(agentsDir, `teamai-recall${extension}`);
         if (await pathExists(agentFile)) {
           await remove(agentFile);
           log.debug(`Removed recall agent from ${tool}`);
@@ -48233,7 +48317,7 @@ async function removeRecallArtifacts(teamConfig, localConfig) {
       }
     }
     if (toolPath.claudemd && (!usesManagedPolicy(teamConfig, localConfig) || supportsStaticResource(tool, "instructions", localConfig.scope))) {
-      const claudeMdPath = path124.join(baseDir, toolPath.claudemd);
+      const claudeMdPath = path125.join(baseDir, toolPath.claudemd);
       const content = await readFileSafe(claudeMdPath);
       if (content && content.includes(TEAMAI_RECALL_RULES_START)) {
         const startIdx = content.indexOf(TEAMAI_RECALL_RULES_START);
@@ -48269,7 +48353,7 @@ async function deployRecallArtifacts(teamConfig, localConfig) {
     if (!toolPath.claudemd || !toolPath.agents) continue;
     if (!await isToolInstalledForConfig(tool, toolPath.agents, localConfig)) continue;
     const baseDir = resolveToolBaseDir(tool, localConfig);
-    const claudeMdPath = path124.join(baseDir, toolPath.claudemd);
+    const claudeMdPath = path125.join(baseDir, toolPath.claudemd);
     try {
       await injectClaudeMdSection2(
         claudeMdPath,
@@ -48326,7 +48410,7 @@ var init_recall_toggle = __esm({
 });
 
 // src/utils/cache-index.ts
-import path125 from "path";
+import path126 from "path";
 import os13 from "os";
 import fs51 from "fs-extra";
 function parsePositiveInteger(value) {
@@ -48336,16 +48420,16 @@ function parsePositiveInteger(value) {
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : void 0;
 }
 function getCacheRoot() {
-  return process.env.TEAMAI_CACHE_DIR ?? path125.join(os13.homedir(), ".teamai", "cache", "repos");
+  return process.env.TEAMAI_CACHE_DIR ?? path126.join(os13.homedir(), ".teamai", "cache", "repos");
 }
 function buildKey(provider, owner, repo) {
   return `${provider}/${owner}/${repo}`;
 }
 function keyToAbsPath(key) {
-  return path125.join(getCacheRoot(), key);
+  return path126.join(getCacheRoot(), key);
 }
 async function loadCacheIndex() {
-  const indexPath = path125.join(getCacheRoot(), INDEX_FILENAME);
+  const indexPath = path126.join(getCacheRoot(), INDEX_FILENAME);
   try {
     const stat10 = await fs51.stat(indexPath);
     if (stat10.size > MAX_CONFIG_FILE_BYTES) {
@@ -48368,7 +48452,7 @@ async function loadCacheIndex() {
 async function saveCacheIndex(idx) {
   const root = getCacheRoot();
   await fs51.ensureDir(root);
-  const indexPath = path125.join(root, INDEX_FILENAME);
+  const indexPath = path126.join(root, INDEX_FILENAME);
   const updated = { ...idx, updated_at: (/* @__PURE__ */ new Date()).toISOString() };
   await fs51.writeFile(indexPath, JSON.stringify(updated, null, 2), "utf8");
 }
@@ -48401,7 +48485,7 @@ async function statDirSize(absPath) {
     return 0;
   }
   for (const entry of entries) {
-    const childPath = path125.join(absPath, entry.name);
+    const childPath = path126.join(absPath, entry.name);
     if (entry.isSymbolicLink()) {
       continue;
     }
@@ -48714,7 +48798,7 @@ var init_cache_cmd = __esm({
 
 // src/import-local.ts
 import fs52 from "fs";
-import path126 from "path";
+import path127 from "path";
 import readline4 from "readline";
 function toSlug(title) {
   return title.toLowerCase().replace(/[^a-z0-9一-鿿]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 60);
@@ -48750,7 +48834,7 @@ function parseClassifyOutput(sourcePath, rawContent, output) {
       sourcePath,
       rawContent,
       type: knownType,
-      title: typeof parsed.title === "string" ? parsed.title : path126.basename(sourcePath),
+      title: typeof parsed.title === "string" ? parsed.title : path127.basename(sourcePath),
       summary: typeof parsed.summary === "string" ? parsed.summary : "",
       tags: Array.isArray(parsed.tags) ? parsed.tags.filter((t) => typeof t === "string") : [],
       confidence: typeof parsed.confidence === "number" ? parsed.confidence : 0,
@@ -48762,7 +48846,7 @@ function parseClassifyOutput(sourcePath, rawContent, output) {
       sourcePath,
       rawContent,
       type: "learning",
-      title: path126.basename(sourcePath),
+      title: path127.basename(sourcePath),
       summary: "",
       tags: [],
       confidence: 0,
@@ -48808,9 +48892,9 @@ async function scanCandidates(opts) {
     const relPaths = await listFilesRecursive(expandedDir);
     for (const relPath of relPaths) {
       if (relPath.split("/").some((seg) => seg.startsWith("."))) continue;
-      const ext = path126.extname(relPath).toLowerCase();
+      const ext = path127.extname(relPath).toLowerCase();
       if (ext !== ".md" && ext !== ".txt") continue;
-      const absPath = path126.join(expandedDir, relPath);
+      const absPath = path127.join(expandedDir, relPath);
       try {
         const stat10 = fs52.statSync(absPath);
         if (stat10.size > MAX_FILE_SIZE_BYTES) continue;
@@ -48828,15 +48912,15 @@ async function scanCandidates(opts) {
     const { resolveToolRootDir: resolveToolRootDir2, CLAUDE_TOOL_ID: CLAUDE_TOOL_ID2, DEFAULT_CLAUDE_ROOT: DEFAULT_CLAUDE_ROOT2 } = await Promise.resolve().then(() => (init_types(), types_exports));
     const claudeRoot = resolveToolRootDir2(CLAUDE_TOOL_ID2, DEFAULT_CLAUDE_ROOT2, await resolveMemberToolRoots2());
     const rulesBaseDirs = [
-      path126.join(claudeRoot, "rules"),
+      path127.join(claudeRoot, "rules"),
       expandHome("~/.cursor/rules")
     ];
     for (const baseDir of rulesBaseDirs) {
       if (!fs52.existsSync(baseDir)) continue;
       const relPaths = await listFilesRecursive(baseDir);
       for (const relPath of relPaths) {
-        if (path126.extname(relPath).toLowerCase() !== ".md") continue;
-        const absPath = path126.join(baseDir, relPath);
+        if (path127.extname(relPath).toLowerCase() !== ".md") continue;
+        const absPath = path127.join(baseDir, relPath);
         try {
           const stat10 = fs52.statSync(absPath);
           if (stat10.size > MAX_FILE_SIZE_BYTES) continue;
@@ -48867,7 +48951,7 @@ async function classifyWithAI(candidates) {
       sourcePath: c.path,
       rawContent: c.rawContent,
       type: "learning",
-      title: path126.basename(c.path),
+      title: path127.basename(c.path),
       summary: "",
       tags: [],
       confidence: 0,
@@ -48947,7 +49031,7 @@ async function interactiveReview(items, opts) {
   for (const sessionItem of pendingItems) {
     const currentIndex = session.items.indexOf(sessionItem) + 1;
     const classified = classifiedMap.get(sessionItem.sourcePath ?? "");
-    const title = sessionItem.learningDraft?.title ?? classified?.title ?? path126.basename(sessionItem.sourcePath ?? "");
+    const title = sessionItem.learningDraft?.title ?? classified?.title ?? path127.basename(sessionItem.sourcePath ?? "");
     const itemType = classified?.type ?? "learning";
     const summary = classified?.summary ?? "";
     const tags = classified?.tags ?? [];
@@ -49014,9 +49098,9 @@ async function pushAccepted(session, repoPath, opts) {
     } else {
       const typeInContent = detectTypeFromContent(draft.content);
       const subDir = typeInContent === "rule" ? "rules" : typeInContent === "doc" ? "docs" : "learnings";
-      destDir = path126.join(expandHome(repoPath), subDir);
+      destDir = path127.join(expandHome(repoPath), subDir);
     }
-    const destPath = path126.join(destDir, filename);
+    const destPath = path127.join(destDir, filename);
     if (opts.dryRun) {
       log.info(`[dry-run] would write: ${destPath}`);
       pushed++;
@@ -49045,7 +49129,7 @@ var init_import_local = __esm({
     init_home();
     MAX_FILE_SIZE_BYTES = 50 * 1024;
     MAX_CONTENT_CHARS = 3e3;
-    DEFAULT_SESSION_PATH = path126.join(getUserHome(), ".teamai", "import-session.json");
+    DEFAULT_SESSION_PATH = path127.join(getUserHome(), ".teamai", "import-session.json");
     AI_CONCURRENCY = 3;
   }
 });
@@ -49283,8 +49367,8 @@ var init_iwiki_client = __esm({
 });
 
 // src/import-iwiki.ts
-import path127 from "path";
-import { readFile as readFile7, writeFile as writeFile4 } from "fs/promises";
+import path128 from "path";
+import { readFile as readFile8, writeFile as writeFile4 } from "fs/promises";
 function parseIWikiInput(input) {
   const trimmed = input.trim();
   if (/^\d+$/.test(trimmed)) {
@@ -49372,8 +49456,8 @@ async function importFromIWiki(opts) {
     dryRun: opts.dryRun,
     outputDir: opts.outputDir
   });
-  const teamwikiRoot = path127.join(repoPath, "teamwiki");
-  if (await pathExists(path127.join(teamwikiRoot, ".indices", "graph-index.json"))) {
+  const teamwikiRoot = path128.join(repoPath, "teamwiki");
+  if (await pathExists(path128.join(teamwikiRoot, ".indices", "graph-index.json"))) {
     try {
       const mapsToEdges = await reconcileIwikiWithCodebase(documents, teamwikiRoot);
       if (mapsToEdges.length > 0) {
@@ -49392,8 +49476,8 @@ async function importFromIWiki(opts) {
   log.success("iWiki import complete");
 }
 async function reconcileIwikiWithCodebase(documents, teamwikiRoot) {
-  const graphPath = path127.join(teamwikiRoot, ".indices", "graph-index.json");
-  const graphRaw = await readFile7(graphPath, "utf-8");
+  const graphPath = path128.join(teamwikiRoot, ".indices", "graph-index.json");
+  const graphRaw = await readFile8(graphPath, "utf-8");
   const graph = JSON.parse(graphRaw);
   const codeLabels = /* @__PURE__ */ new Map();
   for (const node of graph.nodes) {
@@ -49401,17 +49485,17 @@ async function reconcileIwikiWithCodebase(documents, teamwikiRoot) {
     const words = node.label.replace(/([a-z])([A-Z])/g, "$1 $2").toLowerCase();
     codeLabels.set(words, node.id);
   }
-  const evidenceDir = path127.join(teamwikiRoot, "evidence", "code");
+  const evidenceDir = path128.join(teamwikiRoot, "evidence", "code");
   const codePageContents = /* @__PURE__ */ new Map();
   if (await pathExists(evidenceDir)) {
     const { readdir: readdir11 } = await import("fs/promises");
     const projects = await readdir11(evidenceDir);
     for (const project of projects) {
-      const projectDir = path127.join(evidenceDir, project);
+      const projectDir = path128.join(evidenceDir, project);
       const files = await readdir11(projectDir).catch(() => []);
       for (const file of files) {
         if (!file.endsWith(".md")) continue;
-        const content = await readFile7(path127.join(projectDir, file), "utf-8").catch(() => "");
+        const content = await readFile8(path128.join(projectDir, file), "utf-8").catch(() => "");
         codePageContents.set(`evidence/code/${project}/${file}`, content);
       }
     }
@@ -49500,7 +49584,7 @@ function parseGitHubPRUrl(url) {
   }
   return { owner: match[1], repo: match[2], number: match[3] };
 }
-async function githubApiGet(path157) {
+async function githubApiGet(path158) {
   return new Promise((resolve, reject) => {
     const token2 = process.env["GITHUB_TOKEN"];
     const headers = {
@@ -49509,7 +49593,7 @@ async function githubApiGet(path157) {
     };
     if (token2) headers["Authorization"] = `Bearer ${token2}`;
     const req = https2.request(
-      { hostname: "api.github.com", path: path157, headers },
+      { hostname: "api.github.com", path: path158, headers },
       (res) => {
         const chunks = [];
         res.on("data", (c) => chunks.push(c));
@@ -49668,7 +49752,7 @@ var init_mr_fetch4 = __esm({
 
 // src/utils/dedup.ts
 import fs53 from "fs/promises";
-import path128 from "path";
+import path129 from "path";
 import matter10 from "gray-matter";
 function extractKeywords(text) {
   const keywords = /* @__PURE__ */ new Set();
@@ -49717,13 +49801,13 @@ async function listComparableLearnings(learningsDirs, namespaces) {
   for (const root of learningsDirs) {
     for (const ns of namespaces) {
       if (!isSafeNamespaceSegment(ns)) continue;
-      const nsDir = path128.join(root, ns);
+      const nsDir = path129.join(root, ns);
       if (!await pathExists(nsDir)) continue;
       for (const rel of await listFilesRecursive(nsDir)) {
-        const file = path128.join(ns, rel);
+        const file = path129.join(ns, rel);
         if (!rel.endsWith(".md") || claimed.has(file)) continue;
         claimed.add(file);
-        out.push({ file, absPath: path128.join(nsDir, rel), root });
+        out.push({ file, absPath: path129.join(nsDir, rel), root });
       }
     }
   }
@@ -49735,7 +49819,7 @@ async function findOverlappingLearnings(draftKeywords, learningsDirs, { namespac
   const results = [];
   for (const { file: filename, absPath: filePath } of mdFiles) {
     try {
-      const docDate = await resolveDocDate(filePath, path128.basename(filename));
+      const docDate = await resolveDocDate(filePath, path129.basename(filename));
       if (docDate < cutoffDate) {
         continue;
       }
@@ -49818,7 +49902,7 @@ var init_dedup = __esm({
 
 // src/import-mr.ts
 import fs54 from "fs/promises";
-import path129 from "path";
+import path130 from "path";
 import readline5 from "readline/promises";
 import matter11 from "gray-matter";
 async function fetchMR(url) {
@@ -49972,7 +50056,7 @@ async function importFromMR(opts) {
 async function writeLearning(draft, outputDir, queueLearning) {
   if (outputDir) {
     await fs54.mkdir(outputDir, { recursive: true });
-    const filePath = path129.join(outputDir, "learning.md");
+    const filePath = path130.join(outputDir, "learning.md");
     await fs54.writeFile(filePath, draft.content, "utf-8");
     log.info(`Learning written: ${filePath}`);
     return filePath;
@@ -49997,14 +50081,14 @@ var init_import_mr = __esm({
     init_dedup();
     init_logger();
     init_home();
-    DEFAULT_LEARNINGS_DIR = path129.join(getUserHome(), ".teamai", "learnings");
+    DEFAULT_LEARNINGS_DIR = path130.join(getUserHome(), ".teamai", "learnings");
   }
 });
 
 // src/codebase.ts
 import { execSync as execSync5 } from "child_process";
 import fs55 from "fs";
-import path130 from "path";
+import path131 from "path";
 import matter12 from "gray-matter";
 async function gatherRepoContext(repoPath) {
   const parts = [];
@@ -50028,7 +50112,7 @@ ${truncated}`);
   } catch (err) {
     log.debug(`gatherRepoContext: find \u5931\u8D25 \u2014 ${String(err)}`);
   }
-  const pkgPath = path130.join(repoPath, "package.json");
+  const pkgPath = path131.join(repoPath, "package.json");
   if (fs55.existsSync(pkgPath)) {
     try {
       const raw = fs55.readFileSync(pkgPath, "utf-8");
@@ -50042,7 +50126,7 @@ ${excerpt}
     }
   }
   for (const candidate of ["src/index.ts", "src/main.ts", "index.ts", "main.py"]) {
-    const entryPath = path130.join(repoPath, candidate);
+    const entryPath = path131.join(repoPath, candidate);
     if (fs55.existsSync(entryPath)) {
       try {
         const raw = fs55.readFileSync(entryPath, "utf-8");
@@ -50058,7 +50142,7 @@ ${excerpt}
     }
   }
   for (const candidate of ["src/types.ts", "src/types/index.ts", "types.py"]) {
-    const typesPath = path130.join(repoPath, candidate);
+    const typesPath = path131.join(repoPath, candidate);
     if (fs55.existsSync(typesPath)) {
       try {
         const raw = fs55.readFileSync(typesPath, "utf-8");
@@ -50074,10 +50158,10 @@ ${excerpt}
     }
   }
   const docCandidates = [
-    path130.join(repoPath, "README.md"),
-    path130.join(repoPath, "ARCHITECTURE.md")
+    path131.join(repoPath, "README.md"),
+    path131.join(repoPath, "ARCHITECTURE.md")
   ];
-  const docsDir = path130.join(repoPath, "docs");
+  const docsDir = path131.join(repoPath, "docs");
   if (fs55.existsSync(docsDir)) {
     try {
       const entries = fs55.readdirSync(docsDir);
@@ -50085,7 +50169,7 @@ ${excerpt}
       for (const entry of entries) {
         if (count >= DOCS_MAX_FILES) break;
         if (entry.endsWith(".md")) {
-          docCandidates.push(path130.join(docsDir, entry));
+          docCandidates.push(path131.join(docsDir, entry));
           count++;
         }
       }
@@ -50098,7 +50182,7 @@ ${excerpt}
     try {
       const raw = fs55.readFileSync(docPath, "utf-8");
       const excerpt = raw.length > DOC_MAX_CHARS ? raw.slice(0, DOC_MAX_CHARS) + "\n\u2026\uFF08\u5DF2\u622A\u65AD\uFF09" : raw;
-      const relPath = path130.relative(repoPath, docPath);
+      const relPath = path131.relative(repoPath, docPath);
       parts.push(`## \u6587\u6863\u6458\u8981\uFF1A${relPath}
 ${excerpt}`);
     } catch (err) {
@@ -50129,7 +50213,7 @@ ${lines.join("\n")}`);
         if (fileCount >= LEARNINGS_MAX_FILES) break;
         if (!entry.endsWith(".md")) continue;
         try {
-          const filePath = path130.join(learningsDir, entry);
+          const filePath = path131.join(learningsDir, entry);
           const raw = fs55.readFileSync(filePath, "utf-8");
           const parsed = matter12(raw);
           const tags = parsed.data["tags"];
@@ -50316,8 +50400,8 @@ var init_codebase = __esm({
 // src/wiki-engine/code-knowledge/code-collector.ts
 import { createHash as createHash11 } from "crypto";
 import { execFile as execFile3 } from "child_process";
-import { readFile as readFile8, readdir as readdir4, stat as stat4 } from "fs/promises";
-import path131 from "path";
+import { readFile as readFile9, readdir as readdir4, stat as stat4 } from "fs/promises";
+import path132 from "path";
 import { promisify as promisify3 } from "util";
 function isKeyFile(relativePath, language) {
   const patterns = KEY_FILE_PATTERNS[language];
@@ -50325,12 +50409,12 @@ function isKeyFile(relativePath, language) {
   return patterns.some((pattern) => pattern.test(relativePath));
 }
 async function collectCode(options) {
-  const root = path131.resolve(options.root);
+  const root = path132.resolve(options.root);
   const filePaths = [];
   await walk(root, filePaths, options.includeTests ?? false);
   let filtered = filePaths.sort((a, b) => {
-    const relA = toPosix(path131.relative(root, a));
-    const relB = toPosix(path131.relative(root, b));
+    const relA = toPosix(path132.relative(root, a));
+    const relB = toPosix(path132.relative(root, b));
     const langA = languageFor(a);
     const langB = languageFor(b);
     const keyA = isKeyFile(relA, langA) ? 0 : 1;
@@ -50344,15 +50428,15 @@ async function collectCode(options) {
   if (options.changedFiles && options.changedFiles.length > 0) {
     const changedSet = new Set(options.changedFiles.map((f) => toPosix(f)));
     filtered = filtered.filter((fp) => {
-      const relativePath = toPosix(path131.relative(root, fp));
+      const relativePath = toPosix(path132.relative(root, fp));
       return changedSet.has(relativePath);
     });
   }
   const limited = filtered.slice(0, options.maxFiles ?? 200);
   const files = [];
   for (const filePath of limited) {
-    const content = await readFile8(filePath, "utf8");
-    const relativePath = toPosix(path131.relative(root, filePath));
+    const content = await readFile9(filePath, "utf8");
+    const relativePath = toPosix(path132.relative(root, filePath));
     const language = languageFor(filePath);
     files.push({
       path: filePath,
@@ -50379,7 +50463,7 @@ async function walk(directory, results, includeTests) {
     return;
   }
   for (const entry of await readdir4(directory, { withFileTypes: true })) {
-    const fullPath = path131.join(directory, entry.name);
+    const fullPath = path132.join(directory, entry.name);
     if (safeIgnore(fullPath) || !includeTests && isTestPath(fullPath)) {
       continue;
     }
@@ -50392,14 +50476,14 @@ async function walk(directory, results, includeTests) {
 }
 function isCodeFile(filePath) {
   return [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".py", ".go", ".rs", ".java", ".swift", ".json", ".yaml", ".yml", ".toml", ".sql", ".conf", ".ini"].includes(
-    path131.extname(filePath).toLowerCase()
+    path132.extname(filePath).toLowerCase()
   );
 }
 function isTestPath(filePath) {
   return /(^|\/|\\)(test|tests|__tests__|fixtures)(\/|\\)|\.test\.|\.spec\./u.test(filePath);
 }
 function languageFor(filePath) {
-  const ext = path131.extname(filePath).toLowerCase();
+  const ext = path132.extname(filePath).toLowerCase();
   const map = {
     ".ts": "typescript",
     ".tsx": "typescript",
@@ -51150,14 +51234,14 @@ var init_code_extractors = __esm({
 });
 
 // src/wiki-engine/code-knowledge/code-graph.ts
-import path132 from "path";
+import path133 from "path";
 function buildCodeGraph(facts) {
   const nodes = facts.filter((fact) => fact.kind !== "relation").map((fact) => ({
     slug: `${fact.kind}/${fact.name}`,
     type: mapFactKindToCategory(fact.kind),
     confidence: fact.confidence === "EXTRACTED" ? "EXTRACTED" : "INFERRED",
     title: fact.name,
-    domain: path132.dirname(fact.file).split("/")[0] || void 0
+    domain: path133.dirname(fact.file).split("/")[0] || void 0
   }));
   const nodeFiles = new Set(facts.filter((f) => f.kind !== "relation").map((f) => f.file));
   const edges = facts.filter((fact) => fact.kind === "relation").flatMap((fact) => {
@@ -51371,30 +51455,30 @@ var init_call_resolver = __esm({
 });
 
 // src/wiki-engine/code-knowledge/ast/import-resolver.ts
-import { readFile as readFile9, stat as stat5 } from "fs/promises";
-import path133 from "path";
+import { readFile as readFile10, stat as stat5 } from "fs/promises";
+import path134 from "path";
 async function loadTsconfigPaths(repoRoot, fromRelativeFile) {
-  const absDir = path133.dirname(path133.resolve(repoRoot, fromRelativeFile));
+  const absDir = path134.dirname(path134.resolve(repoRoot, fromRelativeFile));
   let dir = absDir;
-  const root = path133.resolve(repoRoot);
-  while (dir === root || dir.startsWith(root + path133.sep)) {
+  const root = path134.resolve(repoRoot);
+  while (dir === root || dir.startsWith(root + path134.sep)) {
     if (tsconfigCache.has(dir)) {
       return tsconfigCache.get(dir) ?? null;
     }
-    const configPath = path133.join(dir, "tsconfig.json");
+    const configPath = path134.join(dir, "tsconfig.json");
     try {
-      const raw = JSON.parse(await readFile9(configPath, "utf8"));
-      const configDir = path133.dirname(configPath);
+      const raw = JSON.parse(await readFile10(configPath, "utf8"));
+      const configDir = path134.dirname(configPath);
       const baseUrl = raw.compilerOptions?.baseUrl ?? ".";
       const pathsMap = raw.compilerOptions?.paths ?? {};
       const resolved = {
-        baseUrl: toPosix(path133.resolve(configDir, baseUrl)),
+        baseUrl: toPosix(path134.resolve(configDir, baseUrl)),
         paths: Object.fromEntries(
           Object.entries(pathsMap).map(([key, values]) => [
             key,
             values.map((v) => {
               const withoutStar = v.replace(/\*$/u, "");
-              return toPosix(path133.resolve(configDir, baseUrl, withoutStar));
+              return toPosix(path134.resolve(configDir, baseUrl, withoutStar));
             })
           ])
         )
@@ -51404,7 +51488,7 @@ async function loadTsconfigPaths(repoRoot, fromRelativeFile) {
     } catch {
     }
     if (dir === root) break;
-    const parent = path133.dirname(dir);
+    const parent = path134.dirname(dir);
     if (parent === dir) break;
     dir = parent;
   }
@@ -51434,8 +51518,8 @@ async function resolveImportSpecifier(repoRoot, fromFile, specifier, fileExists2
   return void 0;
 }
 async function resolveRelativeImport(fromFile, specifier, fileExists2) {
-  const fromDir = path133.dirname(fromFile);
-  const base = toPosix(path133.normalize(path133.join(fromDir, specifier)));
+  const fromDir = path134.dirname(fromFile);
+  const base = toPosix(path134.normalize(path134.join(fromDir, specifier)));
   const candidates = await expandModulePaths(base, fromFile, fileExists2);
   return pickCandidate(candidates);
 }
@@ -51443,9 +51527,9 @@ async function resolveSiblingModuleImport(fromFile, specifier, fileExists2) {
   if (!MODULE_IDENTIFIER_RE.test(specifier)) {
     return void 0;
   }
-  const fromDir = path133.dirname(fromFile);
+  const fromDir = path134.dirname(fromFile);
   const modulePath = fromFile.endsWith(".py") ? specifier.replace(/\./gu, "/") : specifier;
-  const base = toPosix(path133.normalize(path133.join(fromDir, modulePath)));
+  const base = toPosix(path134.normalize(path134.join(fromDir, modulePath)));
   const candidates = await expandModulePaths(base, fromFile, fileExists2);
   return pickCandidate(candidates);
 }
@@ -51461,7 +51545,7 @@ async function resolveAbsolutePackageImport(fromFile, specifier, fileExists2) {
   return pickCandidate(candidates);
 }
 async function resolvePathsMapping(repoRoot, config, specifier, fromFile, fileExists2) {
-  const root = path133.resolve(repoRoot);
+  const root = path134.resolve(repoRoot);
   const entries = Object.entries(config.paths).sort((a, b) => b[0].length - a[0].length);
   for (const [pattern, targets] of entries) {
     if (pattern.endsWith("/*")) {
@@ -51469,15 +51553,15 @@ async function resolvePathsMapping(repoRoot, config, specifier, fromFile, fileEx
       if (!specifier.startsWith(`${prefix}/`)) continue;
       const rest = specifier.slice(prefix.length + 1);
       for (const targetBase of targets) {
-        const abs = toPosix(path133.join(targetBase, rest));
-        const rel = toPosix(path133.relative(root, abs));
+        const abs = toPosix(path134.join(targetBase, rest));
+        const rel = toPosix(path134.relative(root, abs));
         const candidates = await expandModulePaths(rel, fromFile, fileExists2);
         const picked = pickCandidate(candidates);
         if (picked) return picked;
       }
     } else if (pattern === specifier) {
       for (const target of targets) {
-        const rel = toPosix(path133.relative(root, target));
+        const rel = toPosix(path134.relative(root, target));
         const candidates = await expandModulePaths(rel, fromFile, fileExists2);
         const picked = pickCandidate(candidates);
         if (picked) return picked;
@@ -51533,7 +51617,7 @@ async function buildFileExistenceChecker(repoRoot, knownFiles) {
   return async (relativePath) => {
     if (knownFiles.has(relativePath)) return true;
     try {
-      const abs = path133.resolve(repoRoot, relativePath);
+      const abs = path134.resolve(repoRoot, relativePath);
       const s = await stat5(abs);
       return s.isFile();
     } catch {
@@ -51950,9 +52034,9 @@ var init_import_bindings = __esm({
 });
 
 // src/wiki-engine/code-knowledge/ast/walk.ts
-import path134 from "path";
+import path135 from "path";
 function isAstParseableFile(relativePath) {
-  return grammarForExtension(path134.extname(relativePath)) !== void 0;
+  return grammarForExtension(path135.extname(relativePath)) !== void 0;
 }
 function walkFile(file) {
   const symbols = [];
@@ -51967,7 +52051,7 @@ function walkFile(file) {
     parseErrors.push(`skipped large file: ${file.relativePath}`);
     return { symbols, imports, callSites, implementsSites, parseErrors };
   }
-  const variant = grammarForExtension(path134.extname(file.relativePath));
+  const variant = grammarForExtension(path135.extname(file.relativePath));
   const language = getLanguage(variant);
   const parser = getParser();
   parser.setLanguage(language);
@@ -52296,10 +52380,10 @@ var init_ast = __esm({
 });
 
 // src/wiki-engine/code-knowledge/code-incremental.ts
-import { readFile as readFile10, writeFile as writeFile5, stat as stat6, mkdir as mkdir3 } from "fs/promises";
-import path135 from "path";
+import { readFile as readFile11, writeFile as writeFile5, stat as stat6, mkdir as mkdir3 } from "fs/promises";
+import path136 from "path";
 async function detectCodeIncrementalChanges(root, manifestPath2, project) {
-  const previous = await exists(manifestPath2) ? JSON.parse(await readFile10(manifestPath2, "utf8")) : { files: [] };
+  const previous = await exists(manifestPath2) ? JSON.parse(await readFile11(manifestPath2, "utf8")) : { files: [] };
   const oldSha = previous.headSha;
   const newSha = await gitCommit(root);
   if (oldSha && newSha && await isWorkingTreeClean(root)) {
@@ -52337,16 +52421,16 @@ function affectedPages(project, files) {
 }
 async function exists(filePath) {
   try {
-    await stat6(path135.resolve(filePath));
+    await stat6(path136.resolve(filePath));
     return true;
   } catch {
     return false;
   }
 }
 async function loadFactsCache(indicesDir) {
-  const cachePath = path135.join(indicesDir, FACTS_CACHE_FILENAME);
+  const cachePath = path136.join(indicesDir, FACTS_CACHE_FILENAME);
   try {
-    const raw = await readFile10(cachePath, "utf-8");
+    const raw = await readFile11(cachePath, "utf-8");
     const parsed = JSON.parse(raw);
     return Array.isArray(parsed) ? parsed : [];
   } catch {
@@ -52355,12 +52439,12 @@ async function loadFactsCache(indicesDir) {
 }
 async function saveFactsCache(indicesDir, facts) {
   await mkdir3(indicesDir, { recursive: true });
-  await writeFile5(path135.join(indicesDir, FACTS_CACHE_FILENAME), JSON.stringify(facts), "utf-8");
+  await writeFile5(path136.join(indicesDir, FACTS_CACHE_FILENAME), JSON.stringify(facts), "utf-8");
 }
 async function loadInterfacesCache(indicesDir) {
-  const cachePath = path135.join(indicesDir, INTERFACES_CACHE_FILENAME);
+  const cachePath = path136.join(indicesDir, INTERFACES_CACHE_FILENAME);
   try {
-    const raw = await readFile10(cachePath, "utf-8");
+    const raw = await readFile11(cachePath, "utf-8");
     const parsed = JSON.parse(raw);
     return parsed?.entries ? parsed : { entries: [], scannedAt: "" };
   } catch {
@@ -52370,7 +52454,7 @@ async function loadInterfacesCache(indicesDir) {
 async function saveInterfacesCache(indicesDir, inventory) {
   await mkdir3(indicesDir, { recursive: true });
   await writeFile5(
-    path135.join(indicesDir, INTERFACES_CACHE_FILENAME),
+    path136.join(indicesDir, INTERFACES_CACHE_FILENAME),
     JSON.stringify(inventory, null, 2),
     "utf-8"
   );
@@ -52396,7 +52480,7 @@ var init_code_incremental = __esm({
 });
 
 // src/wiki-engine/interface-scanner.ts
-import path136 from "path";
+import path137 from "path";
 async function scanInterfaces(files) {
   const componentMap = groupByComponent(files);
   const entries = [];
@@ -52464,7 +52548,7 @@ function groupByComponent(files) {
     if (file.repo) {
       component = parts.length > 1 ? `${file.repo}/${parts[0]}` : file.repo;
     } else {
-      component = parts.length > 1 ? parts[0] : path136.basename(path136.dirname(file.path));
+      component = parts.length > 1 ? parts[0] : path137.basename(path137.dirname(file.path));
     }
     const group = map.get(component) ?? [];
     group.push(file);
@@ -52749,13 +52833,13 @@ var init_reconciler_v2_types = __esm({
 });
 
 // src/wiki-engine/knowledge-reconciler.ts
-import { readFile as readFile11, readdir as readdir5, stat as stat7 } from "fs/promises";
-import path137 from "path";
+import { readFile as readFile12, readdir as readdir5, stat as stat7 } from "fs/promises";
+import path138 from "path";
 function isExpectedSelfLoop(edge) {
   return edge.from === edge.to && edge.relation === "IMPLEMENTS" && !!edge.source && REPAIRABLE_CODE_EDGE_SOURCES.has(edge.source);
 }
 async function loadReconciliationBase(wikiRoot) {
-  const graphPath = path137.join(wikiRoot, ".indices", "graph-index.json");
+  const graphPath = path138.join(wikiRoot, ".indices", "graph-index.json");
   const graph = await loadGraphIndex(wikiRoot);
   if (!graph) {
     if (!await exists2(graphPath)) return createGraphIndex();
@@ -52782,7 +52866,7 @@ async function loadReconciliationBase(wikiRoot) {
         slug,
         type: CODE_PAGE_TYPE,
         confidence: PAGE_CONFIDENCE,
-        title: path137.basename(slug),
+        title: path138.basename(slug),
         domain: CODE_PAGE_DOMAIN,
         source: edge.source
       });
@@ -52808,11 +52892,11 @@ async function readPages(dirPath) {
   const entries = await readdir5(dirPath, { withFileTypes: true });
   const pages = [];
   for (const entry of entries) {
-    const full = path137.join(dirPath, entry.name);
+    const full = path138.join(dirPath, entry.name);
     if (entry.isDirectory()) {
       pages.push(...await readPages(full));
     } else if (entry.isFile() && entry.name.endsWith(".md")) {
-      const text = await readFile11(full, "utf8");
+      const text = await readFile12(full, "utf8");
       const headingMatch = text.match(/^#\s+(.+)/m);
       const title = headingMatch ? headingMatch[1].trim() : entry.name.replace(/\.md$/, "");
       const updatedMatch = text.match(/updated[:\s]+(\d{4}-\d{2}-\d{2})/i);
@@ -52901,17 +52985,17 @@ async function reconcileKnowledge(options) {
   const productDirNames = options.productDirs ?? ["product", "docs"];
   const codeDirNames = options.codeDirs ?? ["evidence/code"];
   for (const dir of [...productDirNames, ...codeDirNames]) {
-    if (dir.includes("..") || path137.isAbsolute(dir)) {
+    if (dir.includes("..") || path138.isAbsolute(dir)) {
       throw new Error(`Unsafe directory path rejected: ${dir}`);
     }
   }
   const productPages = [];
   for (const dir of productDirNames) {
-    productPages.push(...await readPages(path137.join(wikiRoot, dir)));
+    productPages.push(...await readPages(path138.join(wikiRoot, dir)));
   }
   const codePages = [];
   for (const dir of codeDirNames) {
-    codePages.push(...await readPages(path137.join(wikiRoot, dir)));
+    codePages.push(...await readPages(path138.join(wikiRoot, dir)));
   }
   const graphEdges = [];
   const gaps = [];
@@ -52938,8 +53022,8 @@ async function reconcileKnowledge(options) {
         ];
         const nc = buildConfidence(factors);
         graphEdges.push({
-          from: toPageSlug(path137.relative(wikiRoot, productPage.path)),
-          to: toPageSlug(path137.relative(wikiRoot, codePage.path)),
+          from: toPageSlug(path138.relative(wikiRoot, productPage.path)),
+          to: toPageSlug(path138.relative(wikiRoot, codePage.path)),
           relation: "MAPS_TO",
           term,
           confidence: nc.label,
@@ -53020,10 +53104,10 @@ async function reconcileKnowledge(options) {
   const MS_PER_DAY = 864e5;
   for (const edge of graphEdges) {
     const fromPage = productPages.find(
-      (p) => toPageSlug(path137.relative(wikiRoot, p.path)) === edge.from
+      (p) => toPageSlug(path138.relative(wikiRoot, p.path)) === edge.from
     );
     const toPage = codePages.find(
-      (p) => toPageSlug(path137.relative(wikiRoot, p.path)) === edge.to
+      (p) => toPageSlug(path138.relative(wikiRoot, p.path)) === edge.to
     );
     if (!fromPage?.updated || !toPage?.updated) continue;
     const fromMs = new Date(fromPage.updated).getTime();
@@ -53052,7 +53136,7 @@ async function reconcileKnowledge(options) {
     );
     const pageNodes = [
       ...productPages.map((page) => ({
-        slug: toPageSlug(path137.relative(wikiRoot, page.path)),
+        slug: toPageSlug(path138.relative(wikiRoot, page.path)),
         type: PRODUCT_PAGE_TYPE,
         confidence: PAGE_CONFIDENCE,
         title: page.title,
@@ -53060,7 +53144,7 @@ async function reconcileKnowledge(options) {
         source: BRIDGE_EDGE_SOURCE
       })),
       ...codePages.map((page) => ({
-        slug: toPageSlug(path137.relative(wikiRoot, page.path)),
+        slug: toPageSlug(path138.relative(wikiRoot, page.path)),
         type: CODE_PAGE_TYPE,
         confidence: PAGE_CONFIDENCE,
         title: page.title,
@@ -53336,7 +53420,7 @@ __export(enrich_with_ai_exports, {
   parseEdgeProvenance: () => parseEdgeProvenance,
   writeManifest: () => writeManifest
 });
-import path138 from "path";
+import path139 from "path";
 import { writeFile as writeFile6, mkdir as mkdir4 } from "fs/promises";
 function sanitizeForPrompt(text) {
   return text.replace(/[\n\r]/g, " ").replace(/[<>]/g, "").slice(0, 200);
@@ -53387,8 +53471,8 @@ function parseJSON(raw) {
 }
 function resolveImportToModule(importerFile, importPath) {
   if (importPath.startsWith(".")) {
-    const importerDir = path138.dirname(importerFile);
-    const resolved = path138.normalize(path138.join(importerDir, importPath));
+    const importerDir = path139.dirname(importerFile);
+    const resolved = path139.normalize(path139.join(importerDir, importPath));
     const topLevel = resolved.split("/")[0];
     if (!topLevel || topLevel === ".." || topLevel === ".") return void 0;
     return topLevel;
@@ -53587,7 +53671,7 @@ function edgeReason(from, to, relation) {
 }
 async function writeManifest(manifest, outputDir) {
   await mkdir4(outputDir, { recursive: true });
-  const manifestPath2 = path138.join(outputDir, "_manifest.json");
+  const manifestPath2 = path139.join(outputDir, "_manifest.json");
   await writeFile6(manifestPath2, JSON.stringify(manifest, null, 2), "utf-8");
   return manifestPath2;
 }
@@ -53607,8 +53691,8 @@ __export(codebase_extract_exports, {
   extractCodebase: () => extractCodebase
 });
 import { statSync } from "fs";
-import { mkdir as mkdir5, writeFile as writeFile7, readFile as readFile12, realpath as realpath3 } from "fs/promises";
-import path139 from "path";
+import { mkdir as mkdir5, writeFile as writeFile7, readFile as readFile13, realpath as realpath3 } from "fs/promises";
+import path140 from "path";
 import chalk4 from "chalk";
 function detectKnowledgeGaps(facts, graph, files) {
   const gaps = [];
@@ -53624,7 +53708,7 @@ function detectKnowledgeGaps(facts, graph, files) {
     const target = rel.name;
     if (target.startsWith(".")) continue;
     if (target.startsWith("node:")) continue;
-    const matchesAnyFile = [...scannedFiles].some((f) => f.includes(target.replace(/\//g, path139.sep)));
+    const matchesAnyFile = [...scannedFiles].some((f) => f.includes(target.replace(/\//g, path140.sep)));
     if (!matchesAnyFile) {
       unresolvedImports.add(target);
     }
@@ -53968,29 +54052,29 @@ function buildOverview(facts, graph, project, interfaceInventory, callChains) {
     lines.push("## Key Dependency Paths");
     lines.push("");
     for (const chain of callChains.slice(0, 5)) {
-      const path157 = chain.steps.map((s) => s.symbol).join(" \u2192 ");
-      lines.push(`- ${chain.entryPoint}: ${path157}`);
+      const path158 = chain.steps.map((s) => s.symbol).join(" \u2192 ");
+      lines.push(`- ${chain.entryPoint}: ${path158}`);
     }
   }
   lines.push("");
   return lines.join("\n");
 }
 async function defaultProjectSlug(dir) {
-  if (!statSync(dir, { throwIfNoEntry: false })?.isDirectory()) return path139.basename(dir);
+  if (!statSync(dir, { throwIfNoEntry: false })?.isDirectory()) return path140.basename(dir);
   const anchors = await resolveAnchors(dir);
   if (anchors && await realpath3(dir) === anchors.workspaceRoot) {
     return repoName(anchors.projectAnchor);
   }
-  return path139.basename(dir);
+  return path140.basename(dir);
 }
 async function extractCodebase(opts) {
-  const root = path139.resolve(opts.path || ".");
+  const root = path140.resolve(opts.path || ".");
   const project = opts.project || await defaultProjectSlug(root);
   const maxFiles = opts.maxFiles || 200;
-  const outputBase = opts.outputRoot ? path139.resolve(opts.outputRoot) : root;
-  const wikiRoot = path139.join(outputBase, "teamwiki");
-  const evidenceDir = path139.join(wikiRoot, "evidence", "code", project);
-  const manifestPath2 = path139.join(wikiRoot, "source-manifest.json");
+  const outputBase = opts.outputRoot ? path140.resolve(opts.outputRoot) : root;
+  const wikiRoot = path140.join(outputBase, "teamwiki");
+  const evidenceDir = path140.join(wikiRoot, "evidence", "code", project);
+  const manifestPath2 = path140.join(wikiRoot, "source-manifest.json");
   let changedFiles;
   let deletedFiles = [];
   if (opts.incremental) {
@@ -54027,7 +54111,7 @@ async function extractCodebase(opts) {
   const newFacts = files.length > 0 ? extractCodeFacts(files) : [];
   let facts;
   let interfaceInventory;
-  const indicesDir = path139.join(wikiRoot, ".indices");
+  const indicesDir = path140.join(wikiRoot, ".indices");
   if (changedFiles !== void 0) {
     const oldFacts = await loadFactsCache(indicesDir);
     const oldInterfaces = await loadInterfacesCache(indicesDir);
@@ -54092,11 +54176,11 @@ async function extractCodebase(opts) {
   }
   const graph = buildCodeGraph(facts);
   let callChains;
-  const depPathsFile = path139.join(evidenceDir, "dependency-paths.md");
+  const depPathsFile = path140.join(evidenceDir, "dependency-paths.md");
   if (changedFiles) {
     let reused = false;
     try {
-      const existing = await readFile12(depPathsFile, "utf-8");
+      const existing = await readFile13(depPathsFile, "utf-8");
       if (existing.trim()) {
         reused = true;
       }
@@ -54114,13 +54198,13 @@ async function extractCodebase(opts) {
   await mkdir5(evidenceDir, { recursive: true });
   if (changedFiles && !pages.has("dependency-paths.md")) {
     try {
-      const existing = await readFile12(depPathsFile, "utf-8");
+      const existing = await readFile13(depPathsFile, "utf-8");
       pages.set("dependency-paths.md", existing);
     } catch {
     }
   }
   for (const [filename, content] of pages) {
-    await writeIfChanged(path139.join(evidenceDir, filename), content);
+    await writeIfChanged(path140.join(evidenceDir, filename), content);
   }
   const pageSlugs = [...pages.keys()].map((p) => `evidence/code/${project}/${p.replace(".md", "")}`);
   const overlay = buildIndexHubOverlay(project, "evidence/code", pageSlugs);
@@ -54153,7 +54237,7 @@ async function extractCodebase(opts) {
           keywords: enrichResult.repoKeywords || [],
           components: enrichResult.domains[0]?.components ?? []
         };
-        await writeFile7(path139.join(evidenceDir, "_domains.json"), JSON.stringify(domainMeta, null, 2), "utf-8");
+        await writeFile7(path140.join(evidenceDir, "_domains.json"), JSON.stringify(domainMeta, null, 2), "utf-8");
         if (!opts.json) {
           const domainLabel = domainMeta.domain || "uncategorized";
           console.log(`  AI enrich: ${enrichResult.manifest.components.length} modules, domain=${domainLabel}`);
@@ -54176,14 +54260,14 @@ async function extractCodebase(opts) {
   const manifestNote = describeEvidenceManifest2(manifestSource, manifestComponentCount);
   const moduleSummaries = buildModuleSummaries(facts, graph, project);
   if (moduleSummaries.size > 0) {
-    const modulesDir = path139.join(evidenceDir, "modules");
+    const modulesDir = path140.join(evidenceDir, "modules");
     await mkdir5(modulesDir, { recursive: true });
     for (const [filename, content] of moduleSummaries) {
-      await writeIfChanged(path139.join(modulesDir, filename), content);
+      await writeIfChanged(path140.join(modulesDir, filename), content);
     }
   }
   const overview = buildOverview(facts, repoGraph, project, interfaceInventory, callChains);
-  await writeIfChanged(path139.join(evidenceDir, "overview.md"), overview);
+  await writeIfChanged(path140.join(evidenceDir, "overview.md"), overview);
   const proj = [{ slug: project, label: project }];
   const ifByType = {};
   for (const e of interfaceInventory.entries) {
@@ -54196,11 +54280,11 @@ async function extractCodebase(opts) {
     interfaces: Object.keys(ifByType).length > 0 ? ifByType : void 0,
     callChains: callChains.length > 0 ? callChains.length : void 0
   };
-  await writeIfChanged(path139.join(wikiRoot, "router.md"), routerTemplate(proj, aiDomains.length > 0 ? aiDomains : void 0));
-  await writeIfChanged(path139.join(wikiRoot, "hot.md"), HOT_TEMPLATE);
-  await writeIfChanged(path139.join(wikiRoot, "index.md"), indexTemplate(proj, indexStats));
+  await writeIfChanged(path140.join(wikiRoot, "router.md"), routerTemplate(proj, aiDomains.length > 0 ? aiDomains : void 0));
+  await writeIfChanged(path140.join(wikiRoot, "hot.md"), HOT_TEMPLATE);
+  await writeIfChanged(path140.join(wikiRoot, "index.md"), indexTemplate(proj, indexStats));
   const gaps = [...detectKnowledgeGaps(facts, graph, files), ...astGaps];
-  const gapsDir = path139.join(wikiRoot, "gaps");
+  const gapsDir = path140.join(wikiRoot, "gaps");
   await mkdir5(gapsDir, { recursive: true });
   const gapLines = [
     "---",
@@ -54223,7 +54307,7 @@ async function extractCodebase(opts) {
     gapLines.push("| \u2014 | \u2014 | \u2014 | \u672A\u53D1\u73B0\u660E\u663E\u77E5\u8BC6\u7F3A\u53E3 | \u2014 |");
   }
   gapLines.push("");
-  await writeIfChanged(path139.join(gapsDir, "detected.md"), gapLines.join("\n"));
+  await writeIfChanged(path140.join(gapsDir, "detected.md"), gapLines.join("\n"));
   await saveFactsCache(indicesDir, facts);
   await saveInterfacesCache(indicesDir, interfaceInventory);
   let allManifestFiles = collectionManifest.files.map((f) => ({
@@ -54233,7 +54317,7 @@ async function extractCodebase(opts) {
   }));
   if (changedFiles !== void 0 && changedFiles.length > 0) {
     try {
-      const oldManifestRaw = await readFile12(manifestPath2, "utf-8");
+      const oldManifestRaw = await readFile13(manifestPath2, "utf-8");
       const oldManifest = JSON.parse(oldManifestRaw);
       const changedSet = /* @__PURE__ */ new Set([...changedFiles, ...deletedFiles]);
       const unchanged = (oldManifest.files ?? []).filter((f) => !changedSet.has(f.relativePath)).map((f) => ({ relativePath: f.relativePath, sha256: f.sha256, language: f.language ?? "" }));
@@ -54248,7 +54332,7 @@ async function extractCodebase(opts) {
   let prevBranch;
   let prevIngestedMrs = [];
   try {
-    const prev = JSON.parse(await readFile12(manifestPath2, "utf-8"));
+    const prev = JSON.parse(await readFile13(manifestPath2, "utf-8"));
     prevRepoUrl = prev.repoUrl;
     prevBranch = prev.branch;
     prevIngestedMrs = prev.ingestedMrs ?? [];
@@ -54533,14 +54617,14 @@ __export(repo_cache_exports, {
   readLastSync: () => readLastSync,
   writeLastSync: () => writeLastSync
 });
-import path140 from "path";
+import path141 from "path";
 import os14 from "os";
 import fs57 from "fs-extra";
 function getCacheRoot2() {
-  return process.env.TEAMAI_CACHE_DIR ?? path140.join(os14.homedir(), ".teamai", "cache", "repos");
+  return process.env.TEAMAI_CACHE_DIR ?? path141.join(os14.homedir(), ".teamai", "cache", "repos");
 }
 function getRepoCacheDir(provider, owner, repo) {
-  return path140.join(getCacheRoot2(), provider, owner, repo);
+  return path141.join(getCacheRoot2(), provider, owner, repo);
 }
 function getRepoSlug(provider, owner, repo) {
   const safeOwner = owner.replace(/\//g, "-");
@@ -54551,10 +54635,10 @@ async function writeLastSync(cacheDir, sha) {
   const content = `${sha}
 ${isoTs}
 `;
-  await fs57.writeFile(path140.join(cacheDir, LAST_SYNC_FILE), content, "utf8");
+  await fs57.writeFile(path141.join(cacheDir, LAST_SYNC_FILE), content, "utf8");
 }
 async function readLastSync(cacheDir) {
-  const filePath = path140.join(cacheDir, LAST_SYNC_FILE);
+  const filePath = path141.join(cacheDir, LAST_SYNC_FILE);
   const exists3 = await fs57.pathExists(filePath);
   if (!exists3) {
     return null;
@@ -54585,17 +54669,17 @@ __export(deep_enrich_exports, {
   deepEnrich: () => deepEnrich,
   runHiddenDeepEnrich: () => runHiddenDeepEnrich
 });
-import { readFile as readFile13, writeFile as writeFile8, readdir as readdir6, mkdir as mkdir6, unlink as unlink2 } from "fs/promises";
-import path141 from "path";
+import { readFile as readFile14, writeFile as writeFile8, readdir as readdir6, mkdir as mkdir6, unlink as unlink2 } from "fs/promises";
+import path142 from "path";
 async function readFileSafe2(filePath) {
   try {
-    return await readFile13(filePath, "utf-8");
+    return await readFile14(filePath, "utf-8");
   } catch {
     return "";
   }
 }
 async function loadContext(evidenceDir) {
-  const manifestRaw = await readFileSafe2(path141.join(evidenceDir, "_manifest.json"));
+  const manifestRaw = await readFileSafe2(path142.join(evidenceDir, "_manifest.json"));
   let manifest = {};
   try {
     manifest = JSON.parse(manifestRaw);
@@ -54603,18 +54687,18 @@ async function loadContext(evidenceDir) {
     log.debug("deep-enrich: failed to parse _manifest.json");
   }
   const [indexMd, callChains, overview] = await Promise.all([
-    readFileSafe2(path141.join(evidenceDir, "index.md")),
-    readFileSafe2(path141.join(evidenceDir, "dependency-paths.md")),
-    readFileSafe2(path141.join(evidenceDir, "overview.md"))
+    readFileSafe2(path142.join(evidenceDir, "index.md")),
+    readFileSafe2(path142.join(evidenceDir, "dependency-paths.md")),
+    readFileSafe2(path142.join(evidenceDir, "overview.md"))
   ]);
-  const modulesDir = path141.join(evidenceDir, "modules");
+  const modulesDir = path142.join(evidenceDir, "modules");
   const moduleDocs = /* @__PURE__ */ new Map();
   if (await pathExists(modulesDir)) {
     try {
       const entries = await readdir6(modulesDir);
       await Promise.all(
         entries.filter((e) => e.endsWith(".md")).map(async (e) => {
-          const content = await readFileSafe2(path141.join(modulesDir, e));
+          const content = await readFileSafe2(path142.join(modulesDir, e));
           moduleDocs.set(e.replace(/\.md$/, ""), content);
         })
       );
@@ -54625,7 +54709,7 @@ async function loadContext(evidenceDir) {
   return { manifest, indexMd, callChains, overview, moduleDocs };
 }
 function progressPath(evidenceDir) {
-  return path141.join(evidenceDir, PROGRESS_PATH_SUBDIR, PROGRESS_FILENAME);
+  return path142.join(evidenceDir, PROGRESS_PATH_SUBDIR, PROGRESS_FILENAME);
 }
 function isValidProgressState(v, project) {
   if (typeof v !== "object" || v === null) return false;
@@ -54635,7 +54719,7 @@ function isValidProgressState(v, project) {
 async function loadProgress(evidenceDir, project, allComponents) {
   const p = progressPath(evidenceDir);
   try {
-    const raw = await readFile13(p, "utf-8");
+    const raw = await readFile14(p, "utf-8");
     const parsed = JSON.parse(raw);
     if (isValidProgressState(parsed, project)) return parsed;
   } catch {
@@ -54651,7 +54735,7 @@ async function loadProgress(evidenceDir, project, allComponents) {
 }
 async function saveProgress(evidenceDir, state) {
   const p = progressPath(evidenceDir);
-  await mkdir6(path141.dirname(p), { recursive: true });
+  await mkdir6(path142.dirname(p), { recursive: true });
   const updated = { ...state, updatedAt: (/* @__PURE__ */ new Date()).toISOString() };
   await writeFile8(p, JSON.stringify(updated, null, 2), "utf-8");
 }
@@ -54890,7 +54974,7 @@ async function runPhaseComponents(opts, ctx, progress, docsDir) {
         log.warn(`deep-enrich[${project}]: Skipping unsafe component slug "${comp.slug}": ${e.message}`);
         continue;
       }
-      const outPath = path141.join(docsDir, `${comp.slug}.md`);
+      const outPath = path142.join(docsDir, `${comp.slug}.md`);
       await mkdir6(docsDir, { recursive: true });
       await writeFile8(outPath, content, "utf-8");
       progress.componentsDone.push(comp.slug);
@@ -54918,7 +55002,7 @@ async function runPhaseArchitecture(opts, ctx, docsDir) {
     log.warn(`deep-enrich[${project}]: Architecture overview: AI returned empty, skipping write`);
     return;
   }
-  const outPath = path141.join(docsDir, "architecture.md");
+  const outPath = path142.join(docsDir, "architecture.md");
   await mkdir6(docsDir, { recursive: true });
   await writeFile8(outPath, content, "utf-8");
   log.debug(`deep-enrich[${project}]: Architecture overview written: ${outPath}`);
@@ -54926,15 +55010,15 @@ async function runPhaseArchitecture(opts, ctx, docsDir) {
 async function runPhaseGraph(opts, ctx, docsDir) {
   const { project, evidenceDir } = opts;
   log.info(`deep-enrich[${project}]: Phase 3 \u2014 Generating deterministic graph docs`);
-  const interfacesMd = await readFileSafe2(path141.join(evidenceDir, "interfaces.md"));
+  const interfacesMd = await readFileSafe2(path142.join(evidenceDir, "interfaces.md"));
   const g1 = buildG1RelationsDoc(ctx.manifest);
   const g2 = buildG2DataflowDoc(ctx.callChains);
   const g3 = buildG3InterfacesDoc(interfacesMd);
   await mkdir6(docsDir, { recursive: true });
   await Promise.all([
-    writeFile8(path141.join(docsDir, "graph-g1-relations.md"), g1, "utf-8"),
-    writeFile8(path141.join(docsDir, "graph-g2-dataflow.md"), g2, "utf-8"),
-    writeFile8(path141.join(docsDir, "graph-g3-interfaces.md"), g3, "utf-8")
+    writeFile8(path142.join(docsDir, "graph-g1-relations.md"), g1, "utf-8"),
+    writeFile8(path142.join(docsDir, "graph-g2-dataflow.md"), g2, "utf-8"),
+    writeFile8(path142.join(docsDir, "graph-g3-interfaces.md"), g3, "utf-8")
   ]);
   log.debug(`deep-enrich[${project}]: Graph docs written: ${docsDir}`);
 }
@@ -55040,9 +55124,9 @@ async function runPhaseAiGraph(opts, ctx, docsDir) {
   await mkdir6(docsDir, { recursive: true });
   const g6HasEdges = (ctx.manifest.edges ?? []).length > 0;
   const g6 = buildG6Content(project, ctx.manifest);
-  await writeFile8(path141.join(docsDir, "graph-g6-multihop.md"), g6, "utf-8");
+  await writeFile8(path142.join(docsDir, "graph-g6-multihop.md"), g6, "utf-8");
   log.debug(`deep-enrich[${project}]: G6 multi-hop analysis written`);
-  const g5Path = path141.join(docsDir, "graph-g5-scenarios.md");
+  const g5Path = path142.join(docsDir, "graph-g5-scenarios.md");
   if (await pathExists(g5Path)) {
     return { g5Generated: true, g6Generated: g6HasEdges };
   }
@@ -55051,7 +55135,7 @@ async function runPhaseAiGraph(opts, ctx, docsDir) {
     log.warn(`deep-enrich[${project}]: Insufficient modules (${ctx.moduleDocs.size} < 2), skipping G5`);
     return { g5Generated, g6Generated: g6HasEdges };
   }
-  const architectureMd = await readFileSafe2(path141.join(docsDir, "architecture.md"));
+  const architectureMd = await readFileSafe2(path142.join(docsDir, "architecture.md"));
   if (!architectureMd.trim()) {
     log.warn(`deep-enrich[${project}]: No architecture doc, skipping G5 scenarios`);
     return { g5Generated, g6Generated: g6HasEdges };
@@ -55061,7 +55145,7 @@ async function runPhaseAiGraph(opts, ctx, docsDir) {
   try {
     const g5Content = await callClaude(prompt);
     if (g5Content.trim()) {
-      await writeFile8(path141.join(docsDir, "graph-g5-scenarios.md"), g5Content, "utf-8");
+      await writeFile8(path142.join(docsDir, "graph-g5-scenarios.md"), g5Content, "utf-8");
       log.debug(`deep-enrich[${project}]: G5 scenario diagrams written`);
       g5Generated = true;
     }
@@ -55079,10 +55163,10 @@ async function runPhaseIndexEnhance(opts, ctx, docsDir, graphFlags) {
     hasG5: graphFlags?.g5Generated ?? false,
     hasG6: graphFlags?.g6Generated ?? true
   });
-  await writeFile8(path141.join(docsDir, "README.md"), graphReadme, "utf-8");
+  await writeFile8(path142.join(docsDir, "README.md"), graphReadme, "utf-8");
   log.debug(`deep-enrich[${project}]: graph/README.md routing table written`);
   const { wikiRoot } = opts;
-  const domainsJson = await readFileSafe2(path141.join(evidenceDir, "_domains.json"));
+  const domainsJson = await readFileSafe2(path142.join(evidenceDir, "_domains.json"));
   let keywords = [];
   let description = "";
   try {
@@ -55091,7 +55175,7 @@ async function runPhaseIndexEnhance(opts, ctx, docsDir, graphFlags) {
     description = domains.description ?? "";
   } catch {
   }
-  const routerPath = path141.join(wikiRoot, "router.md");
+  const routerPath = path142.join(wikiRoot, "router.md");
   const routerContent = await readFileSafe2(routerPath);
   const projectLink = `[[evidence/code/${project}/index]]`;
   if (routerContent && !routerContent.includes(projectLink)) {
@@ -55101,7 +55185,7 @@ async function runPhaseIndexEnhance(opts, ctx, docsDir, graphFlags) {
 `;
     await writeFile8(routerPath, routerContent.trimEnd() + "\n" + line, "utf-8");
   }
-  const indexPath = path141.join(wikiRoot, "index.md");
+  const indexPath = path142.join(wikiRoot, "index.md");
   const indexContent = await readFileSafe2(indexPath);
   if (indexContent && !indexContent.includes(`evidence/code/${project}/`)) {
     const navBlock = [
@@ -55125,7 +55209,7 @@ async function runPhaseIndexEnhance(opts, ctx, docsDir, graphFlags) {
   log.debug(`deep-enrich[${project}]: Index incremental update complete`);
 }
 function architectureDocPath(docsDir) {
-  return path141.join(docsDir, "architecture.md");
+  return path142.join(docsDir, "architecture.md");
 }
 async function existingComponentSlugs(docsDir, slugs) {
   const found = [];
@@ -55135,7 +55219,7 @@ async function existingComponentSlugs(docsDir, slugs) {
     } catch {
       continue;
     }
-    if (await pathExists(path141.join(docsDir, `${slug}.md`))) found.push(slug);
+    if (await pathExists(path142.join(docsDir, `${slug}.md`))) found.push(slug);
   }
   return found;
 }
@@ -55160,14 +55244,14 @@ async function invalidateStaleAiDocs(docsDir, slugs) {
     } catch {
       continue;
     }
-    await removeIfExists(path141.join(docsDir, `${slug}.md`));
+    await removeIfExists(path142.join(docsDir, `${slug}.md`));
   }
   await removeIfExists(architectureDocPath(docsDir));
-  await removeIfExists(path141.join(docsDir, "graph-g5-scenarios.md"));
+  await removeIfExists(path142.join(docsDir, "graph-g5-scenarios.md"));
 }
 async function runHiddenDeepEnrich(opts) {
-  const wikiRoot = opts.wikiRoot ?? path141.join(process.cwd(), ".teamai", "team-repo", "teamwiki");
-  const evidenceDir = path141.join(wikiRoot, "evidence", "code", opts.project);
+  const wikiRoot = opts.wikiRoot ?? path142.join(process.cwd(), ".teamai", "team-repo", "teamwiki");
+  const evidenceDir = path142.join(wikiRoot, "evidence", "code", opts.project);
   const result = await deepEnrich({
     project: opts.project,
     evidenceDir,
@@ -55179,7 +55263,7 @@ async function runHiddenDeepEnrich(opts) {
 }
 async function deepEnrich(opts) {
   const { project, evidenceDir } = opts;
-  const docsDir = path141.join(evidenceDir, "docs");
+  const docsDir = path142.join(evidenceDir, "docs");
   log.info(`deep-enrich[${project}]: Starting deep knowledge generation, evidenceDir=${evidenceDir}`);
   const ctx = await loadContext(evidenceDir);
   let components = ctx.manifest.components ?? [];
@@ -55271,11 +55355,11 @@ var graph_aggregate_exports = {};
 __export(graph_aggregate_exports, {
   aggregateGlobalGraph: () => aggregateGlobalGraph
 });
-import path142 from "path";
+import path143 from "path";
 import { readdir as readdir7 } from "fs/promises";
 import fs58 from "fs-extra";
 async function aggregateGlobalGraph(teamwikiRoot) {
-  const evidenceBase = path142.join(teamwikiRoot, "evidence", "code");
+  const evidenceBase = path143.join(teamwikiRoot, "evidence", "code");
   if (!await fs58.pathExists(evidenceBase)) return null;
   const { mergeGraphs: mergeGraphs2 } = await Promise.resolve().then(() => (init_adapters(), adapters_exports));
   const { detectCrossRepoEdges: detectCrossRepoEdges2 } = await Promise.resolve().then(() => (init_import_repo(), import_repo_exports));
@@ -55283,7 +55367,7 @@ async function aggregateGlobalGraph(teamwikiRoot) {
   const projectDirs = await readdir7(evidenceBase, { withFileTypes: true });
   for (const dir of projectDirs) {
     if (!dir.isDirectory()) continue;
-    const graphPath = path142.join(evidenceBase, dir.name, ".indices", "graph-index.json");
+    const graphPath = path143.join(evidenceBase, dir.name, ".indices", "graph-index.json");
     if (!await fs58.pathExists(graphPath)) continue;
     try {
       const overlay = JSON.parse(await fs58.readFile(graphPath, "utf8"));
@@ -55301,8 +55385,8 @@ async function aggregateGlobalGraph(teamwikiRoot) {
     }
   }
   if (globalGraph) {
-    const destPath = path142.join(teamwikiRoot, ".indices", "graph-index.json");
-    await fs58.ensureDir(path142.dirname(destPath));
+    const destPath = path143.join(teamwikiRoot, ".indices", "graph-index.json");
+    await fs58.ensureDir(path143.dirname(destPath));
     await fs58.writeFile(destPath, JSON.stringify(globalGraph, null, 2), "utf8");
     log.info(`global graph-index.json aggregated (${globalGraph.nodes.length} nodes, ${globalGraph.edges.length} edges)`);
     return { nodes: globalGraph.nodes.length, edges: globalGraph.edges.length };
@@ -55321,10 +55405,10 @@ var rebuild_wiki_index_exports = {};
 __export(rebuild_wiki_index_exports, {
   rebuildWikiIndex: () => rebuildWikiIndex
 });
-import { readFile as readFile14, readdir as readdir8, stat as stat8, writeFile as writeFile9 } from "fs/promises";
-import path143 from "path";
+import { readFile as readFile15, readdir as readdir8, stat as stat8, writeFile as writeFile9 } from "fs/promises";
+import path144 from "path";
 async function rebuildWikiIndex(teamwikiRoot) {
-  const evidenceCodeDir = path143.join(teamwikiRoot, "evidence", "code");
+  const evidenceCodeDir = path144.join(teamwikiRoot, "evidence", "code");
   if (!await pathExists(evidenceCodeDir)) return;
   const projects = [];
   let totalFacts = 0, totalNodes = 0, totalEdges = 0;
@@ -55332,7 +55416,7 @@ async function rebuildWikiIndex(teamwikiRoot) {
   let totalCallChains = 0;
   const dirs = await readdir8(evidenceCodeDir);
   for (const dir of dirs) {
-    const dirPath = path143.join(evidenceCodeDir, dir);
+    const dirPath = path144.join(evidenceCodeDir, dir);
     const dirStat = await stat8(dirPath).catch(() => null);
     if (!dirStat?.isDirectory()) continue;
     const info = {
@@ -55345,9 +55429,9 @@ async function rebuildWikiIndex(teamwikiRoot) {
       keywords: [],
       domain: ""
     };
-    const overviewPath = path143.join(dirPath, "overview.md");
+    const overviewPath = path144.join(dirPath, "overview.md");
     if (await pathExists(overviewPath)) {
-      const content = await readFile14(overviewPath, "utf-8");
+      const content = await readFile15(overviewPath, "utf-8");
       const bodyStart = content.indexOf("\n\n", content.indexOf("---", 3));
       if (bodyStart > 0) {
         const body = content.slice(bodyStart).trim();
@@ -55358,9 +55442,9 @@ async function rebuildWikiIndex(teamwikiRoot) {
         }
       }
     }
-    const projectIndex = path143.join(dirPath, "index.md");
+    const projectIndex = path144.join(dirPath, "index.md");
     if (await pathExists(projectIndex)) {
-      const content = await readFile14(projectIndex, "utf-8");
+      const content = await readFile15(projectIndex, "utf-8");
       const factsMatch = content.match(/Facts:\s*(\d+)/);
       if (factsMatch) info.facts = parseInt(factsMatch[1], 10);
       const ifMatches = content.matchAll(/\|\s*(HTTP|MQ|RPC)\s*\|\s*(\d+)\s*\|/g);
@@ -55368,10 +55452,10 @@ async function rebuildWikiIndex(teamwikiRoot) {
         info.interfaces[m[1]] = (info.interfaces[m[1]] ?? 0) + parseInt(m[2], 10);
       }
     }
-    const manifestPath2 = path143.join(dirPath, "_manifest.json");
+    const manifestPath2 = path144.join(dirPath, "_manifest.json");
     if (await pathExists(manifestPath2)) {
       try {
-        const raw = await readFile14(manifestPath2, "utf-8");
+        const raw = await readFile15(manifestPath2, "utf-8");
         const manifest = JSON.parse(raw);
         for (const comp of manifest.components) {
           if (comp.responsibilities) info.responsibilities.push(...comp.responsibilities);
@@ -55380,10 +55464,10 @@ async function rebuildWikiIndex(teamwikiRoot) {
       } catch {
       }
     }
-    const domainsPath = path143.join(dirPath, "_domains.json");
+    const domainsPath = path144.join(dirPath, "_domains.json");
     if (await pathExists(domainsPath)) {
       try {
-        const raw = await readFile14(domainsPath, "utf-8");
+        const raw = await readFile15(domainsPath, "utf-8");
         const domainMeta = JSON.parse(raw);
         if (domainMeta.domain) {
           info.domain = domainMeta.domain;
@@ -55397,9 +55481,9 @@ async function rebuildWikiIndex(teamwikiRoot) {
       } catch {
       }
     }
-    const chainsPath = path143.join(dirPath, "dependency-paths.md");
+    const chainsPath = path144.join(dirPath, "dependency-paths.md");
     if (await pathExists(chainsPath)) {
-      const content = await readFile14(chainsPath, "utf-8");
+      const content = await readFile15(chainsPath, "utf-8");
       const chainMatch = content.match(/(\d+)\s*call chain/);
       if (chainMatch) info.callChains = parseInt(chainMatch[1], 10);
     }
@@ -55413,10 +55497,10 @@ async function rebuildWikiIndex(teamwikiRoot) {
     }
     projects.push(info);
   }
-  const graphPath = path143.join(teamwikiRoot, ".indices", "graph-index.json");
+  const graphPath = path144.join(teamwikiRoot, ".indices", "graph-index.json");
   if (await pathExists(graphPath)) {
     try {
-      const raw = await readFile14(graphPath, "utf-8");
+      const raw = await readFile15(graphPath, "utf-8");
       const graph = JSON.parse(raw);
       totalNodes = Array.isArray(graph.nodes) ? graph.nodes.length : 0;
       totalEdges = Array.isArray(graph.edges) ? graph.edges.length : 0;
@@ -55454,7 +55538,7 @@ async function rebuildWikiIndex(teamwikiRoot) {
   routerLines.push("4. **\u8C03\u7528\u94FE/\u6392\u969C** \u2192 \u67E5\u5BF9\u5E94\u4ED3\u5E93\u7684 dependency-paths.md");
   routerLines.push("5. **\u6A21\u5757\u804C\u8D23\u6982\u8FF0** \u2192 \u67E5 overview.md \u6216 modules/*.md");
   routerLines.push("");
-  await writeFile9(path143.join(teamwikiRoot, "router.md"), routerLines.join("\n"), "utf-8");
+  await writeFile9(path144.join(teamwikiRoot, "router.md"), routerLines.join("\n"), "utf-8");
   const indexLines = [
     "# Team Wiki Index",
     "",
@@ -55490,9 +55574,9 @@ async function rebuildWikiIndex(teamwikiRoot) {
   indexLines.push("- [router.md](./router.md) \u2014 \u4EA7\u54C1\u57DF\u8DEF\u7531\uFF08\u8868\u683C + \u8DEF\u7531\u89C4\u5219\uFF09");
   indexLines.push("- [hot.md](./hot.md) \u2014 \u6D3B\u8DC3\u5DE5\u4F5C\u8BB0\u5FC6");
   indexLines.push("");
-  await writeFile9(path143.join(teamwikiRoot, "index.md"), indexLines.join("\n"), "utf-8");
-  if (!await pathExists(path143.join(teamwikiRoot, "hot.md"))) {
-    await writeFile9(path143.join(teamwikiRoot, "hot.md"), HOT_TEMPLATE, "utf-8");
+  await writeFile9(path144.join(teamwikiRoot, "index.md"), indexLines.join("\n"), "utf-8");
+  if (!await pathExists(path144.join(teamwikiRoot, "hot.md"))) {
+    await writeFile9(path144.join(teamwikiRoot, "hot.md"), HOT_TEMPLATE, "utf-8");
   }
   log.debug(`rebuildWikiIndex: ${projects.length} projects, ${totalNodes} nodes, ${totalEdges} edges`);
 }
@@ -55536,7 +55620,7 @@ __export(import_repo_exports, {
   detectCrossRepoEdges: () => detectCrossRepoEdges,
   importFromRepo: () => importFromRepo
 });
-import path144 from "path";
+import path145 from "path";
 import fs59 from "fs-extra";
 import chalk5 from "chalk";
 function detectCrossRepoEdges(overlay, existing) {
@@ -55647,7 +55731,7 @@ async function importFromRepo(opts) {
   const cacheDir = getRepoCacheDir(providerName, owner, repoName2);
   const slug = getRepoSlug(providerName, owner, repoName2);
   const lastSync = await readLastSync(cacheDir);
-  const cacheExists = await fs59.pathExists(path144.join(cacheDir, ".git"));
+  const cacheExists = await fs59.pathExists(path145.join(cacheDir, ".git"));
   const useIncremental = incremental && cacheExists && lastSync !== null;
   let cloneSha;
   let cloneBranch;
@@ -55725,31 +55809,31 @@ async function importFromRepo(opts) {
     mrTeamConfig = { repo: tc.repo, provider: tc.provider, reviewers: tc.reviewers };
     mrLocalConfig = { repo: lc.repo, username: lc.username, provider: lc.provider };
   } catch {
-    teamRepoDir = path144.join(process.cwd(), ".teamai", "team-repo");
+    teamRepoDir = path145.join(process.cwd(), ".teamai", "team-repo");
   }
   const { acquireImportLock: acquireImportLock2 } = await Promise.resolve().then(() => (init_import_lock(), import_lock_exports));
   const releaseImportLock = await acquireImportLock2(teamRepoDir);
   try {
-    const teamwikiRoot = output ? path144.resolve(output, "..", "teamwiki") : path144.join(teamRepoDir, "teamwiki");
+    const teamwikiRoot = output ? path145.resolve(output, "..", "teamwiki") : path145.join(teamRepoDir, "teamwiki");
     if (!dryRun) {
-      const cacheWiki = path144.join(cacheDir, "teamwiki");
+      const cacheWiki = path145.join(cacheDir, "teamwiki");
       try {
         let extractIncremental = incremental;
         if (incremental) {
-          const destIndices = path144.join(teamwikiRoot, ".indices");
-          const cacheIndices = path144.join(cacheDir, "teamwiki", ".indices");
+          const destIndices = path145.join(teamwikiRoot, ".indices");
+          const cacheIndices = path145.join(cacheDir, "teamwiki", ".indices");
           await fs59.ensureDir(cacheIndices);
           for (const f of ["facts-cache.json", "interfaces-cache.json"]) {
-            const src = path144.join(destIndices, f);
+            const src = path145.join(destIndices, f);
             if (await fs59.pathExists(src)) {
-              await fs59.copy(src, path144.join(cacheIndices, f));
+              await fs59.copy(src, path145.join(cacheIndices, f));
             }
           }
-          const existingManifest = path144.join(teamwikiRoot, "source-manifest.json");
+          const existingManifest = path145.join(teamwikiRoot, "source-manifest.json");
           if (await fs59.pathExists(existingManifest)) {
-            await fs59.copy(existingManifest, path144.join(cacheDir, "teamwiki", "source-manifest.json"));
+            await fs59.copy(existingManifest, path145.join(cacheDir, "teamwiki", "source-manifest.json"));
           }
-          const cacheManifest = path144.join(cacheWiki, "source-manifest.json");
+          const cacheManifest = path145.join(cacheWiki, "source-manifest.json");
           if (await fs59.pathExists(cacheManifest)) {
             const manifest = await fs59.readJson(cacheManifest).catch(() => null);
             if (!lastSync || manifest?.headSha !== lastSync.sha) extractIncremental = false;
@@ -55766,19 +55850,19 @@ async function importFromRepo(opts) {
           sourceMrUrl
         });
         if (await fs59.pathExists(cacheWiki)) {
-          const evidenceSrc = path144.join(cacheWiki, "evidence", "code", slug);
-          const evidenceDest = path144.join(teamwikiRoot, "evidence", "code", slug);
+          const evidenceSrc = path145.join(cacheWiki, "evidence", "code", slug);
+          const evidenceDest = path145.join(teamwikiRoot, "evidence", "code", slug);
           if (await fs59.pathExists(evidenceDest)) {
             const entries = await fs59.readdir(evidenceDest);
             for (const entry of entries) {
               if (entry === ".indices") continue;
-              await fs59.remove(path144.join(evidenceDest, entry));
+              await fs59.remove(path145.join(evidenceDest, entry));
             }
           }
           await fs59.ensureDir(evidenceDest);
           await fs59.copy(evidenceSrc, evidenceDest, { overwrite: true });
           if (codebaseMd) {
-            const overviewPath = path144.join(evidenceDest, "overview.md");
+            const overviewPath = path145.join(evidenceDest, "overview.md");
             const existing = await fs59.readFile(overviewPath, "utf8").catch(() => "");
             const aiNarrative = stripFrontmatter(codebaseMd);
             const marker = "## AI Architecture Narrative";
@@ -55801,31 +55885,31 @@ ${aiNarrative}`;
             }
             await fs59.writeFile(overviewPath, combined, "utf8");
           }
-          const srcGraph = path144.join(cacheWiki, ".indices", "graph-index.json");
+          const srcGraph = path145.join(cacheWiki, ".indices", "graph-index.json");
           if (await fs59.pathExists(srcGraph)) {
-            const evidenceGraphDir = path144.join(teamwikiRoot, "evidence", "code", slug, ".indices");
+            const evidenceGraphDir = path145.join(teamwikiRoot, "evidence", "code", slug, ".indices");
             await fs59.ensureDir(evidenceGraphDir);
-            await fs59.copy(srcGraph, path144.join(evidenceGraphDir, "graph-index.json"));
+            await fs59.copy(srcGraph, path145.join(evidenceGraphDir, "graph-index.json"));
           } else {
             log.debug(`[graph] per-repo graph-index.json not found, skipping copy`);
           }
-          const cacheIndices = path144.join(cacheWiki, ".indices");
-          const destIndices = path144.join(teamwikiRoot, ".indices");
+          const cacheIndices = path145.join(cacheWiki, ".indices");
+          const destIndices = path145.join(teamwikiRoot, ".indices");
           for (const cacheFile of ["facts-cache.json", "interfaces-cache.json"]) {
-            const src = path144.join(cacheIndices, cacheFile);
+            const src = path145.join(cacheIndices, cacheFile);
             if (await fs59.pathExists(src)) {
               await fs59.ensureDir(destIndices);
-              await fs59.copy(src, path144.join(destIndices, cacheFile), { overwrite: true });
+              await fs59.copy(src, path145.join(destIndices, cacheFile), { overwrite: true });
             }
           }
-          const srcManifest = path144.join(cacheWiki, "source-manifest.json");
+          const srcManifest = path145.join(cacheWiki, "source-manifest.json");
           if (await fs59.pathExists(srcManifest)) {
-            await fs59.copy(srcManifest, path144.join(teamwikiRoot, "source-manifest.json"), { overwrite: true });
+            await fs59.copy(srcManifest, path145.join(teamwikiRoot, "source-manifest.json"), { overwrite: true });
           }
           await fs59.remove(cacheWiki);
         }
         if (explicitDomain) {
-          const domainsJsonPath = path144.join(teamwikiRoot, "evidence", "code", slug, "_domains.json");
+          const domainsJsonPath = path145.join(teamwikiRoot, "evidence", "code", slug, "_domains.json");
           if (await fs59.pathExists(domainsJsonPath)) {
             try {
               const existing = JSON.parse(await fs59.readFile(domainsJsonPath, "utf8"));
@@ -55857,8 +55941,8 @@ ${aiNarrative}`;
       }
     }
     if (!dryRun && !skipEnrich && teamwikiRoot) {
-      const evidenceDir = path144.join(teamwikiRoot, "evidence", "code", slug);
-      if (await fs59.pathExists(path144.join(evidenceDir, "_manifest.json"))) {
+      const evidenceDir = path145.join(teamwikiRoot, "evidence", "code", slug);
+      if (await fs59.pathExists(path145.join(evidenceDir, "_manifest.json"))) {
         try {
           const { deepEnrich: deepEnrich2 } = await Promise.resolve().then(() => (init_deep_enrich(), deep_enrich_exports));
           await deepEnrich2({ project: slug, evidenceDir, wikiRoot: teamwikiRoot, cacheDir });
@@ -55985,7 +56069,7 @@ var init_store = __esm({
 });
 
 // src/import-repo-list.ts
-import path145 from "path";
+import path146 from "path";
 import fs61 from "fs-extra";
 function sortByPriority(entries) {
   const order = { high: 0, normal: 1, low: 2 };
@@ -56073,7 +56157,7 @@ async function importFromRepoList(opts) {
         const { autoDetectInit: autoDetectInit2 } = await Promise.resolve().then(() => (init_config(), config_exports));
         const { localConfig: lc } = await autoDetectInit2();
         const teamRepoPath = lc.repo.localPath;
-        const teamwikiRoot = path145.join(teamRepoPath, "teamwiki");
+        const teamwikiRoot = path146.join(teamRepoPath, "teamwiki");
         const { aggregateGlobalGraph: aggregateGlobalGraph2 } = await Promise.resolve().then(() => (init_graph_aggregate(), graph_aggregate_exports));
         await aggregateGlobalGraph2(teamwikiRoot);
       } catch (e) {
@@ -56084,7 +56168,7 @@ async function importFromRepoList(opts) {
       try {
         const { autoDetectInit: autoDetectInit2 } = await Promise.resolve().then(() => (init_config(), config_exports));
         const { localConfig } = await autoDetectInit2();
-        const teamwikiRoot = path145.join(localConfig.repo.localPath, "teamwiki");
+        const teamwikiRoot = path146.join(localConfig.repo.localPath, "teamwiki");
         if (await fs61.pathExists(teamwikiRoot)) {
           const { rebuildWikiIndex: rebuildWikiIndex2 } = await Promise.resolve().then(() => (init_rebuild_wiki_index(), rebuild_wiki_index_exports));
           await rebuildWikiIndex2(teamwikiRoot);
@@ -56138,7 +56222,7 @@ var init_import_repo_list = __esm({
 });
 
 // src/import-org.ts
-import path146 from "path";
+import path147 from "path";
 import fs62 from "fs-extra";
 function parseOrgInput(org) {
   const trimmed = org.trim();
@@ -56210,9 +56294,9 @@ async function importFromOrg(opts) {
     return;
   }
   log.info(`${filteredRepos.length} repos after filtering, generating whitelist...`);
-  const whitelistDraftPath = path146.join(cwd, WHITELIST_DRAFT_PATH);
+  const whitelistDraftPath = path147.join(cwd, WHITELIST_DRAFT_PATH);
   if (!opts.dryRun) {
-    await fs62.ensureDir(path146.dirname(whitelistDraftPath));
+    await fs62.ensureDir(path147.dirname(whitelistDraftPath));
     const lines = ["version: 1", "repos:"];
     for (const repo of filteredRepos) {
       lines.push(`  - url: ${repo.url}`);
@@ -56245,7 +56329,7 @@ async function importFromOrg(opts) {
             const { autoDetectInit: autoDetectInit2 } = await Promise.resolve().then(() => (init_config(), config_exports));
             const { localConfig } = await autoDetectInit2();
             const teamRepoPath = localConfig.repo.localPath;
-            const teamRepoWiki = path146.join(teamRepoPath, "teamwiki");
+            const teamRepoWiki = path147.join(teamRepoPath, "teamwiki");
             if (await fs62.pathExists(teamRepoWiki)) {
               await rebuildWikiIndex2(teamRepoWiki);
               log.info("teamwiki router.md / index.md rebuilt");
@@ -56278,10 +56362,10 @@ var init_import_org = __esm({
 
 // src/review-store.ts
 import crypto10 from "crypto";
-import path147 from "path";
+import path148 from "path";
 import fs63 from "fs-extra";
 function getPendingReviewPath(cwd) {
-  return path147.join(cwd, PENDING_REVIEW_PATH);
+  return path148.join(cwd, PENDING_REVIEW_PATH);
 }
 function computeReviewId(file, section, ts) {
   return crypto10.createHash("sha1").update(`${file}|${section ?? ""}|${ts}`).digest("hex").slice(0, 12);
@@ -56357,7 +56441,7 @@ async function loadPendingReview(cwd) {
 async function savePendingReview(cwd, items) {
   const filePath = getPendingReviewPath(cwd);
   const tmpPath = `${filePath}.tmp`;
-  await fs63.ensureDir(path147.dirname(filePath));
+  await fs63.ensureDir(path148.dirname(filePath));
   const content = items.map((item) => JSON.stringify(item)).join("\n") + (items.length > 0 ? "\n" : "");
   await fs63.writeFile(tmpPath, content, "utf8");
   await fs63.rename(tmpPath, filePath);
@@ -56377,7 +56461,7 @@ async function appendPendingReview(cwd, partial) {
     risk
   };
   const filePath = getPendingReviewPath(cwd);
-  await fs63.ensureDir(path147.dirname(filePath));
+  await fs63.ensureDir(path148.dirname(filePath));
   await fs63.appendFile(filePath, JSON.stringify(item) + "\n", "utf8");
   return item;
 }
@@ -56412,14 +56496,14 @@ var init_review_store = __esm({
 });
 
 // src/utils/team-codebase-paths.ts
-import path148 from "path";
+import path149 from "path";
 function getTeamCodebasePaths(cwd, output) {
-  const root = output ?? path148.join(cwd, "docs", TEAM_CODEBASE_DIR);
+  const root = output ?? path149.join(cwd, "docs", TEAM_CODEBASE_DIR);
   return {
     root,
-    index: path148.join(root, "index.md"),
-    domainsDir: path148.join(root, "domains"),
-    reposDir: path148.join(root, "repos")
+    index: path149.join(root, "index.md"),
+    domainsDir: path149.join(root, "domains"),
+    reposDir: path149.join(root, "repos")
   };
 }
 var TEAM_CODEBASE_DIR;
@@ -56431,7 +56515,7 @@ var init_team_codebase_paths = __esm({
 });
 
 // src/iwiki-dual.ts
-import path149 from "path";
+import path150 from "path";
 import fs64 from "fs-extra";
 function parseIWikiInput2(input) {
   const trimmed = input.trim();
@@ -56596,10 +56680,10 @@ async function importFromIWikiDual(opts) {
     return { sectionsUpdated: [], pendingReview: false };
   }
   const paths = getTeamCodebasePaths(cwd, opts.output);
-  const filePath = path149.join(paths.root, "external-knowledge.md");
+  const filePath = path150.join(paths.root, "external-knowledge.md");
   if (opts.requireReview) {
     if (!opts.dryRun) {
-      const relativeFilePath = path149.relative(cwd, filePath);
+      const relativeFilePath = path150.relative(cwd, filePath);
       for (const sectionKey of sections) {
         const body = aiOutput[sectionKey] ?? "";
         if (!body) continue;
@@ -56666,7 +56750,7 @@ var import_exports = {};
 __export(import_exports, {
   importCmd: () => importCmd
 });
-import path150 from "path";
+import path151 from "path";
 import os15 from "os";
 import fs65 from "fs-extra";
 import { Listr, PRESET_TIMER } from "listr2";
@@ -56683,7 +56767,7 @@ async function reconcileAndDeepEnrich(params) {
   } catch (err) {
     log.debug(`reconcile skipped: ${err.message}`);
   }
-  const manifestExists = await fs65.pathExists(path150.join(evidenceDir, "_manifest.json"));
+  const manifestExists = await fs65.pathExists(path151.join(evidenceDir, "_manifest.json"));
   if (!skipEnrich && manifestExists) {
     try {
       const { deepEnrich: deepEnrich2 } = await Promise.resolve().then(() => (init_deep_enrich(), deep_enrich_exports));
@@ -56820,7 +56904,7 @@ async function importCmd(opts) {
         outputDir: opts.output,
         // Into the contribution queue, which publishing drains (#823).
         queueLearning: opts.dryRun ? void 0 : async (filename, content) => {
-          const queued = await savePendingLearning(localConfig, path150.posix.join(learningsSubdir, filename), content);
+          const queued = await savePendingLearning(localConfig, path151.posix.join(learningsSubdir, filename), content);
           if (queued.status !== "saved") throw new Error(queueWriteRefusal(queued));
           return queued.path;
         },
@@ -56835,7 +56919,7 @@ async function importCmd(opts) {
             const { rebuildIndexAfterContribute: rebuildIndexAfterContribute2 } = await Promise.resolve().then(() => (init_contribute(), contribute_exports));
             const report = await publishQueuedLearnings2(localConfig, localConfig.username);
             await rebuildIndexAfterContribute2(localConfig).catch((e) => log.debug(`import: index rebuild skipped: ${e instanceof Error ? e.message : String(e)}`));
-            const queued = ctx.learningFile ? path150.posix.join(learningsSubdir, path150.basename(ctx.learningFile)) : "";
+            const queued = ctx.learningFile ? path151.posix.join(learningsSubdir, path151.basename(ctx.learningFile)) : "";
             if (report.installChanged) {
               const { KEPT_FOR_ITS_INSTALL: KEPT_FOR_ITS_INSTALL2 } = await Promise.resolve().then(() => (init_contribute(), contribute_exports));
               task.title = `Learning saved locally, not published: ${report.installChanged}. ${KEPT_FOR_ITS_INSTALL2}`;
@@ -56852,7 +56936,7 @@ async function importCmd(opts) {
           title: "Incremental teamwiki update",
           skip: (ctx) => !ctx.repoUrl || !!opts.dryRun || !!opts.output,
           task: async (ctx, task) => {
-            const teamwikiRoot = path150.join(localConfig.repo.localPath, "teamwiki");
+            const teamwikiRoot = path151.join(localConfig.repo.localPath, "teamwiki");
             try {
               const { detectProvider: detectProvider2, getProvider: getProvider2 } = await Promise.resolve().then(() => (init_registry(), registry_exports));
               const { getRepoSlug: getRepoSlug2 } = await Promise.resolve().then(() => (init_repo_cache(), repo_cache_exports));
@@ -56860,7 +56944,7 @@ async function importCmd(opts) {
               const provider = getProvider2(providerName);
               const repoInfo = provider.parseRepoInput(ctx.repoUrl);
               const slug = getRepoSlug2(providerName, repoInfo.owner, repoInfo.repo);
-              const evidenceDir = path150.join(teamwikiRoot, "evidence", "code", slug);
+              const evidenceDir = path151.join(teamwikiRoot, "evidence", "code", slug);
               if (await fs65.pathExists(evidenceDir)) {
                 task.output = `Updating ${slug}...`;
                 await importFromRepo({
@@ -56913,7 +56997,7 @@ async function importCmd(opts) {
         setSilent(false);
       }
     } else if (opts.dir) {
-      const dirPath = path150.resolve(opts.dir);
+      const dirPath = path151.resolve(opts.dir);
       if (!await fs65.pathExists(dirPath)) {
         throw new Error(`Directory not found: ${dirPath}`);
       }
@@ -56925,7 +57009,7 @@ async function importCmd(opts) {
         log.success(`Local directory ${slug} import complete (dry-run)`);
         return;
       }
-      const tmpExtractDir = await fs65.mkdtemp(path150.join(os15.tmpdir(), "teamai-extract-"));
+      const tmpExtractDir = await fs65.mkdtemp(path151.join(os15.tmpdir(), "teamai-extract-"));
       try {
         await extractCodebase2({
           path: dirPath,
@@ -56934,15 +57018,15 @@ async function importCmd(opts) {
           skipEnrich: opts.skipEnrich ?? false,
           outputRoot: tmpExtractDir
         });
-        const srcWiki = path150.join(tmpExtractDir, "teamwiki");
+        const srcWiki = path151.join(tmpExtractDir, "teamwiki");
         if (opts.output) {
-          const outputWiki = path150.join(opts.output, "teamwiki");
+          const outputWiki = path151.join(opts.output, "teamwiki");
           if (await fs65.pathExists(srcWiki)) {
             await fs65.copy(srcWiki, outputWiki, { overwrite: true });
             log.info(`Output written: ${outputWiki}`);
             await reconcileAndDeepEnrich({
               slug,
-              evidenceDir: path150.join(outputWiki, "evidence", "code", slug),
+              evidenceDir: path151.join(outputWiki, "evidence", "code", slug),
               wikiRoot: outputWiki,
               cacheDir: dirPath,
               skipEnrich: opts.skipEnrich ?? false
@@ -56951,19 +57035,19 @@ async function importCmd(opts) {
         } else {
           const { localConfig } = await autoDetectInit();
           const teamRepoPath = localConfig.repo.localPath;
-          const teamwikiRoot = path150.join(teamRepoPath, "teamwiki");
+          const teamwikiRoot = path151.join(teamRepoPath, "teamwiki");
           if (await fs65.pathExists(srcWiki)) {
-            const evidenceSrc = path150.join(srcWiki, "evidence", "code", slug);
-            const evidenceDest = path150.join(teamwikiRoot, "evidence", "code", slug);
+            const evidenceSrc = path151.join(srcWiki, "evidence", "code", slug);
+            const evidenceDest = path151.join(teamwikiRoot, "evidence", "code", slug);
             if (await fs65.pathExists(evidenceSrc)) {
-              await fs65.ensureDir(path150.dirname(evidenceDest));
+              await fs65.ensureDir(path151.dirname(evidenceDest));
               await fs65.copy(evidenceSrc, evidenceDest, { overwrite: true });
             }
-            const srcGraph = path150.join(srcWiki, ".indices", "graph-index.json");
+            const srcGraph = path151.join(srcWiki, ".indices", "graph-index.json");
             if (await fs65.pathExists(srcGraph)) {
-              const destGraphDir = path150.join(evidenceDest, ".indices");
+              const destGraphDir = path151.join(evidenceDest, ".indices");
               await fs65.ensureDir(destGraphDir);
-              await fs65.copy(srcGraph, path150.join(destGraphDir, "graph-index.json"), { overwrite: true });
+              await fs65.copy(srcGraph, path151.join(destGraphDir, "graph-index.json"), { overwrite: true });
             }
             log.info(`teamwiki/ knowledge graph updated: ${slug}`);
             await reconcileAndDeepEnrich({
@@ -57041,12 +57125,12 @@ var codebase_upgrade_wiki_exports = {};
 __export(codebase_upgrade_wiki_exports, {
   upgradeCodebaseWiki: () => upgradeCodebaseWiki
 });
-import { readdir as readdir9, readFile as readFile15 } from "fs/promises";
-import path151 from "path";
+import { readdir as readdir9, readFile as readFile16 } from "fs/promises";
+import path152 from "path";
 import chalk6 from "chalk";
 import matter13 from "gray-matter";
 async function upgradeCodebaseWiki(opts) {
-  const teamCodebaseDir = path151.join(opts.cwd, "docs", "team-codebase", "repos");
+  const teamCodebaseDir = path152.join(opts.cwd, "docs", "team-codebase", "repos");
   if (!await pathExists(teamCodebaseDir)) {
     if (opts.json) {
       console.log(JSON.stringify({ status: "nothing-to-migrate", reason: "docs/team-codebase/repos/ not found" }));
@@ -57071,9 +57155,9 @@ async function upgradeCodebaseWiki(opts) {
   const result = { migrated: [], skipped: [], errors: [] };
   for (const file of mdFiles) {
     const slug = file.replace(".md", "");
-    const filePath = path151.join(teamCodebaseDir, file);
+    const filePath = path152.join(teamCodebaseDir, file);
     try {
-      const content = await readFile15(filePath, "utf-8");
+      const content = await readFile16(filePath, "utf-8");
       const parsed = matter13(content);
       const source = parsed.data["source"] ?? parsed.data["repo_url"];
       if (!source) {
@@ -57084,9 +57168,9 @@ async function upgradeCodebaseWiki(opts) {
         result.migrated.push(`${slug} \u2192 teamwiki/evidence/code/${slug}/`);
         continue;
       }
-      const cacheBase = path151.join(process.env["HOME"] ?? "", ".teamai", "cache", "repos");
+      const cacheBase = path152.join(process.env["HOME"] ?? "", ".teamai", "cache", "repos");
       const urlParts = String(source).replace(/^https?:\/\//, "").replace(/@.*$/, "").split("/");
-      const cachePath = path151.join(cacheBase, ...urlParts.slice(0, 3));
+      const cachePath = path152.join(cacheBase, ...urlParts.slice(0, 3));
       if (await pathExists(cachePath)) {
         await extractCodebase({ path: cachePath, project: slug });
         result.migrated.push(slug);
@@ -57140,11 +57224,11 @@ __export(codebase_wiki_lint_exports, {
   formatWikiLintReport: () => formatWikiLintReport,
   lintTeamwiki: () => lintTeamwiki
 });
-import { readFile as readFile16, readdir as readdir10, stat as stat9 } from "fs/promises";
-import path152 from "path";
+import { readFile as readFile17, readdir as readdir10, stat as stat9 } from "fs/promises";
+import path153 from "path";
 import chalk7 from "chalk";
 async function lintTeamwiki(opts) {
-  const wikiRoot = opts.wikiRoot ?? path152.join(opts.cwd ?? process.cwd(), "teamwiki");
+  const wikiRoot = opts.wikiRoot ?? path153.join(opts.cwd ?? process.cwd(), "teamwiki");
   const issues = [];
   const minSeverity = opts.severity ?? "info";
   const severityOrder = ["info", "low", "medium", "high"];
@@ -57154,7 +57238,7 @@ async function lintTeamwiki(opts) {
       issues.push(issue);
     }
   }
-  const graphPath = path152.join(wikiRoot, ".indices", "graph-index.json");
+  const graphPath = path153.join(wikiRoot, ".indices", "graph-index.json");
   let graph = null;
   if (!await pathExists(graphPath)) {
     addIssue({
@@ -57165,7 +57249,7 @@ async function lintTeamwiki(opts) {
     });
   } else {
     try {
-      const raw = await readFile16(graphPath, "utf-8");
+      const raw = await readFile17(graphPath, "utf-8");
       graph = JSON.parse(raw);
     } catch {
       addIssue({
@@ -57176,7 +57260,7 @@ async function lintTeamwiki(opts) {
       });
     }
   }
-  const evidenceDir = path152.join(wikiRoot, "evidence", "code");
+  const evidenceDir = path153.join(wikiRoot, "evidence", "code");
   if (!await pathExists(evidenceDir)) {
     addIssue({
       severity: "high",
@@ -57195,7 +57279,7 @@ async function lintTeamwiki(opts) {
       });
     }
     for (const project of projects) {
-      const projectDir = path152.join(evidenceDir, project);
+      const projectDir = path153.join(evidenceDir, project);
       const pStat = await stat9(projectDir).catch(() => null);
       if (!pStat?.isDirectory()) {
         if (!pStat) {
@@ -57215,7 +57299,7 @@ async function lintTeamwiki(opts) {
     }
   }
   for (const navFile of ["router.md", "index.md", "hot.md"]) {
-    if (!await pathExists(path152.join(wikiRoot, navFile))) {
+    if (!await pathExists(path153.join(wikiRoot, navFile))) {
       addIssue({
         severity: "low",
         category: "nav-missing",
@@ -57224,7 +57308,7 @@ async function lintTeamwiki(opts) {
       });
     }
   }
-  const manifestPath2 = path152.join(wikiRoot, "source-manifest.json");
+  const manifestPath2 = path153.join(wikiRoot, "source-manifest.json");
   if (!await pathExists(manifestPath2)) {
     addIssue({
       severity: "low",
@@ -57234,7 +57318,7 @@ async function lintTeamwiki(opts) {
     });
   } else {
     try {
-      const raw = await readFile16(manifestPath2, "utf-8");
+      const raw = await readFile17(manifestPath2, "utf-8");
       const manifest = JSON.parse(raw);
       if (manifest.lastScan) {
         const daysSince = (Date.now() - new Date(manifest.lastScan).getTime()) / (1e3 * 60 * 60 * 24);
@@ -57339,8 +57423,8 @@ var codebase_cmd_exports = {};
 __export(codebase_cmd_exports, {
   codebaseCmd: () => codebaseCmd
 });
-import path153 from "path";
-import { readFile as readFile17 } from "fs/promises";
+import path154 from "path";
+import { readFile as readFile18 } from "fs/promises";
 import chalk8 from "chalk";
 async function codebaseCmd(opts) {
   const cwd = process.cwd();
@@ -57382,14 +57466,14 @@ async function codebaseCmd(opts) {
   const { pathExists: pathExists2 } = await Promise.resolve().then(() => (init_fs(), fs_exports));
   let teamwikiDir;
   if (opts.output) {
-    teamwikiDir = path153.resolve(opts.output, "teamwiki");
+    teamwikiDir = path154.resolve(opts.output, "teamwiki");
   } else {
     try {
       const { autoDetectInit: autoDetectInit2 } = await Promise.resolve().then(() => (init_config(), config_exports));
       const { localConfig: lc } = await autoDetectInit2();
-      teamwikiDir = path153.join(lc.repo.localPath, "teamwiki");
+      teamwikiDir = path154.join(lc.repo.localPath, "teamwiki");
     } catch {
-      teamwikiDir = path153.join(cwd, ".teamai", "team-repo", "teamwiki");
+      teamwikiDir = path154.join(cwd, ".teamai", "team-repo", "teamwiki");
     }
   }
   if (!await pathExists2(teamwikiDir)) {
@@ -57405,8 +57489,8 @@ async function codebaseCmd(opts) {
       return;
     }
     const { assertWithinRoot: assertWithinRoot2 } = await Promise.resolve().then(() => (init_path_safety(), path_safety_exports));
-    const codeRoot = path153.join(teamwikiDir, "evidence", "code");
-    const evidenceDir = path153.join(codeRoot, project);
+    const codeRoot = path154.join(teamwikiDir, "evidence", "code");
+    const evidenceDir = path154.join(codeRoot, project);
     try {
       assertWithinRoot2(codeRoot, evidenceDir);
     } catch (e) {
@@ -57421,7 +57505,7 @@ async function codebaseCmd(opts) {
     }
     let componentCount = 0;
     try {
-      const manifest = JSON.parse(await readFile17(path153.join(evidenceDir, "_manifest.json"), "utf-8"));
+      const manifest = JSON.parse(await readFile18(path154.join(evidenceDir, "_manifest.json"), "utf-8"));
       componentCount = Array.isArray(manifest.components) ? manifest.components.length : 0;
     } catch {
       componentCount = 0;
@@ -57488,20 +57572,20 @@ async function printCodebaseStatus(opts) {
   const cwd = process.cwd();
   let teamwikiDir;
   if (opts.output) {
-    teamwikiDir = path153.resolve(opts.output, "teamwiki");
+    teamwikiDir = path154.resolve(opts.output, "teamwiki");
   } else {
     try {
       const { autoDetectInit: autoDetectInit2 } = await Promise.resolve().then(() => (init_config(), config_exports));
       const { localConfig: lc } = await autoDetectInit2();
-      teamwikiDir = path153.join(lc.repo.localPath, "teamwiki");
+      teamwikiDir = path154.join(lc.repo.localPath, "teamwiki");
     } catch {
-      teamwikiDir = path153.join(cwd, ".teamai", "team-repo", "teamwiki");
+      teamwikiDir = path154.join(cwd, ".teamai", "team-repo", "teamwiki");
     }
   }
-  const manifestPath2 = path153.join(teamwikiDir, "source-manifest.json");
+  const manifestPath2 = path154.join(teamwikiDir, "source-manifest.json");
   let manifest;
   try {
-    manifest = JSON.parse(await readFile17(manifestPath2, "utf-8"));
+    manifest = JSON.parse(await readFile18(manifestPath2, "utf-8"));
   } catch {
     if (opts.json) {
       console.log(JSON.stringify({ error: "no-manifest", manifestPath: manifestPath2 }));
@@ -57596,7 +57680,7 @@ var review_cmd_exports = {};
 __export(review_cmd_exports, {
   reviewCmd: () => reviewCmd
 });
-import path154 from "path";
+import path155 from "path";
 import chalk9 from "chalk";
 import fs66 from "fs-extra";
 function riskAtMost(itemRisk, ceiling) {
@@ -57672,7 +57756,7 @@ async function applyOne(cwd, item) {
   if (!section) {
     return { ok: false, reason: "target.section is missing" };
   }
-  const filePath = path154.isAbsolute(file) ? file : path154.join(cwd, file);
+  const filePath = path155.isAbsolute(file) ? file : path155.join(cwd, file);
   if (!await fs66.pathExists(filePath)) {
     return { ok: false, reason: `target file not found: ${filePath}` };
   }
@@ -57829,10 +57913,10 @@ function formatComment(learning, suggestions, marker) {
   lines.push("> _Auto-generated by `teamai ci extract-mr`_");
   return lines.join("\n");
 }
-async function githubRequest(path157, method, body) {
+async function githubRequest(path158, method, body) {
   const token2 = process.env["GITHUB_TOKEN"];
   if (!token2) throw new Error("\u672A\u8BBE\u7F6E GITHUB_TOKEN \u73AF\u5883\u53D8\u91CF");
-  const url = `https://api.github.com${path157}`;
+  const url = `https://api.github.com${path158}`;
   const headers = {
     Authorization: `Bearer ${token2}`,
     Accept: "application/vnd.github+json",
@@ -57883,8 +57967,8 @@ async function updateGitHubComment(owner, repo, commentId, body) {
   const data = await resp.json();
   return { created: false, url: data.html_url };
 }
-async function tgitRequest(path157, method, body) {
-  return tgitFetch(path157, {
+async function tgitRequest(path158, method, body) {
+  return tgitFetch(path158, {
     method,
     body: body ? JSON.stringify(body) : void 0
   });
@@ -58169,10 +58253,10 @@ function extractMarkerId(body) {
   const match = body.match(MARKER_REGEX);
   return match ? match[1] : null;
 }
-async function githubRequest2(path157) {
+async function githubRequest2(path158) {
   const token2 = process.env["GITHUB_TOKEN"];
   if (!token2) throw new Error("\u672A\u8BBE\u7F6E GITHUB_TOKEN");
-  return fetch(`https://api.github.com${path157}`, {
+  return fetch(`https://api.github.com${path158}`, {
     headers: {
       Authorization: `Bearer ${token2}`,
       Accept: "application/vnd.github+json",
@@ -58206,8 +58290,8 @@ async function readGitHubRejections(owner, repo, prNumber) {
   }
   return result;
 }
-async function tgitRequest2(path157) {
-  return tgitFetch(path157);
+async function tgitRequest2(path158) {
+  return tgitFetch(path158);
 }
 async function getMrGlobalId2(projectId, mrIid) {
   const resp = await tgitRequest2(`/projects/${projectId}/merge_requests?iid=${mrIid}`);
@@ -58268,7 +58352,7 @@ __export(extract_mr_exports, {
   ciExtractMr: () => ciExtractMr
 });
 import fs67 from "fs/promises";
-import path155 from "path";
+import path156 from "path";
 async function configureGitUser2(repoPath, provider) {
   const { execFileSync: execFileSync7 } = await import("child_process");
   let name = "teamai-ci";
@@ -58315,8 +58399,8 @@ async function writeKnowledgeToRepo(teamRepo, learning, suggestions, writeMode, 
     const safeTitle = learning.title.replace(/[^a-zA-Z0-9一-鿿_-]/g, "-").replace(/-+/g, "-").slice(0, 50);
     const dateStr = (/* @__PURE__ */ new Date()).toISOString().slice(0, 10);
     const filename = `${dateStr}-${safeTitle}.md`;
-    const learningsDir = path155.join(teamRepo, "learnings");
-    const learningPath = path155.join(learningsDir, filename);
+    const learningsDir = path156.join(teamRepo, "learnings");
+    const learningPath = path156.join(learningsDir, filename);
     if (!dryRun) {
       await fs67.mkdir(learningsDir, { recursive: true });
       await fs67.writeFile(learningPath, learning.content, "utf-8");
@@ -58356,11 +58440,11 @@ async function writeKnowledgeToRepo(teamRepo, learning, suggestions, writeMode, 
 async function writeArtifacts(outputDir, learning, suggestions) {
   await fs67.mkdir(outputDir, { recursive: true });
   if (learning) {
-    await fs67.writeFile(path155.join(outputDir, "learning.md"), learning.content, "utf-8");
+    await fs67.writeFile(path156.join(outputDir, "learning.md"), learning.content, "utf-8");
   }
   if (suggestions && suggestions.length > 0) {
     await fs67.writeFile(
-      path155.join(outputDir, "codebase-suggestions.json"),
+      path156.join(outputDir, "codebase-suggestions.json"),
       JSON.stringify(suggestions, null, 2),
       "utf-8"
     );
@@ -58375,7 +58459,7 @@ async function ciExtractMr(opts) {
     url: opts.url,
     all: true,
     // learnings-root ok: CI runs against a bare checkout, with no LocalConfig
-    learningsDirs: opts.teamRepo ? [path155.join(opts.teamRepo, "learnings")] : void 0,
+    learningsDirs: opts.teamRepo ? [path156.join(opts.teamRepo, "learnings")] : void 0,
     dryRun: true
     // 不让 importFromMR 自己写文件，我们自己控制写入
   });
@@ -58484,21 +58568,21 @@ ${affectedModules.map((m) => `- \`${m}\` (evidence + G-document)`).join("\n")}` 
           const projectName = parsed.repo;
           await extractCodebase2({ path: businessRepo, project: projectName });
           const fse16 = await import("fs-extra");
-          const srcWiki = path155.join(businessRepo, "teamwiki");
-          const teamWikiRoot = path155.join(path155.resolve(opts.teamRepo), "teamwiki");
+          const srcWiki = path156.join(businessRepo, "teamwiki");
+          const teamWikiRoot = path156.join(path156.resolve(opts.teamRepo), "teamwiki");
           try {
             if (await fse16.pathExists(srcWiki)) {
-              const evidenceSrc = path155.join(srcWiki, "evidence", "code", projectName);
-              const evidenceDest = path155.join(teamWikiRoot, "evidence", "code", projectName);
+              const evidenceSrc = path156.join(srcWiki, "evidence", "code", projectName);
+              const evidenceDest = path156.join(teamWikiRoot, "evidence", "code", projectName);
               if (await fse16.pathExists(evidenceSrc)) {
                 await fse16.ensureDir(evidenceDest);
                 await fse16.copy(evidenceSrc, evidenceDest, { overwrite: true });
               }
-              const srcGraph = path155.join(srcWiki, ".indices", "graph-index.json");
+              const srcGraph = path156.join(srcWiki, ".indices", "graph-index.json");
               if (await fse16.pathExists(srcGraph)) {
-                const destGraphDir = path155.join(evidenceDest, ".indices");
+                const destGraphDir = path156.join(evidenceDest, ".indices");
                 await fse16.ensureDir(destGraphDir);
-                await fse16.copy(srcGraph, path155.join(destGraphDir, "graph-index.json"));
+                await fse16.copy(srcGraph, path156.join(destGraphDir, "graph-index.json"));
               }
               const { aggregateGlobalGraph: aggregateGlobalGraph2 } = await Promise.resolve().then(() => (init_graph_aggregate(), graph_aggregate_exports));
               await aggregateGlobalGraph2(teamWikiRoot);
@@ -58555,7 +58639,7 @@ var init_extract_mr = __esm({
 });
 
 // src/maintenance/paths.ts
-import path156 from "path";
+import path157 from "path";
 function assertCheckoutReady(checkout, refreshed) {
   switch (refreshed.status) {
     case "done":
@@ -58581,7 +58665,7 @@ async function resolveMaintenancePaths(localConfig) {
   const roots = learningsRoots(localConfig);
   return {
     repoPath,
-    votesDir: path156.join(getReportsDir(localConfig), "votes"),
+    votesDir: path157.join(getReportsDir(localConfig), "votes"),
     learningsWriteDir: roots.write,
     learningsReadDirs: roots.read
   };
@@ -58596,7 +58680,7 @@ var init_paths = __esm({
       name = "CheckoutLockedError";
       constructor(checkout, lockPath) {
         super(
-          `The ${checkout} checkout is locked: another teamai command may be updating it, or its lock at ${lockPath} could not be created. Nothing was changed. Run this again when the other command finishes; if this keeps happening, check that ${path156.dirname(lockPath)} is writable.`
+          `The ${checkout} checkout is locked: another teamai command may be updating it, or its lock at ${lockPath} could not be created. Nothing was changed. Run this again when the other command finishes; if this keeps happening, check that ${path157.dirname(lockPath)} is writable.`
         );
       }
     };

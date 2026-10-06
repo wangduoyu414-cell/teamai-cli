@@ -25,12 +25,14 @@ afterEach(async () => {
 });
 
 describe('instruction lifecycle integration', () => {
-  it('reads root AGENTS.md and owns full Codex and Qwen host files in user scope', async () => {
+  it('reads root AGENTS.md and preserves personal Codex and Qwen rules in user scope', async () => {
     const { home, repo } = await fixture();
     vi.stubEnv('HOME', home);
     await fse.writeFile(path.join(repo, 'AGENTS.md'), '# Team instructions\nUse the shared workflow.\n');
     await fse.ensureDir(path.join(home, '.codex'));
     await fse.ensureDir(path.join(home, '.qwen'));
+    await fse.writeFile(path.join(home, '.codex/AGENTS.md'), '# My personal rules\n');
+    await fse.writeFile(path.join(home, '.qwen/QWEN.md'), '# Team instructions\nUse the shared workflow.\n');
     const config = TeamaiConfigSchema.parse({
       team: 'test', repo: 'https://example.test/team.git',
       sharing: { instructions: { source: 'AGENTS.md' } },
@@ -47,6 +49,19 @@ describe('instruction lifecycle integration', () => {
     await reconcileManagedInstructions(config, localConfig, null, 'test');
     expect(await fse.readFile(path.join(home, '.codex/AGENTS.md'), 'utf8')).toContain('Team instructions');
     expect(await fse.readFile(path.join(home, '.qwen/QWEN.md'), 'utf8')).toContain('shared workflow');
+    expect((await fse.readFile(path.join(home, '.qwen/QWEN.md'), 'utf8')).match(/Use the shared workflow/g)).toHaveLength(1);
+    const target = path.join(home, '.codex/AGENTS.md');
+    expect(await fse.readFile(target, 'utf8')).toContain('# My personal rules');
+    await fse.appendFile(target, '\n# A later personal choice\n');
+    await fse.writeFile(path.join(repo, 'AGENTS.md'), '# Updated team rules\n');
+    await reconcileManagedInstructions(config, localConfig, null, 'test');
+    expect(await fse.readFile(target, 'utf8')).toContain('A later personal choice');
+    expect(await fse.readFile(target, 'utf8')).not.toContain('Use the shared workflow');
+    await uninstallManagedResources(path.join(home, '.teamai'));
+    expect(await fse.readFile(target, 'utf8')).toContain('My personal rules');
+    expect(await fse.readFile(target, 'utf8')).toContain('A later personal choice');
+    expect(await fse.readFile(target, 'utf8')).not.toContain('Updated team rules');
+    expect(await fse.pathExists(path.join(home, '.qwen/QWEN.md'))).toBe(false);
   });
 
   it('uses the independent host probe when the instruction path has a different root', async () => {
